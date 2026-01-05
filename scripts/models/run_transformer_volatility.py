@@ -8,6 +8,13 @@
 使用 Qlib 内置的 PyTorch Transformer 实现，兼容 Apple Silicon
 """
 
+import sys
+from pathlib import Path
+
+# Add scripts directory to path for imports
+script_dir = Path(__file__).parent.parent  # scripts directory
+sys.path.insert(0, str(script_dir))
+
 from pathlib import Path
 import argparse
 import copy
@@ -26,17 +33,17 @@ from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 # Import TA-Lib custom operators
-from talib_ops import TALIB_OPS
+from utils.talib_ops import TALIB_OPS
 
 # Import extended data handlers
-from datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
-from utils import evaluate_model
+from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
+from utils.utils import evaluate_model
 
 
 # ========== 配置 ==========
 
 # 数据路径
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 
 # 股票池

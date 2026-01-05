@@ -4,11 +4,18 @@
 包含 Alpha158 特征 + TA-Lib 技术指标 + N天价格波动率标签
 """
 
+import sys
+from pathlib import Path
+
+# Add scripts directory to path for imports
+script_dir = Path(__file__).parent.parent  # scripts directory
+sys.path.insert(0, str(script_dir))
+
 from qlib.contrib.data.handler import Alpha158
 from qlib.data.dataset.handler import DataHandlerLP
 
 # Import TA-Lib custom operators
-from talib_ops import TALIB_OPS
+from utils.talib_ops import TALIB_OPS
 
 
 class Alpha158_Volatility(Alpha158):

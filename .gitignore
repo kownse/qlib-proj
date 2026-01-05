@@ -37,6 +37,7 @@ mlruns/
 tmp
 *.tmp
 *.log
+catboost_info/
 
 # macOS
 .DS_Store

@@ -6,6 +6,13 @@
 扩展特征：包含 Alpha158 默认指标 + TA-Lib 技术指标
 """
 
+import sys
+from pathlib import Path
+
+# Add scripts directory to path for imports
+script_dir = Path(__file__).parent.parent  # scripts directory
+sys.path.insert(0, str(script_dir))
+
 from pathlib import Path
 import argparse
 import os
@@ -28,11 +35,11 @@ from qlib.model.base import ModelFT
 tf.disable_v2_behavior()
 
 # Import TA-Lib custom operators
-from talib_ops import TALIB_OPS
+from utils.talib_ops import TALIB_OPS
 
 # Import extended data handlers
-from datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
-from utils import evaluate_model
+from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
+from utils.utils import evaluate_model
 
 # Add TFT benchmark path for imports
 TFT_PATH = Path(__file__).parent.parent / "qlib" / "examples" / "benchmarks" / "TFT"
@@ -47,7 +54,7 @@ import sklearn.preprocessing
 # ========== 配置 ==========
 
 # 数据路径
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 
 # 股票池

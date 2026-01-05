@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 # 确保项目路径正确
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT / "qlib"))  # 添加 qlib 源码路径
 
 import pandas as pd
