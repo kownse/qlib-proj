@@ -1,7 +1,10 @@
 """
 运行 LightGBM baseline，预测N天股票价格波动率
 
-波动率定义：未来N个交易日波动变化"""
+波动率定义：未来N个交易日波动变化
+
+扩展特征：包含 Alpha158 默认指标 + TA-Lib 技术指标
+"""
 
 from pathlib import Path
 import argparse
@@ -11,8 +14,13 @@ import qlib
 from qlib.constant import REG_US
 from qlib.data import D
 from qlib.contrib.model.gbdt import LGBModel
-from qlib.contrib.data.handler import Alpha158
 from qlib.data.dataset import DatasetH
+
+# Import TA-Lib custom operators
+from talib_ops import TALIB_OPS
+
+# Import extended data handlers
+from datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
 
 
 # ========== 配置 ==========
@@ -35,47 +43,33 @@ TEST_END = "2025-12-31"
 # 波动率预测窗口（天数）
 VOLATILITY_WINDOW = 2
 
-
-class Alpha158_Volatility(Alpha158):
-    """
-    Alpha158 特征 + N天价格波动率标签
-
-    继承 Alpha158 的所有技术指标特征，只修改标签为N天波动率
-    """
-
-    def get_label_config(self):
-        """
-        返回N天波动率标签
-
-        Returns:
-            fields: 标签表达式列表
-            names: 标签名称列表
-        """
-        # 使用 Qlib 的表达式语法
-        # Std($close, N) 计算 N 天的标准差
-        # Ref($field, -N) 向未来移动 N 天
-        volatility_expr = f"Ref($close, -{VOLATILITY_WINDOW})/Ref($close, -1) - 1"
-
-        return [volatility_expr], ["LABEL0"]
-
 def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='Qlib Stock Price Volatility Prediction')
     parser.add_argument('--nday', type=int, default=2, help='Volatility prediction window in days (default: 2)')
+    parser.add_argument('--use-talib', action='store_true', help='Use extended TA-Lib features (default: False)')
     args = parser.parse_args()
-    
+
     # 更新全局变量
     global VOLATILITY_WINDOW
     VOLATILITY_WINDOW = args.nday
-    
+
     print("=" * 70)
     print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
+    if args.use_talib:
+        print("Features: Alpha158 + TA-Lib Technical Indicators")
+    else:
+        print("Features: Alpha158 (default)")
     print("=" * 70)
 
-    # 1. 初始化 Qlib
+    # 1. 初始化 Qlib (包含 TA-Lib 自定义算子)
     print("\n[1] Initializing Qlib...")
-    qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US)
-    print("    ✓ Qlib initialized")
+    if args.use_talib:
+        qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US, custom_ops=TALIB_OPS)
+        print("    ✓ Qlib initialized with TA-Lib custom operators")
+    else:
+        qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US)
+        print("    ✓ Qlib initialized")
 
     # 2. 检查数据
     print("\n[2] Checking data availability...")
@@ -95,17 +89,32 @@ def main():
 
     # 3. 创建 DataHandler
     print(f"\n[3] Creating DataHandler with {VOLATILITY_WINDOW}-day volatility label...")
-    print(f"    Features: Alpha158 (158 technical indicators)")
+    if args.use_talib:
+        print(f"    Features: Alpha158 + TA-Lib (~300+ technical indicators)")
+    else:
+        print(f"    Features: Alpha158 (158 technical indicators)")
     print(f"    Label: {VOLATILITY_WINDOW}-day realized volatility")
 
-    handler = Alpha158_Volatility(
-        instruments=TEST_SYMBOLS,
-        start_time=TRAIN_START,
-        end_time=TEST_END,
-        fit_start_time=TRAIN_START,
-        fit_end_time=TRAIN_END,
-        infer_processors=[],
-    )
+    if args.use_talib:
+        handler = Alpha158_Volatility_TALib(
+            volatility_window=VOLATILITY_WINDOW,
+            instruments=TEST_SYMBOLS,
+            start_time=TRAIN_START,
+            end_time=TEST_END,
+            fit_start_time=TRAIN_START,
+            fit_end_time=TRAIN_END,
+            infer_processors=[],
+        )
+    else:
+        handler = Alpha158_Volatility(
+            volatility_window=VOLATILITY_WINDOW,
+            instruments=TEST_SYMBOLS,
+            start_time=TRAIN_START,
+            end_time=TEST_END,
+            fit_start_time=TRAIN_START,
+            fit_end_time=TRAIN_END,
+            infer_processors=[],
+        )
     print("    ✓ DataHandler created")
 
     # 4. 创建 Dataset
