@@ -25,8 +25,7 @@ ENV/
 *~
 
 # Qlib data and outputs
-my_data/csv_us/
-my_data/qlib_us/
+my_data/
 my_models/
 outputs/
 logs/
@@ -38,6 +37,7 @@ tmp
 *.tmp
 *.log
 catboost_info/
+.env
 
 # macOS
 .DS_Store
