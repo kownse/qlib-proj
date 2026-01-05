@@ -1,11 +1,7 @@
 """
 运行 LightGBM baseline，验证环境正常
 """
-import os
 from pathlib import Path
-
-# Disable MLflow git tracking to avoid warnings when not in a git repo
-os.environ["MLFLOW_GIT_PYTHON_DISABLE"] = "1"
 
 import qlib
 from qlib.constant import REG_US
