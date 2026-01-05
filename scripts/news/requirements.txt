@@ -1,0 +1,20 @@
+# 新闻模块依赖
+
+# 环境变量
+python-dotenv>=1.0.0
+
+# 新闻 API
+finnhub-python>=2.4.0
+
+# 情感分析
+vaderSentiment>=3.3.2        # 快速情感分析 (无需 GPU)
+transformers>=4.30.0         # FinBERT 依赖 (可选，需要 GPU)
+torch>=2.0.0                 # FinBERT 依赖 (可选)
+
+# 文本嵌入 (可选)
+sentence-transformers>=2.2.0
+
+# 数据处理
+pandas>=1.5.0
+numpy>=1.24.0
+pyarrow>=12.0.0              # Parquet 文件支持

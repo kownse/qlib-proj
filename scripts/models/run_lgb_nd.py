@@ -28,6 +28,7 @@ from utils.talib_ops import TALIB_OPS
 
 # Import extended data handlers
 from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
+from data.datahandler_news import Alpha158_Volatility_TALib_News
 
 
 # ========== 配置 ==========
@@ -35,16 +36,17 @@ from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
 # 数据路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
+NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.parquet"
 
 # 股票池
 TEST_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ"]
 
 # 时间划分
-TRAIN_START = "2015-01-01"
-TRAIN_END = "2023-12-31"
-VALID_START = "2024-01-01"
-VALID_END = "2024-12-31"
-TEST_START = "2025-01-01"
+TRAIN_START = "2025-01-01"
+TRAIN_END = "2025-09-30"
+VALID_START = "2025-10-01"
+VALID_END = "2025-11-30"
+TEST_START = "2025-12-01"
 TEST_END = "2025-12-31"
 
 # 波动率预测窗口（天数）
@@ -55,6 +57,10 @@ def main():
     parser = argparse.ArgumentParser(description='Qlib Stock Price Volatility Prediction')
     parser.add_argument('--nday', type=int, default=2, help='Volatility prediction window in days (default: 2)')
     parser.add_argument('--use-talib', action='store_true', help='Use extended TA-Lib features (default: False)')
+    parser.add_argument('--use-news', action='store_true', help='Use Alpha158 + TA-Lib + News features (default: False)')
+    parser.add_argument('--news-features', type=str, default='core', choices=['all', 'sentiment', 'stats', 'core'],
+                        help='News feature set to use (default: core)')
+    parser.add_argument('--news-rolling', action='store_true', help='Add rolling news features (default: False)')
     args = parser.parse_args()
 
     # 更新全局变量
@@ -63,7 +69,11 @@ def main():
 
     print("=" * 70)
     print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
-    if args.use_talib:
+    if args.use_news:
+        print("Features: Alpha158 + TA-Lib + News Features")
+        print(f"    News feature set: {args.news_features}")
+        print(f"    News rolling features: {args.news_rolling}")
+    elif args.use_talib:
         print("Features: Alpha158 + TA-Lib Technical Indicators")
     else:
         print("Features: Alpha158 (default)")
@@ -71,7 +81,7 @@ def main():
 
     # 1. 初始化 Qlib (包含 TA-Lib 自定义算子)
     print("\n[1] Initializing Qlib...")
-    if args.use_talib:
+    if args.use_talib or args.use_news:
         qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US, custom_ops=TALIB_OPS)
         print("    ✓ Qlib initialized with TA-Lib custom operators")
     else:
@@ -96,13 +106,30 @@ def main():
 
     # 3. 创建 DataHandler
     print(f"\n[3] Creating DataHandler with {VOLATILITY_WINDOW}-day volatility label...")
-    if args.use_talib:
+    if args.use_news:
+        print(f"    Features: Alpha158 + TA-Lib + News (~250+ technical indicators + news features)")
+        print(f"    News data path: {NEWS_DATA_PATH}")
+    elif args.use_talib:
         print(f"    Features: Alpha158 + TA-Lib (~300+ technical indicators)")
     else:
         print(f"    Features: Alpha158 (158 technical indicators)")
     print(f"    Label: {VOLATILITY_WINDOW}-day realized volatility")
 
-    if args.use_talib:
+    if args.use_news:
+        handler = Alpha158_Volatility_TALib_News(
+            volatility_window=VOLATILITY_WINDOW,
+            instruments=TEST_SYMBOLS,
+            start_time=TRAIN_START,
+            end_time=TEST_END,
+            fit_start_time=TRAIN_START,
+            fit_end_time=TRAIN_END,
+            infer_processors=[],
+            news_data_path=str(NEWS_DATA_PATH) if NEWS_DATA_PATH.exists() else None,
+            news_features=args.news_features,
+            add_news_rolling=args.news_rolling,
+        )
+        print(f"    ✓ DataHandler created with news features: {handler.get_news_feature_names()}")
+    elif args.use_talib:
         handler = Alpha158_Volatility_TALib(
             volatility_window=VOLATILITY_WINDOW,
             instruments=TEST_SYMBOLS,
@@ -112,6 +139,7 @@ def main():
             fit_end_time=TRAIN_END,
             infer_processors=[],
         )
+        print("    ✓ DataHandler created")
     else:
         handler = Alpha158_Volatility(
             volatility_window=VOLATILITY_WINDOW,
@@ -122,7 +150,7 @@ def main():
             fit_end_time=TRAIN_END,
             infer_processors=[],
         )
-    print("    ✓ DataHandler created")
+        print("    ✓ DataHandler created")
 
     # 4. 创建 Dataset
     print("\n[4] Creating Dataset...")
@@ -166,7 +194,7 @@ def main():
 
     model = LGBModel(
         loss="mse",
-        learning_rate=0.05,
+        learning_rate=0.01,
         max_depth=8,
         num_leaves=128,
         num_threads=4,
