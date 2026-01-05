@@ -2,6 +2,7 @@
 运行 LightGBM baseline，验证环境正常
 """
 from pathlib import Path
+from utils import evaluate_model
 
 import qlib
 from qlib.constant import REG_US
@@ -109,24 +110,7 @@ def main():
     
     # 7. 简单评估
     print("\n[7] Simple evaluation...")
-    
-    # 获取实际收益
-    label_df = dataset.prepare("test", col_set="label")
-    test_pred_aligned = test_pred.reindex(label_df.index)
-
-    # 计算 IC (Information Coefficient)
-    # model.predict() returns a Series, not a DataFrame with 'score' column
-    ic = test_pred_aligned.groupby(level="datetime").apply(
-        lambda x: x.corr(label_df.loc[x.index, "LABEL0"])
-    )
-    
-    print(f"    Mean IC: {ic.mean():.4f}")
-    print(f"    IC Std: {ic.std():.4f}")
-    print(f"    ICIR: {ic.mean() / ic.std():.4f}")
-    
-    print("\n" + "=" * 60)
-    print("Baseline test completed successfully!")
-    print("=" * 60)
+    evaluate_model(dataset, test_pred, PROJECT_ROOT, 2)
 
 
 if __name__ == "__main__":
