@@ -45,3 +45,4 @@ tmp
 
 # Qlib cache
 .qlib_cache/
+qlib/qlib/_version.py
