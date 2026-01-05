@@ -1,5 +1,5 @@
 """
-运行 LightGBM baseline，预测N天股票价格波动率
+运行 CatBoost baseline，预测N天股票价格波动率
 
 波动率定义：未来N个交易日波动变化
 
@@ -13,7 +13,7 @@ from utils import evaluate_model
 import qlib
 from qlib.constant import REG_US
 from qlib.data import D
-from qlib.contrib.model.gbdt import LGBModel
+from qlib.contrib.model.catboost_model import CatBoostModel
 from qlib.data.dataset import DatasetH
 
 # Import TA-Lib custom operators
@@ -45,7 +45,7 @@ VOLATILITY_WINDOW = 2
 
 def main():
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='Qlib Stock Price Volatility Prediction')
+    parser = argparse.ArgumentParser(description='Qlib Stock Price Volatility Prediction (CatBoost)')
     parser.add_argument('--nday', type=int, default=2, help='Volatility prediction window in days (default: 2)')
     parser.add_argument('--use-talib', action='store_true', help='Use extended TA-Lib features (default: False)')
     args = parser.parse_args()
@@ -55,7 +55,7 @@ def main():
     VOLATILITY_WINDOW = args.nday
 
     print("=" * 70)
-    print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
+    print(f"CatBoost {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
     if args.use_talib:
         print("Features: Alpha158 + TA-Lib Technical Indicators")
     else:
@@ -149,27 +149,30 @@ def main():
     print(f"      Std:    {valid_label['LABEL0'].std():.4f}")
 
     # 5. 训练模型
-    print("\n[6] Training LightGBM model...")
+    print("\n[6] Training CatBoost model...")
     print("    Model parameters:")
-    print(f"      - loss: mse")
+    print(f"      - loss: RMSE")
     print(f"      - learning_rate: 0.05")
-    print(f"      - max_depth: 8")
-    print(f"      - num_leaves: 128")
-    print(f"      - n_estimators: 200")
+    print(f"      - max_depth: 6")
+    print(f"      - l2_leaf_reg: 3")
+    print(f"      - random_strength: 1")
 
-    model = LGBModel(
-        loss="mse",
+    model = CatBoostModel(
+        loss="RMSE",
         learning_rate=0.05,
-        max_depth=8,
-        num_leaves=128,
-        num_threads=4,
-        n_estimators=200,
-        early_stopping_rounds=30,
-        verbose=-1,  # 减少训练输出
+        max_depth=6,
+        l2_leaf_reg=3,
+        random_strength=1,
+        thread_count=4,
     )
 
     print("\n    Training progress:")
-    model.fit(dataset)
+    model.fit(
+        dataset,
+        num_boost_round=1000,
+        early_stopping_rounds=50,
+        verbose_eval=100,
+    )
     print("    ✓ Model training completed")
 
     # 6. 预测
