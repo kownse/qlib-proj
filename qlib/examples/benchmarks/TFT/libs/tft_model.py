@@ -978,11 +978,8 @@ class TemporalFusionTransformer:
 
             model = tf.keras.Model(inputs=all_inputs, outputs=outputs)
 
-            # Note: model.summary() may cause Dimension/int division errors in some TF/Keras versions
-            try:
-                model.summary()
-            except TypeError:
-                print("Model built successfully (summary skipped due to TF compatibility)")
+            # Model summary disabled for cleaner output
+            # model.summary()
 
             valid_quantiles = self.quantiles
             output_size = self.output_size
@@ -1040,6 +1037,10 @@ class TemporalFusionTransformer:
 
         print("*** Fitting {} ***".format(self.name))
 
+        # TensorBoard log directory
+        tensorboard_log_dir = os.path.join(os.path.dirname(self._temp_folder), "logs")
+        print(f"TensorBoard logs will be saved to: {tensorboard_log_dir}")
+
         # Add relevant callbacks
         callbacks = [
             tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=self.early_stopping_patience, min_delta=1e-4),
@@ -1050,6 +1051,12 @@ class TemporalFusionTransformer:
                 save_weights_only=True,
             ),
             tf.keras.callbacks.TerminateOnNaN(),
+            tf.keras.callbacks.TensorBoard(
+                log_dir=tensorboard_log_dir,
+                histogram_freq=1,
+                write_graph=True,
+                update_freq="epoch",
+            ),
         ]
 
         print("Getting batched_data")
@@ -1121,8 +1128,6 @@ class TemporalFusionTransformer:
             x=inputs,
             y=np.concatenate([outputs, outputs, outputs], axis=-1),
             sample_weight=active_entries,
-            workers=16,
-            use_multiprocessing=True,
         )
 
         metrics = pd.Series(metric_values, self.model.metrics_names)
@@ -1148,7 +1153,7 @@ class TemporalFusionTransformer:
         identifier = data["identifier"]
         outputs = data["outputs"]
 
-        combined = self.model.predict(inputs, workers=16, use_multiprocessing=True, batch_size=self.minibatch_size)
+        combined = self.model.predict(inputs, batch_size=self.minibatch_size)
 
         # Format output_csv
         if self.output_size != 1:
@@ -1257,30 +1262,26 @@ class TemporalFusionTransformer:
         Args:
           model_folder: Location to serialze model.
         """
-        # Allows for direct serialisation of tensorflow variables to avoid spurious
-        # issue with Keras that leads to different performance evaluation results
-        # when model is reloaded (https://github.com/keras-team/keras/issues/4875).
+        # Use Keras native weight saving (TF2/Keras 3 compatible)
+        utils.create_folder_if_not_exist(model_folder)
+        serialisation_path = self.get_keras_saved_path(model_folder)
+        print("Saving model to {}".format(serialisation_path))
+        self.model.save_weights(serialisation_path)
 
-        utils.save(tf.keras.backend.get_session(), model_folder, cp_name=self.name, scope=self.name)
-
-    def load(self, model_folder, use_keras_loadings=False):
+    def load(self, model_folder, use_keras_loadings=True):
         """Loads TFT weights.
 
         Args:
           model_folder: Folder containing serialized models.
-          use_keras_loadings: Whether to load from Keras checkpoint.
+          use_keras_loadings: Whether to load from Keras checkpoint (default True for TF2/Keras 3).
 
         Returns:
 
         """
-        if use_keras_loadings:
-            # Loads temporary Keras model saved during training.
-            serialisation_path = self.get_keras_saved_path(model_folder)
-            print("Loading model from {}".format(serialisation_path))
-            self.model.load_weights(serialisation_path)
-        else:
-            # Loads tensorflow graph for optimal models.
-            utils.load(tf.keras.backend.get_session(), model_folder, cp_name=self.name, scope=self.name)
+        # Use Keras native weight loading (TF2/Keras 3 compatible)
+        serialisation_path = self.get_keras_saved_path(model_folder)
+        print("Loading model from {}".format(serialisation_path))
+        self.model.load_weights(serialisation_path)
 
     @classmethod
     def get_hyperparm_choices(cls):

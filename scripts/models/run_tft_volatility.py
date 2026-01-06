@@ -113,10 +113,11 @@ InputTypes = data_formatters.base.InputTypes
 class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
     """Data formatter for Alpha158_Volatility_TALib dataset."""
 
-    def __init__(self, feature_cols, use_talib=False):
+    def __init__(self, feature_cols, use_talib=False, epochs=50):
         """Initialize formatter with selected features."""
         self.feature_cols = feature_cols
         self.use_talib = use_talib
+        self.epochs = epochs
         self._build_column_def()
 
         self.identifiers = None
@@ -232,21 +233,21 @@ class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
     def get_fixed_params(self):
         """Returns fixed model parameters for experiments."""
         return {
-            "total_time_steps": 6 + 6,
-            "num_encoder_steps": 6,
-            "num_epochs": 50,  # Reduced for faster training
-            "early_stopping_patience": 10,
+            "total_time_steps": 14 + 5,  # 14 days history + 5 days decoder (for valid attention)
+            "num_encoder_steps": 14,
+            "num_epochs": self.epochs,
+            "early_stopping_patience": 20,  # More patience for learning
             "multiprocessing_workers": 4,
         }
 
     def get_default_model_params(self):
         """Returns default optimised model parameters."""
         return {
-            "dropout_rate": 0.3,
-            "hidden_layer_size": 128,
-            "learning_rate": 0.001,
-            "minibatch_size": 64,
-            "max_gradient_norm": 0.01,
+            "dropout_rate": 0.1,  # Reduced dropout for better learning
+            "hidden_layer_size": 128,  # Restored for sufficient capacity
+            "learning_rate": 0.0005,  # Slightly lower for stability
+            "minibatch_size": 128,  # Balanced batch size
+            "max_gradient_norm": 1.0,  # Much larger to allow gradient flow
             "num_heads": 4,
             "stack_size": 1,
         }
@@ -305,7 +306,7 @@ def process_predicted(df, col_name):
     df_res = df_res.rename(columns={
         "forecast_time": "datetime",
         "identifier": "instrument",
-        "t+4": col_name
+        "t+0": col_name  # Use first prediction step for 1-day ahead forecast
     })
     df_res = df_res.set_index(["datetime", "instrument"]).sort_index()
     df_res = df_res[[col_name]]
@@ -332,11 +333,12 @@ def transform_df(df, col_name="LABEL0"):
 class TFTVolatilityModel(ModelFT):
     """TFT Model for Volatility Prediction."""
 
-    def __init__(self, feature_cols, use_talib=False, label_shift=5, **kwargs):
+    def __init__(self, feature_cols, use_talib=False, label_shift=5, epochs=50, **kwargs):
         self.model = None
         self.feature_cols = feature_cols
         self.use_talib = use_talib
         self.label_shift = label_shift
+        self.epochs = epochs
         self.params = kwargs
 
     def _prepare_data(self, dataset: DatasetH):
@@ -362,7 +364,7 @@ class TFTVolatilityModel(ModelFT):
 
         # Create data formatter
         available_features = [f for f in self.feature_cols if f in train.columns]
-        self.data_formatter = Alpha158VolatilityTALibFormatter(available_features, self.use_talib)
+        self.data_formatter = Alpha158VolatilityTALibFormatter(available_features, self.use_talib, self.epochs)
         self.model_folder = model_folder
         self.gpu_id = gpu_id
 
@@ -442,6 +444,59 @@ class TFTVolatilityModel(ModelFT):
     def finetune(self, dataset: DatasetH):
         pass
 
+    def load(self, dataset: DatasetH, model_folder: str, gpu_id: int = 0):
+        """Load a pre-trained TFT model from saved path."""
+        self.model_folder = model_folder
+        self.gpu_id = gpu_id
+
+        saved_model_dir = os.path.join(self.model_folder, "saved_model")
+        if not os.path.exists(saved_model_dir):
+            raise ValueError(f"Saved model not found at {saved_model_dir}")
+
+        # Prepare data to set scalers (needed for prediction)
+        dtrain, dvalid = self._prepare_data(dataset)
+
+        # Shift labels for consistency
+        dtrain.loc[:, "LABEL0"] = get_shifted_label(dtrain, shifts=self.label_shift, col_shift="LABEL0")
+
+        train = process_qlib_data(dtrain, self.feature_cols, fillna=True).dropna()
+
+        # Create data formatter and set scalers
+        available_features = [f for f in self.feature_cols if f in train.columns]
+        self.data_formatter = Alpha158VolatilityTALibFormatter(available_features, self.use_talib, self.epochs)
+        self.data_formatter.set_scalers(train)
+
+        # Configure GPU
+        use_gpu = (True, self.gpu_id)
+        if use_gpu[0]:
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(use_gpu[1])
+            print(f"Selecting GPU ID={use_gpu[1]}")
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                try:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                except RuntimeError as e:
+                    print(f"GPU config error: {e}")
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+        # Get model parameters
+        fixed_params = self.data_formatter.get_experiment_params()
+        params = self.data_formatter.get_default_model_params()
+        params = {**params, **fixed_params}
+        params["model_folder"] = self.model_folder
+
+        print("\n*** Loading TFT Model ***")
+        print(f"    Loading from: {saved_model_dir}")
+
+        ModelClass = libs.tft_model.TemporalFusionTransformer
+        self.model = ModelClass(params, use_cudnn=use_gpu[0])
+        self.model.load(saved_model_dir)
+
+        print("*** Model Loaded Successfully ***")
+
     def to_pickle(self, path: Union[Path, str]):
         drop_attrs = ["model", "tf_graph", "sess", "data_formatter"]
         orig_attr = {}
@@ -465,6 +520,8 @@ def main():
                         help='GPU ID to use (default: 0)')
     parser.add_argument('--epochs', type=int, default=50,
                         help='Number of training epochs (default: 50)')
+    parser.add_argument('--load-model', action='store_true',
+                        help='Skip training and load model from saved path for prediction only')
     args = parser.parse_args()
 
     global VOLATILITY_WINDOW
@@ -575,23 +632,33 @@ def main():
     print(f"      Mean:   {valid_label['LABEL0'].mean():.4f}")
     print(f"      Std:    {valid_label['LABEL0'].std():.4f}")
 
-    # 6. Train TFT model
-    print("\n[7] Training Temporal Fusion Transformer (TFT) model...")
-
+    # 6. Train or Load TFT model
     model_folder = str(PROJECT_ROOT / "my_models" / f"tft_volatility_{VOLATILITY_WINDOW}d")
 
     model = TFTVolatilityModel(
         feature_cols=available_features,
         use_talib=args.use_talib,
-        label_shift=5,
+        label_shift=1,  # Predict 1 day ahead
+        epochs=args.epochs,
     )
 
-    model.fit(
-        dataset,
-        model_folder=model_folder,
-        gpu_id=args.gpu_id,
-    )
-    print("    Model training completed")
+    if args.load_model:
+        print("\n[7] Loading pre-trained TFT model...")
+        print(f"    Model folder: {model_folder}")
+        model.load(
+            dataset,
+            model_folder=model_folder,
+            gpu_id=args.gpu_id,
+        )
+        print("    Model loaded successfully")
+    else:
+        print("\n[7] Training Temporal Fusion Transformer (TFT) model...")
+        model.fit(
+            dataset,
+            model_folder=model_folder,
+            gpu_id=args.gpu_id,
+        )
+        print("    Model training completed")
 
     # 7. Predict
     print("\n[8] Generating predictions...")
