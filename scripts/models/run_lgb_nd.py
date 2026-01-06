@@ -15,6 +15,8 @@ sys.path.insert(0, str(script_dir))
 
 from pathlib import Path
 import argparse
+import numpy as np
+import pandas as pd
 from utils.utils import evaluate_model
 
 import qlib
@@ -42,11 +44,18 @@ NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.pa
 TEST_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ"]
 
 # 时间划分
-TRAIN_START = "2025-01-01"
-TRAIN_END = "2025-09-30"
-VALID_START = "2025-10-01"
-VALID_END = "2025-11-30"
-TEST_START = "2025-12-01"
+# TRAIN_START = "2025-01-01"
+# TRAIN_END = "2025-09-30"
+# VALID_START = "2025-10-01"
+# VALID_END = "2025-11-30"
+# TEST_START = "2025-12-01"
+# TEST_END = "2025-12-31"
+
+TRAIN_START = "2015-01-01"
+TRAIN_END = "2023-12-31"
+VALID_START = "2024-01-01"
+VALID_END = "2024-12-31"
+TEST_START = "2025-01-01"
 TEST_END = "2025-12-31"
 
 # 波动率预测窗口（天数）
@@ -61,6 +70,8 @@ def main():
     parser.add_argument('--news-features', type=str, default='core', choices=['all', 'sentiment', 'stats', 'core'],
                         help='News feature set to use (default: core)')
     parser.add_argument('--news-rolling', action='store_true', help='Add rolling news features (default: False)')
+    parser.add_argument('--top-k', type=int, default=0,
+                        help='Number of top features to select for retraining (0 = disable feature selection)')
     args = parser.parse_args()
 
     # 更新全局变量
@@ -77,6 +88,8 @@ def main():
         print("Features: Alpha158 + TA-Lib Technical Indicators")
     else:
         print("Features: Alpha158 (default)")
+    if args.top_k > 0:
+        print(f"Feature Selection: Top {args.top_k} features will be selected for retraining")
     print("=" * 70)
 
     # 1. 初始化 Qlib (包含 TA-Lib 自定义算子)
@@ -207,16 +220,105 @@ def main():
     model.fit(dataset)
     print("    ✓ Model training completed")
 
-    # 6. 预测
-    print("\n[7] Generating predictions...")
-    pred = model.predict(dataset)
+    # 6.5. 特征重要性分析
+    print("\n[7] Feature Importance Analysis...")
+    feature_names = train_data.columns.tolist()
+    importance = model.model.feature_importance(importance_type='gain')
 
-    test_pred = pred.loc[TEST_START:TEST_END]
-    print(f"    ✓ Prediction shape: {test_pred.shape}")
-    print(f"    ✓ Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+    # 创建特征重要性 DataFrame
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importance
+    }).sort_values('importance', ascending=False)
 
-    # 7. 评估
-    evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
+    # 打印 top 20 特征
+    print("\n    Top 20 Features by Importance (gain):")
+    print("    " + "-" * 50)
+    for i, row in importance_df.head(20).iterrows():
+        print(f"    {importance_df.index.get_loc(i)+1:3d}. {row['feature']:<40s} {row['importance']:>10.2f}")
+    print("    " + "-" * 50)
+    print(f"    Total features: {len(feature_names)}")
+
+    # 特征选择和重新训练
+    if args.top_k > 0 and args.top_k < len(feature_names):
+        print(f"\n[8] Feature Selection and Retraining...")
+        print(f"    Selecting top {args.top_k} features...")
+
+        # 选择 top-k 特征
+        top_features = importance_df.head(args.top_k)['feature'].tolist()
+        print(f"    Selected features: {top_features[:10]}{'...' if len(top_features) > 10 else ''}")
+
+        # 准备筛选后的数据
+        train_data_selected = dataset.prepare("train", col_set="feature")[top_features]
+        valid_data_selected = dataset.prepare("valid", col_set="feature")[top_features]
+        test_data_selected = dataset.prepare("test", col_set="feature")[top_features]
+
+        train_label = dataset.prepare("train", col_set="label")
+        valid_label = dataset.prepare("valid", col_set="label")
+        test_label = dataset.prepare("test", col_set="label")
+
+        print(f"    ✓ Selected train features shape: {train_data_selected.shape}")
+
+        # 重新训练模型
+        print("\n    Retraining with selected features...")
+        import lightgbm as lgb
+        train_set = lgb.Dataset(train_data_selected, label=train_label.values.ravel())
+        valid_set = lgb.Dataset(valid_data_selected, label=valid_label.values.ravel())
+
+        lgb_params = {
+            'objective': 'regression',
+            'metric': 'mse',
+            'learning_rate': 0.01,
+            'max_depth': 8,
+            'num_leaves': 128,
+            'num_threads': 4,
+            'verbose': -1,
+        }
+
+        lgb_model = lgb.train(
+            lgb_params,
+            train_set,
+            num_boost_round=200,
+            valid_sets=[valid_set],
+            callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)]
+        )
+        print("    ✓ Retraining completed")
+
+        # 打印重新训练后的特征重要性
+        print("\n    Feature Importance after Retraining:")
+        print("    " + "-" * 50)
+        importance_retrained = lgb_model.feature_importance(importance_type='gain')
+        importance_retrained_df = pd.DataFrame({
+            'feature': top_features,
+            'importance': importance_retrained
+        }).sort_values('importance', ascending=False)
+
+        for i, row in importance_retrained_df.iterrows():
+            print(f"    {importance_retrained_df.index.get_loc(i)+1:3d}. {row['feature']:<40s} {row['importance']:>10.2f}")
+        print("    " + "-" * 50)
+
+        # 预测
+        print("\n[9] Generating predictions with selected features...")
+        test_pred_values = lgb_model.predict(test_data_selected)
+        test_pred = pd.Series(test_pred_values, index=test_data_selected.index, name='score')
+        print(f"    ✓ Prediction shape: {test_pred.shape}")
+        print(f"    ✓ Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+
+        # 评估
+        print("\n[10] Evaluation with selected features...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
+    else:
+        # 原始模型预测
+        print("\n[8] Generating predictions...")
+        pred = model.predict(dataset)
+
+        test_pred = pred.loc[TEST_START:TEST_END]
+        print(f"    ✓ Prediction shape: {test_pred.shape}")
+        print(f"    ✓ Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+
+        # 评估
+        print("\n[9] Evaluation...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
 
 
 if __name__ == "__main__":
