@@ -22,7 +22,7 @@ from typing import Union
 
 import numpy as np
 import pandas as pd
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 import qlib
 from qlib.constant import REG_US
@@ -31,8 +31,7 @@ from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 from qlib.model.base import ModelFT
 
-# Disable TF2 behavior
-tf.disable_v2_behavior()
+# TF2/Keras 3 uses eager execution by default - no need to disable v2 behavior
 
 # Import TA-Lib custom operators
 from utils.talib_ops import TALIB_OPS
@@ -42,7 +41,8 @@ from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
 from utils.utils import evaluate_model
 
 # Add TFT benchmark path for imports
-TFT_PATH = Path(__file__).parent.parent / "qlib" / "examples" / "benchmarks" / "TFT"
+# Path(__file__).parent.parent.parent is the project root (qlib-proj/)
+TFT_PATH = Path(__file__).parent.parent.parent / "qlib" / "examples" / "benchmarks" / "TFT"
 sys.path.insert(0, str(TFT_PATH))
 
 import data_formatters.base
@@ -117,7 +117,7 @@ class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
         """Initialize formatter with selected features."""
         self.feature_cols = feature_cols
         self.use_talib = use_talib
-        self._build_column_definition()
+        self._build_column_def()
 
         self.identifiers = None
         self._real_scalers = None
@@ -125,9 +125,9 @@ class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
         self._target_scaler = None
         self._num_classes_per_cat_input = None
 
-    def _build_column_definition(self):
+    def _build_column_def(self):
         """Build column definition based on selected features."""
-        self._column_definition = [
+        self._column_def = [
             ("instrument", DataTypes.CATEGORICAL, InputTypes.ID),
             ("LABEL0", DataTypes.REAL_VALUED, InputTypes.TARGET),
             ("date", DataTypes.DATE, InputTypes.TIME),
@@ -137,14 +137,28 @@ class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
 
         # Add selected features as observed inputs
         for feat in self.feature_cols:
-            self._column_definition.append(
+            self._column_def.append(
                 (feat, DataTypes.REAL_VALUED, InputTypes.OBSERVED_INPUT)
             )
 
         # Add static input
-        self._column_definition.append(
+        self._column_def.append(
             ("const", DataTypes.CATEGORICAL, InputTypes.STATIC_INPUT)
         )
+
+    @property
+    def _column_definition(self):
+        """Returns column definition (required by base class)."""
+        return self._column_def
+
+    def split_data(self, df, valid_boundary=None, test_boundary=None):
+        """Splits data into train, validation and test sets.
+
+        Note: In this implementation, data splitting is handled by Qlib's DatasetH,
+        so this method is not used but required by the abstract base class.
+        """
+        # This is handled by Qlib's DatasetH, so we just return the df as-is
+        return df, df, df
 
     def set_scalers(self, df):
         """Calibrates scalers using the data supplied."""
@@ -326,8 +340,10 @@ class TFTVolatilityModel(ModelFT):
         self.params = kwargs
 
     def _prepare_data(self, dataset: DatasetH):
+        # Use raw data (DK_R) instead of processed data (DK_L) to avoid double normalization
+        # The TFT's data_formatter will handle normalization internally
         df_train, df_valid = dataset.prepare(
-            ["train", "valid"], col_set=["feature", "label"], data_key=DataHandlerLP.DK_L
+            ["train", "valid"], col_set=["feature", "label"], data_key=DataHandlerLP.DK_R
         )
         return transform_df(df_train), transform_df(df_valid)
 
@@ -354,16 +370,27 @@ class TFTVolatilityModel(ModelFT):
 
         ModelClass = libs.tft_model.TemporalFusionTransformer
 
-        default_keras_session = tf.keras.backend.get_session()
-
+        # Configure GPU for TF2/Keras 3
         if use_gpu[0]:
-            self.tf_config = tft_utils.get_default_tensorflow_config(tf_device="gpu", gpu_id=use_gpu[1])
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(use_gpu[1])
+            print(f"Selecting GPU ID={use_gpu[1]}")
+            # Enable memory growth to avoid OOM
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                try:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                except RuntimeError as e:
+                    print(f"GPU config error: {e}")
         else:
-            self.tf_config = tft_utils.get_default_tensorflow_config(tf_device="cpu")
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable GPU
 
         self.data_formatter.set_scalers(train)
 
-        fixed_params = self.data_formatter.get_fixed_params()
+        # Use get_experiment_params() to include all TFT-required params
+        # (input_size, output_size, category_counts, input_obs_loc, etc.)
+        fixed_params = self.data_formatter.get_experiment_params()
         params = self.data_formatter.get_default_model_params()
         params = {**params, **fixed_params}
 
@@ -376,23 +403,15 @@ class TFTVolatilityModel(ModelFT):
         for key, value in params.items():
             print(f"      - {key}: {value}")
 
-        tf.reset_default_graph()
+        # TF2/Keras 3: No need for Session, Graph context, or variable initialization
+        self.model = ModelClass(params, use_cudnn=use_gpu[0])
+        self.model.fit(train_df=train, valid_df=valid)
+        print("*** Finished TFT Training ***")
 
-        self.tf_graph = tf.Graph()
-        with self.tf_graph.as_default():
-            self.sess = tf.Session(config=self.tf_config)
-            tf.keras.backend.set_session(self.sess)
-            self.model = ModelClass(params, use_cudnn=use_gpu[0])
-            self.sess.run(tf.global_variables_initializer())
-            self.model.fit(train_df=train, valid_df=valid)
-            print("*** Finished TFT Training ***")
-
-            saved_model_dir = os.path.join(self.model_folder, "saved_model")
-            if not os.path.exists(saved_model_dir):
-                os.makedirs(saved_model_dir)
-            self.model.save(saved_model_dir)
-
-            tf.keras.backend.set_session(default_keras_session)
+        saved_model_dir = os.path.join(self.model_folder, "saved_model")
+        if not os.path.exists(saved_model_dir):
+            os.makedirs(saved_model_dir)
+        self.model.save(saved_model_dir)
 
         print(f"Training completed at {dte.datetime.now()}.")
 
@@ -400,20 +419,18 @@ class TFTVolatilityModel(ModelFT):
         if self.model is None:
             raise ValueError("Model is not fitted yet!")
 
-        d_test = dataset.prepare("test", col_set=["feature", "label"])
+        # Use raw data (DK_R) to match training data processing
+        d_test = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_R)
         d_test = transform_df(d_test)
         d_test.loc[:, "LABEL0"] = get_shifted_label(d_test, shifts=self.label_shift, col_shift="LABEL0")
         test = process_qlib_data(d_test, self.feature_cols, fillna=True).dropna()
 
         print("\n*** Begin TFT Prediction ***")
-        default_keras_session = tf.keras.backend.get_session()
 
-        with self.tf_graph.as_default():
-            tf.keras.backend.set_session(self.sess)
-            output_map = self.model.predict(test, return_targets=True)
-            p50_forecast = self.data_formatter.format_predictions(output_map["p50"])
-            p90_forecast = self.data_formatter.format_predictions(output_map["p90"])
-            tf.keras.backend.set_session(default_keras_session)
+        # TF2/Keras 3: No need for Session/Graph context
+        output_map = self.model.predict(test, return_targets=True)
+        p50_forecast = self.data_formatter.format_predictions(output_map["p50"])
+        p90_forecast = self.data_formatter.format_predictions(output_map["p90"])
 
         predict50 = format_score(p50_forecast, "pred", 1)
         predict90 = format_score(p90_forecast, "pred", 1)

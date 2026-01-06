@@ -21,6 +21,7 @@ import pathlib
 
 import numpy as np
 import tensorflow as tf
+# Note: tf.disable_v2_behavior() removed for Keras 3 compatibility
 from tensorflow.python.tools.inspect_checkpoint import print_tensors_in_checkpoint_file
 
 

@@ -34,11 +34,16 @@ import libs.utils as utils
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+# Note: tf.disable_v2_behavior() removed for Keras 3 compatibility
+# Keras 3 requires eager execution mode
+import keras
 
 # Layer definitions.
-concat = tf.keras.backend.concatenate
-stack = tf.keras.backend.stack
-K = tf.keras.backend
+concat = keras.ops.concatenate
+stack = keras.ops.stack
+K = keras.ops
+# Keep tf.keras.backend reference for batch_dot which isn't in keras.ops
+tf_backend = tf.keras.backend
 Add = tf.keras.layers.Add
 LayerNorm = tf.keras.layers.LayerNormalization
 Dense = tf.keras.layers.Dense
@@ -196,11 +201,16 @@ def get_decoder_mask(self_attn_inputs):
 
     Args:
       self_attn_inputs: Inputs to self attention layer to determine mask shape
+
+    Returns:
+      Causal mask wrapped in a Lambda layer for Keras 3 compatibility.
     """
-    len_s = tf.shape(self_attn_inputs)[1]
-    bs = tf.shape(self_attn_inputs)[:1]
-    mask = K.cumsum(tf.eye(len_s, batch_shape=bs), 1)
-    return mask
+    def _create_mask(x):
+        len_s = tf.shape(x)[1]
+        bs = tf.shape(x)[:1]
+        return tf.cumsum(tf.eye(len_s, batch_shape=bs), axis=1)
+
+    return Lambda(_create_mask)(self_attn_inputs)
 
 
 class ScaledDotProductAttention:
@@ -228,14 +238,18 @@ class ScaledDotProductAttention:
         Returns:
           Tuple of (layer outputs, attention weights)
         """
-        temper = tf.sqrt(tf.cast(tf.shape(k)[-1], dtype="float32"))
-        attn = Lambda(lambda x: K.batch_dot(x[0], x[1], axes=[2, 2]) / temper)([q, k])  # shape=(batch, q, k)
+        def _scaled_dot_product(inputs):
+            q_in, k_in = inputs
+            temper = tf.sqrt(tf.cast(tf.shape(k_in)[-1], dtype="float32"))
+            return tf_backend.batch_dot(q_in, k_in, axes=[2, 2]) / temper
+
+        attn = Lambda(_scaled_dot_product)([q, k])  # shape=(batch, q, k)
         if mask is not None:
             mmask = Lambda(lambda x: (-1e9) * (1.0 - K.cast(x, "float32")))(mask)  # setting to infinity
             attn = Add()([attn, mmask])
         attn = self.activation(attn)
         attn = self.dropout(attn)
-        output = Lambda(lambda x: K.batch_dot(x[0], x[1]))([attn, v])
+        output = Lambda(lambda x: tf_backend.batch_dot(x[0], x[1]))([attn, v])
         return output, attn
 
 
@@ -461,10 +475,11 @@ class TemporalFusionTransformer:
             if i in self._static_input_loc:
                 raise ValueError("Observation cannot be static!")
 
-        if all_inputs.get_shape().as_list()[-1] != self.input_size:
+        input_dim = int(all_inputs.shape[-1])
+        if input_dim != self.input_size:
             raise ValueError(
                 "Illegal number of inputs! Inputs observed={}, expected={}".format(
-                    all_inputs.get_shape().as_list()[-1], self.input_size
+                    input_dim, self.input_size
                 )
             )
 
@@ -503,7 +518,7 @@ class TemporalFusionTransformer:
                 for i in range(num_categorical_variables)
                 if i + num_regular_variables in self._static_input_loc
             ]
-            static_inputs = tf.keras.backend.stack(static_inputs, axis=1)
+            static_inputs = keras.ops.stack(static_inputs, axis=1)
 
         else:
             static_inputs = None
@@ -513,7 +528,7 @@ class TemporalFusionTransformer:
             return tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.hidden_layer_size))(x)
 
         # Targets
-        obs_inputs = tf.keras.backend.stack(
+        obs_inputs = keras.ops.stack(
             [convert_real_to_embedding(regular_inputs[Ellipsis, i : i + 1]) for i in self._input_obs_loc], axis=-1
         )
 
@@ -531,7 +546,7 @@ class TemporalFusionTransformer:
                 unknown_inputs.append(e)
 
         if unknown_inputs + wired_embeddings:
-            unknown_inputs = tf.keras.backend.stack(unknown_inputs + wired_embeddings, axis=-1)
+            unknown_inputs = keras.ops.stack(unknown_inputs + wired_embeddings, axis=-1)
         else:
             unknown_inputs = None
 
@@ -547,7 +562,7 @@ class TemporalFusionTransformer:
             if i + num_regular_variables not in self._static_input_loc
         ]
 
-        known_combined_layer = tf.keras.backend.stack(known_regular_inputs + known_categorical_inputs, axis=-1)
+        known_combined_layer = keras.ops.stack(known_regular_inputs + known_categorical_inputs, axis=-1)
 
         return unknown_inputs, known_combined_layer, obs_inputs, static_inputs
 
@@ -757,7 +772,7 @@ class TemporalFusionTransformer:
             """
 
             # Add temporal features
-            _, num_static, _ = embedding.get_shape().as_list()
+            num_static = int(embedding.shape[1])
 
             flatten = tf.keras.layers.Flatten()(embedding)
 
@@ -818,7 +833,9 @@ class TemporalFusionTransformer:
             """
 
             # Add temporal features
-            _, time_steps, embedding_dim, num_inputs = embedding.get_shape().as_list()
+            time_steps = int(embedding.shape[1])
+            embedding_dim = int(embedding.shape[2])
+            num_inputs = int(embedding.shape[3])
 
             flatten = K.reshape(embedding, [-1, time_steps, embedding_dim * num_inputs])
 
@@ -836,7 +853,7 @@ class TemporalFusionTransformer:
             )
 
             sparse_weights = tf.keras.layers.Activation("softmax")(mlp_outputs)
-            sparse_weights = tf.expand_dims(sparse_weights, axis=2)
+            sparse_weights = K.expand_dims(sparse_weights, axis=2)
 
             # Non-linear Processing & weight application
             trans_emb_list = []
@@ -861,28 +878,24 @@ class TemporalFusionTransformer:
 
         # LSTM layer
         def get_lstm(return_state):
-            """Returns LSTM cell initialized with default parameters."""
-            if self.use_cudnn:
-                lstm = tf.keras.layers.CuDNNLSTM(
-                    self.hidden_layer_size,
-                    return_sequences=True,
-                    return_state=return_state,
-                    stateful=False,
-                )
-            else:
-                lstm = tf.keras.layers.LSTM(
-                    self.hidden_layer_size,
-                    return_sequences=True,
-                    return_state=return_state,
-                    stateful=False,
-                    # Additional params to ensure LSTM matches CuDNN, See TF 2.0 :
-                    # (https://www.tensorflow.org/api_docs/python/tf/keras/layers/LSTM)
-                    activation="tanh",
-                    recurrent_activation="sigmoid",
-                    recurrent_dropout=0,
-                    unroll=False,
-                    use_bias=True,
-                )
+            """Returns LSTM cell initialized with default parameters.
+
+            In Keras 3, CuDNNLSTM was removed. Standard LSTM automatically uses
+            cuDNN when GPU is available and layer config is compatible.
+            """
+            # Use standard LSTM - it will automatically use cuDNN on GPU
+            # when using default activations and recurrent_dropout=0
+            lstm = tf.keras.layers.LSTM(
+                self.hidden_layer_size,
+                return_sequences=True,
+                return_state=return_state,
+                stateful=False,
+                activation="tanh",
+                recurrent_activation="sigmoid",
+                recurrent_dropout=0,
+                unroll=False,
+                use_bias=True,
+            )
             return lstm
 
         history_lstm, state_h, state_c = get_lstm(return_state=True)(
@@ -951,7 +964,8 @@ class TemporalFusionTransformer:
           Fully defined Keras model.
         """
 
-        with tf.variable_scope(self.name):
+        # Note: tf.variable_scope replaced with tf.name_scope for TF2 compatibility
+        with tf.name_scope(self.name):
             transformer_layer, all_inputs, attention_components = self._build_base_graph()
 
             outputs = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(self.output_size * len(self.quantiles)))(
@@ -960,11 +974,15 @@ class TemporalFusionTransformer:
 
             self._attention_components = attention_components
 
-            adam = tf.keras.optimizers.Adam(lr=self.learning_rate, clipnorm=self.max_gradient_norm)
+            adam = tf.keras.optimizers.Adam(learning_rate=self.learning_rate, clipnorm=self.max_gradient_norm)
 
             model = tf.keras.Model(inputs=all_inputs, outputs=outputs)
 
-            print(model.summary())
+            # Note: model.summary() may cause Dimension/int division errors in some TF/Keras versions
+            try:
+                model.summary()
+            except TypeError:
+                print("Model built successfully (summary skipped due to TF compatibility)")
 
             valid_quantiles = self.quantiles
             output_size = self.output_size
@@ -1005,7 +1023,8 @@ class TemporalFusionTransformer:
 
             quantile_loss = QuantileLossCalculator(valid_quantiles).quantile_loss
 
-            model.compile(loss=quantile_loss, optimizer=adam, sample_weight_mode="temporal")
+            # Note: sample_weight_mode was removed in Keras 3
+            model.compile(loss=quantile_loss, optimizer=adam)
 
             self._input_placeholder = all_inputs
 
@@ -1057,6 +1076,7 @@ class TemporalFusionTransformer:
 
         all_callbacks = callbacks
 
+        # Note: use_multiprocessing and workers removed in Keras 3
         self.model.fit(
             x=data,
             y=np.concatenate([labels, labels, labels], axis=-1),
@@ -1066,8 +1086,6 @@ class TemporalFusionTransformer:
             validation_data=(val_data, np.concatenate([val_labels, val_labels, val_labels], axis=-1), val_flags),
             callbacks=all_callbacks,
             shuffle=True,
-            use_multiprocessing=True,
-            workers=self.n_multiprocessing_workers,
         )
 
         # Load best checkpoint again
@@ -1230,7 +1248,8 @@ class TemporalFusionTransformer:
 
     def get_keras_saved_path(self, model_folder):
         """Returns path to keras checkpoint."""
-        return os.path.join(model_folder, "{}.check".format(self.name))
+        # Keras 3 requires .weights.h5 extension for save_weights_only=True
+        return os.path.join(model_folder, "{}.weights.h5".format(self.name))
 
     def save(self, model_folder):
         """Saves optimal TFT weights.

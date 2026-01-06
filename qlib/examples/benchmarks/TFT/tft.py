@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Union
 import numpy as np
 import pandas as pd
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 import data_formatters.base
 import expt_settings.configs
 import libs.hyperparam_opt
