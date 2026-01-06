@@ -24,6 +24,7 @@ from qlib.constant import REG_US
 from qlib.data import D
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.data.dataset import DatasetH
+from qlib.data.dataset.handler import DataHandlerLP
 
 # Import TA-Lib custom operators
 from utils.talib_ops import TALIB_OPS
@@ -176,9 +177,30 @@ def main():
         }
     )
 
-    train_data = dataset.prepare("train", col_set="feature")
+    # Use same data_key as qlib's LGBModel internally uses (DK_L = learn)
+    train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
     print(f"    ✓ Train features shape: {train_data.shape}")
     print(f"      (samples × features)")
+
+    # Identify columns that will be dropped by LightGBM (all NaN or constant)
+    valid_cols = []
+    dropped_cols = []
+    for col in train_data.columns:
+        col_data = train_data[col]
+        if col_data.isna().all():
+            dropped_cols.append(col)
+        elif col_data.nunique(dropna=True) <= 1:
+            dropped_cols.append(col)
+        else:
+            valid_cols.append(col)
+
+    if dropped_cols:
+        print(f"    ⚠ {len(dropped_cols)} features will be dropped (all NaN or constant):")
+        for col in dropped_cols[:5]:
+            print(f"      - {col}")
+        if len(dropped_cols) > 5:
+            print(f"      ... and {len(dropped_cols) - 5} more")
+    print(f"    ✓ Valid features: {len(valid_cols)}")
 
     # 检查标签分布
     print("\n[5] Analyzing label distribution...")
@@ -222,8 +244,19 @@ def main():
 
     # 6.5. 特征重要性分析
     print("\n[7] Feature Importance Analysis...")
-    feature_names = train_data.columns.tolist()
     importance = model.model.feature_importance(importance_type='gain')
+    num_model_features = model.model.num_feature()
+
+    # Verify our valid_cols matches model's feature count
+    print(f"    Model expects {num_model_features} features, detected {len(valid_cols)} valid columns")
+    if len(valid_cols) != num_model_features:
+        print(f"    ⚠ Feature count mismatch!")
+        # Get all columns from training data - the model used these in order
+        all_train_cols = train_data.columns.tolist()
+        feature_names = all_train_cols[:num_model_features]
+        print(f"    Using first {num_model_features} columns: {feature_names[:3]}...{feature_names[-3:]}")
+    else:
+        feature_names = valid_cols
 
     # 创建特征重要性 DataFrame
     importance_df = pd.DataFrame({
@@ -288,6 +321,7 @@ def main():
         print("\n    Feature Importance after Retraining:")
         print("    " + "-" * 50)
         importance_retrained = lgb_model.feature_importance(importance_type='gain')
+        # Use top_features directly (we know exactly which features were used for retraining)
         importance_retrained_df = pd.DataFrame({
             'feature': top_features,
             'importance': importance_retrained
@@ -299,6 +333,7 @@ def main():
 
         # 预测
         print("\n[9] Generating predictions with selected features...")
+        # Use test_data_selected directly (already filtered to top_features)
         test_pred_values = lgb_model.predict(test_data_selected)
         test_pred = pd.Series(test_pred_values, index=test_data_selected.index, name='score')
         print(f"    ✓ Prediction shape: {test_pred.shape}")
@@ -310,9 +345,23 @@ def main():
     else:
         # 原始模型预测
         print("\n[8] Generating predictions...")
-        pred = model.predict(dataset)
+        # Get test features - use DK_I for inference (matches qlib's predict)
+        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_I)
+        print(f"    Test data shape: {test_data.shape}")
 
-        test_pred = pred.loc[TEST_START:TEST_END]
+        # Filter to match training features exactly
+        missing_features = [f for f in feature_names if f not in test_data.columns]
+        if missing_features:
+            print(f"    ⚠ {len(missing_features)} training features missing in test data")
+            # Add missing columns as NaN
+            for f in missing_features:
+                test_data[f] = np.nan
+
+        test_data_filtered = test_data[feature_names]
+        print(f"    Filtered test features: {test_data_filtered.shape[1]} (expected: {len(feature_names)})")
+
+        pred_values = model.model.predict(test_data_filtered.values)
+        test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')
         print(f"    ✓ Prediction shape: {test_pred.shape}")
         print(f"    ✓ Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
 

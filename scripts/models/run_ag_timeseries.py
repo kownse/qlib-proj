@@ -9,6 +9,41 @@
 import sys
 from pathlib import Path
 
+# IMPORTANT: Fix autogluon import path conflict.
+# The autogluon submodule at ./autogluon/ conflicts with the editable install.
+# The nspkg.pth files pre-import autogluon during Python startup with wrong paths
+# because the submodule directory structure shadows the proper src/ paths.
+#
+# Solution: Add the correct autogluon src/ directories to sys.path before importing,
+# clear any pre-imported autogluon modules, and remove conflicting paths.
+
+# Get project root (where autogluon submodule lives)
+project_root = Path(__file__).parent.parent.parent
+
+# Remove cwd and project root from path to prevent finding submodule
+if '' in sys.path:
+    sys.path.remove('')
+project_root_str = str(project_root)
+if project_root_str in sys.path:
+    sys.path.remove(project_root_str)
+
+# Clear any pre-imported autogluon modules
+modules_to_remove = [k for k in list(sys.modules.keys()) if k.startswith('autogluon')]
+for m in modules_to_remove:
+    del sys.modules[m]
+
+# Add the correct autogluon src/ directories to sys.path
+# These contain the actual autogluon namespace package components
+autogluon_submodule = project_root / "autogluon"
+if autogluon_submodule.exists():
+    autogluon_components = ['autogluon', 'common', 'core', 'eda', 'features', 'tabular', 'timeseries']
+    for component in reversed(autogluon_components):
+        src_path = autogluon_submodule / component / "src"
+        if src_path.exists():
+            src_path_str = str(src_path)
+            if src_path_str not in sys.path:
+                sys.path.insert(0, src_path_str)
+
 # Add scripts directory to path for imports
 script_dir = Path(__file__).parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
@@ -29,6 +64,9 @@ from utils.talib_ops import TALIB_OPS
 
 # Import extended data handlers
 from data.datahandler_ext import Alpha158_Volatility_TALib
+
+# Import evaluation utilities
+from utils.utils import evaluate_model
 
 
 # ========== 配置 ==========
@@ -156,69 +194,6 @@ def prepare_all_data(dataset):
     return train_ts, full_ts, test_start_date
 
 
-def evaluate_predictions(predictions, actual_data, test_start_date):
-    """
-    评估预测结果
-
-    Args:
-        predictions: TimeSeriesPredictor 的预测结果
-        actual_data: 完整的时序数据
-        test_start_date: 测试集开始日期
-
-    Returns:
-        dict: 评估指标
-    """
-    # 获取预测的 mean 值
-    pred_df = predictions.reset_index()
-
-    # 获取实际值
-    actual_df = actual_data.reset_index()
-    actual_df = actual_df[actual_df["timestamp"] >= test_start_date]
-
-    # 合并预测和实际值
-    merged = pd.merge(
-        pred_df[["item_id", "timestamp", "mean"]],
-        actual_df[["item_id", "timestamp", "target"]],
-        on=["item_id", "timestamp"],
-        how="inner"
-    )
-
-    if len(merged) == 0:
-        print("Warning: No overlapping data between predictions and actual values")
-        return {}
-
-    # 计算评估指标
-    y_true = merged["target"].values
-    y_pred = merged["mean"].values
-
-    # MSE
-    mse = np.mean((y_true - y_pred) ** 2)
-
-    # RMSE
-    rmse = np.sqrt(mse)
-
-    # MAE
-    mae = np.mean(np.abs(y_true - y_pred))
-
-    # MAPE (避免除以零)
-    mask = y_true != 0
-    mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if mask.sum() > 0 else np.nan
-
-    # IC (Information Coefficient - 皮尔逊相关系数)
-    ic = np.corrcoef(y_true, y_pred)[0, 1] if len(y_true) > 1 else np.nan
-
-    metrics = {
-        "MSE": mse,
-        "RMSE": rmse,
-        "MAE": mae,
-        "MAPE": mape,
-        "IC": ic,
-        "N_samples": len(merged)
-    }
-
-    return metrics
-
-
 def main():
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='AutoGluon TimeSeriesPredictor for Stock Volatility Prediction')
@@ -336,29 +311,34 @@ def main():
     print(f"    ✓ Predictions shape: {predictions.shape}")
     print(f"    ✓ Prediction columns: {list(predictions.columns)}")
 
-    # 9. 评估预测结果
-    print("\n[8] Evaluating predictions...")
-    metrics = evaluate_predictions(predictions, full_ts, test_start_date)
+    # 9. 转换预测结果为 evaluate_model 期望的格式
+    print("\n[8] Preparing predictions for evaluation...")
 
-    if metrics:
-        print("\n    Evaluation Metrics:")
-        print("    " + "-" * 40)
-        for metric_name, value in metrics.items():
-            if metric_name == "N_samples":
-                print(f"    {metric_name:<15s}: {value}")
-            else:
-                print(f"    {metric_name:<15s}: {value:.6f}")
-        print("    " + "-" * 40)
+    # 将 AutoGluon 预测结果转换为 (datetime, instrument) 索引的 Series
+    pred_df = predictions.reset_index()
+    pred_df = pred_df.rename(columns={
+        "item_id": "instrument",
+        "timestamp": "datetime",
+        "mean": "prediction"
+    })
 
-    # 10. 保存预测结果
-    print("\n[9] Saving results...")
+    # 过滤出测试集日期范围内的预测
+    pred_df = pred_df[pred_df["datetime"] >= test_start_date]
+
+    # 设置 MultiIndex 并转为 Series
+    pred_df = pred_df.set_index(["datetime", "instrument"])
+    test_pred = pred_df["prediction"]
+
+    print(f"    ✓ Converted predictions: {len(test_pred)} samples")
+
+    # 10. 使用 evaluate_model 进行评估和可视化
+    evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
+
+    # 11. 保存预测结果
+    print("\n[11] Saving results...")
     predictions_path = OUTPUT_PATH / f"predictions_nday{VOLATILITY_WINDOW}_pred{PREDICTION_LENGTH}.parquet"
     predictions.reset_index().to_parquet(predictions_path)
     print(f"    ✓ Predictions saved to: {predictions_path}")
-
-    # 显示预测样本
-    print("\n[10] Sample predictions:")
-    print(predictions.head(20).to_string())
 
     print("\n" + "=" * 70)
     print("AutoGluon TimeSeriesPredictor training and prediction completed!")

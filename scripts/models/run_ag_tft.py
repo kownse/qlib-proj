@@ -10,6 +10,42 @@ import os
 import sys
 from pathlib import Path
 
+# IMPORTANT: Fix autogluon import path conflict.
+# The autogluon submodule at ./autogluon/ conflicts with the editable install.
+# The nspkg.pth files pre-import autogluon during Python startup with wrong paths
+# because the submodule directory structure shadows the proper src/ paths.
+#
+# Solution: Add the correct autogluon src/ directories to sys.path before importing,
+# clear any pre-imported autogluon modules, and remove conflicting paths.
+
+# Get project root (where autogluon submodule lives)
+project_root = Path(__file__).parent.parent.parent
+
+# Remove cwd and project root from path to prevent finding submodule
+if '' in sys.path:
+    sys.path.remove('')
+project_root_str = str(project_root)
+if project_root_str in sys.path:
+    sys.path.remove(project_root_str)
+
+# Clear any pre-imported autogluon modules
+modules_to_remove = [k for k in list(sys.modules.keys()) if k.startswith('autogluon')]
+for m in modules_to_remove:
+    del sys.modules[m]
+
+# Add the correct autogluon src/ directories to sys.path
+# These contain the actual autogluon namespace package components
+autogluon_submodule = project_root / "autogluon"
+if autogluon_submodule.exists():
+    autogluon_components = ['autogluon', 'common', 'core', 'eda', 'features', 'tabular', 'timeseries']
+    for component in reversed(autogluon_components):
+        src_path = autogluon_submodule / component / "src"
+        if src_path.exists():
+            src_path_str = str(src_path)
+            if src_path_str not in sys.path:
+                sys.path.insert(0, src_path_str)
+
+
 # 修复 macOS 上 PyTorch 多线程锁问题
 # 必须在导入 torch 之前设置
 os.environ["OMP_NUM_THREADS"] = "1"
