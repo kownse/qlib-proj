@@ -4,244 +4,183 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a quantitative trading research project built on Microsoft's Qlib platform. The project focuses on US stock market analysis, particularly technology stocks, using machine learning models for alpha signal generation and backtesting.
+Quantitative trading research project built on Microsoft's Qlib platform. Focus: US stock market analysis using ML models for alpha signal generation, volatility prediction, and backtesting.
 
 ## Project Structure
 
 ```
 qlib-proj/
-├── qlib/              # Qlib library source code (see qlib/CLAUDE.md for details)
-├── scripts/           # Custom data download and processing scripts
-├── my_data/           # Market data storage
-│   ├── csv_us/        # Raw CSV data from Yahoo Finance
-│   └── qlib_us/       # Processed Qlib binary format data
-├── my_configs/        # Custom workflow configuration files (YAML)
-├── my_models/         # Trained model checkpoints and artifacts
-├── notebooks/         # Jupyter notebooks for analysis and experiments
-├── outputs/           # Experiment outputs and results
-└── logs/              # Application logs
+├── qlib/                    # Qlib library source (submodule)
+├── autogluon/               # AutoGluon library (submodule, see autogluon/CLAUDE.md)
+├── scripts/
+│   ├── data/                # Data download and handlers
+│   │   ├── download_us_data.py   # Yahoo Finance data downloader
+│   │   ├── datahandler_ext.py    # Extended handlers with TA-Lib
+│   │   └── datahandler_news.py   # Handlers with news features
+│   ├── models/              # Training scripts
+│   │   ├── run_baseline.py       # Basic LightGBM training
+│   │   └── run_lgb_enhanced.py   # Enhanced training with regularization, CV, transfer learning
+│   ├── news/                # News data acquisition
+│   │   ├── download_news.py      # Finnhub news downloader
+│   │   └── process_news.py       # Sentiment analysis pipeline
+│   └── utils/
+│       ├── utils.py              # Evaluation and plotting utilities
+│       └── talib_ops.py          # TA-Lib custom operators for Qlib
+├── my_data/                 # Data storage (gitignored)
+│   ├── csv_us/              # Raw Yahoo Finance CSV data
+│   ├── qlib_us/             # Qlib binary format data
+│   ├── news_csv/            # Raw news data
+│   └── news_processed/      # Processed news features
+├── my_configs/              # Workflow YAML configs
+├── my_models/               # Trained model checkpoints
+├── outputs/                 # Experiment results and figures
+└── mlruns/                  # MLflow tracking
 ```
 
 ## Common Commands
 
-### Data Download and Preparation
+### Data Pipeline
 
 ```bash
-# Download US stock data from Yahoo Finance and convert to Qlib format
-python scripts/download_us_data.py
+# Download US stock data and convert to Qlib format
+python scripts/data/download_us_data.py
 
-# Note: The script downloads tech stocks (AAPL, MSFT, NVDA, etc.) by default
-# Edit TECH_SYMBOLS or SP100_SYMBOLS in the script to customize stock selection
+# Test data loading
+python scripts/data/test_data.py
+
+# Download news data (requires FINNHUB_API_KEY in .env)
+python scripts/news/download_news.py
+
+# Process news into features
+python scripts/news/process_news.py
 ```
 
-### Running Experiments
+### Training Models
 
 ```bash
-# Initialize Qlib with US data (in Python scripts/notebooks)
+# Basic LightGBM baseline
+python scripts/models/run_baseline.py
+
+# Enhanced training with options
+python scripts/models/run_lgb_enhanced.py --help
+
+# Examples:
+python scripts/models/run_lgb_enhanced.py --nday 2 --stock-pool medium --regularization medium
+python scripts/models/run_lgb_enhanced.py --use-news --transfer-learning --feature-selection
+python scripts/models/run_lgb_enhanced.py --cross-validation --cv-folds 3
+```
+
+### Qlib Initialization
+
+```python
 import qlib
 from qlib.constant import REG_US
+from scripts.utils.talib_ops import TALIB_OPS
 
 qlib.init(
     provider_uri="./my_data/qlib_us",
-    region=REG_US
+    region=REG_US,
+    custom_ops=TALIB_OPS  # Enable TA-Lib indicators
 )
-
-# Run a workflow from config file
-cd qlib/examples
-qrun ../../my_configs/your_config.yaml
-
-# Run workflow in debug mode
-python -m pdb qlib/cli/run.py ../my_configs/your_config.yaml
 ```
 
-### Working with Notebooks
+## Key Architecture
+
+### Data Handlers
+
+Extended `DataHandlerLP` classes in `scripts/data/`:
+
+- **Alpha158_Volatility_TALib**: Alpha158 features + TA-Lib indicators (RSI, MACD, Bollinger Bands, ATR, etc.)
+- **Alpha158_Volatility_TALib_News**: Adds news sentiment features
+
+Label config uses N-day forward returns: `Ref($close, -N)/Ref($close, -1) - 1`
+
+### TA-Lib Integration
+
+Custom operators in `scripts/utils/talib_ops.py` registered via `custom_ops` parameter:
+- `TALIB_RSI`, `TALIB_MACD_*`, `TALIB_ATR`, `TALIB_BBANDS_*`, `TALIB_ADX`, etc.
+- Requires TA-Lib C library: `brew install ta-lib && pip install TA-Lib`
+
+### Enhanced Training Features (`run_lgb_enhanced.py`)
+
+1. **Regularization levels**: light/medium/strong presets for different data sizes
+2. **Stock pools**: small (10), medium (30), large (100 S&P stocks)
+3. **Feature selection**: Based on LightGBM feature importance
+4. **Time series CV**: Walk-forward validation with gap days
+5. **Transfer learning**: Pretrain on historical data, finetune with news
+
+### News Pipeline
+
+1. `download_news.py`: Fetches from Finnhub API by symbol/date range
+2. `process_news.py`: Extracts sentiment (TextBlob/VADER) and statistics
+3. Features: `news_sentiment_mean`, `news_count`, `news_sentiment_std`, etc.
+
+## Stock Pools
+
+Defined in `scripts/data/download_us_data.py` and `scripts/models/run_lgb_enhanced.py`:
+
+- **TECH_SYMBOLS**: ~30 tech stocks (Mag 7, semis, software, internet)
+- **SP100_SYMBOLS**: S&P 100 components
+
+## Time Periods
+
+Default splits in training scripts:
+- Pretrain: 2015-2024 (no news, for transfer learning)
+- Train: 2025-01-01 to 2025-09-30
+- Valid: 2025-10-01 to 2025-11-30
+- Test: 2025-12-01 to 2025-12-31
+
+## Evaluation Metrics
+
+`scripts/utils/utils.py` provides:
+- IC (Information Coefficient) and ICIR
+- MSE, MAE, RMSE, MAPE
+- Visualization: time series plots, scatter plots, error analysis
+
+## AutoGluon Integration
+
+AutoGluon provides AutoML for tabular and time series prediction. See `autogluon/CLAUDE.md` for details.
 
 ```bash
-# Start Jupyter notebook server
-jupyter notebook notebooks/
+# Install AutoGluon
+pip install autogluon
 
-# Install analysis dependencies if needed
-pip install -e qlib/.[analysis]
+# Or install from local source
+cd autogluon && ./full_install.sh
 ```
 
-## Key Implementation Details
-
-### Data Pipeline
-
-**CSV to Qlib Binary Conversion**: The project uses a custom script `scripts/download_us_data.py` to:
-1. Download daily OHLCV data from Yahoo Finance using yfinance
-2. Convert to Qlib's binary format for efficient access
-3. Create instrument files defining stock universes
-
-**Stock Universe**: Currently focused on US tech stocks including:
-- Magnificent 7 (AAPL, MSFT, GOOGL, AMZN, META, NVDA, TSLA)
-- Semiconductor stocks (AMD, INTC, AVGO, QCOM, MU, AMAT)
-- Software/Cloud (CRM, ORCL, ADBE, NOW, SNOW, PLTR)
-- Internet/Consumer tech (NFLX, UBER, ABNB, SHOP, PYPL, SPOT)
-
-### Data Paths
-
-Always use these paths when initializing Qlib:
-
+**TabularPredictor** for cross-sectional stock ranking:
 ```python
-# US stock data (tech-focused)
-provider_uri = "./my_data/qlib_us"  # or absolute path
-
-# Region setting
-from qlib.constant import REG_US
-region = REG_US
+from autogluon.tabular import TabularPredictor
+predictor = TabularPredictor(label="future_return").fit(train_df, presets="best_quality")
 ```
 
-### Workflow Configuration
-
-Config files should be placed in `my_configs/` directory. Standard Qlib workflow config structure:
-
-```yaml
-qlib_init:
-    provider_uri: "./my_data/qlib_us"
-    region: us
-
-market: sp100  # or 'all' for all stocks
-
-data_handler_config:
-    # Define features, labels, and data processing
-
-model:
-    # Model class and hyperparameters
-
-strategy:
-    # Trading strategy configuration
-
-backtest:
-    # Backtesting parameters
-```
-
-### Model Storage
-
-- Save trained models to `my_models/` directory
-- Use descriptive names with timestamps (e.g., `lightgbm_tech_20260105.pkl`)
-- Track experiments using MLflow (default location: `qlib/mlruns/`)
-
-### Outputs and Logs
-
-- **outputs/**: Backtest results, analysis reports, figures
-- **logs/**: Application logs, debugging information
-
-## Known Issues and Workarounds
-
-### DumpDataAll API Change
-
-The `scripts/download_us_data.py` script currently fails at the CSV-to-binary conversion step due to API changes in Qlib's `DumpDataAll` class. The correct usage is:
-
+**TimeSeriesPredictor** for volatility/return forecasting:
 ```python
-from qlib.scripts.dump_bin import DumpDataUpdate
-
-dumper = DumpDataUpdate(
-    csv_path=str(csv_dir),
-    qlib_dir=str(qlib_dir),
-    freq="day",
-    date_field_name="date",
-    file_suffix=".csv",
-    include_fields="open,high,low,close,adj_close,volume",
-)
-dumper.dump()
+from autogluon.timeseries import TimeSeriesPredictor, TimeSeriesDataFrame
+predictor = TimeSeriesPredictor(prediction_length=5, target="return").fit(ts_data)
 ```
 
-### Yahoo Finance Data Quality
-
-Yahoo Finance data may have:
-- Missing data for certain dates (holidays, delistings)
-- Stock splits not always handled correctly
-- Timezone issues (handled in the script by removing timezone info)
-
-For production use, consider professional data providers.
-
-### Qlib Library Development Mode
-
-The `qlib/` subdirectory contains the Qlib source code. If you modify Qlib internals:
+## Qlib Development
 
 ```bash
-cd qlib
-pip install -e .[dev]  # Install in editable mode
+# Install Qlib in editable mode
+cd qlib && pip install -e .[dev]
 
-# Rebuild Cython extensions if you modify data operations
+# If modifying Cython extensions
 make prerequisite
 ```
 
-## Development Workflow
+## Environment Variables
 
-### Adding New Stocks
-
-1. Edit `scripts/download_us_data.py`, modify `TECH_SYMBOLS` or `SP100_SYMBOLS`
-2. Run `python scripts/download_us_data.py` to download new data
-3. Update instrument files in `my_data/qlib_us/instruments/`
-
-### Creating New Experiments
-
-1. Create config file in `my_configs/` based on examples in `qlib/examples/benchmarks/`
-2. Customize:
-   - Market/instrument universe
-   - Features (Alpha158, Alpha360, or custom)
-   - Model (LightGBM, LSTM, Transformer, etc.)
-   - Strategy parameters
-3. Run with `qrun my_configs/your_config.yaml`
-4. Analyze results in Jupyter notebooks
-
-### Custom Feature Engineering
-
-Define custom features in your dataset handler:
-
-```python
-from qlib.contrib.data.handler import DataHandlerLP
-
-class MyDataHandler(DataHandlerLP):
-    def setup_data(self):
-        # Define your features and labels
-        self.fields = [
-            "$close / Ref($close, 1) - 1",  # Daily return
-            "Mean($close, 5) / $close - 1",  # MA5 deviation
-            # ... custom features
-        ]
+`.env` file (gitignored):
 ```
-
-### Backtesting Custom Strategies
-
-1. Create strategy class inheriting from `qlib.strategy.base.BaseStrategy`
-2. Implement `generate_trade_decision()` method
-3. Add to workflow config or use programmatically
-4. Results will be in `outputs/` directory
-
-## Testing
-
-Since this is a research project, testing primarily involves:
-
-```bash
-# Test Qlib installation and data access
-cd qlib
-pytest tests/test_all_pipeline.py -v
-
-# Test data health
-python qlib/scripts/check_data_health.py check_data --qlib_dir ./my_data/qlib_us
-
-# Validate workflow config before long runs
-python qlib/cli/run.py my_configs/your_config.yaml --dry-run  # (if supported)
+FINNHUB_API_KEY=your_key_here
 ```
-
-## Performance Optimization
-
-- **Enable caching**: Qlib uses multi-layer caching. Ensure `my_data/qlib_us/.cache/` is writable
-- **Parallel processing**: Use `n_jobs` parameter in model trainers
-- **GPU acceleration**: For PyTorch models (LSTM, Transformer, etc.), ensure CUDA is available
 
 ## Important Notes
 
-- **Region Settings**: This project uses US data (`REG_US`), not China data (`REG_CN`) used in most Qlib examples
-- **Date Format**: Yahoo Finance returns data in YYYY-MM-DD format with timezone info removed
-- **Market Calendar**: US market calendar is used for trading day calculations
-- **Instruments Format**: Files in `my_data/qlib_us/instruments/` use format: `SYMBOL\tSTART_DATE\tEND_DATE`
-
-## Reference
-
-- Full Qlib documentation: See `qlib/CLAUDE.md` and https://qlib.readthedocs.io
-- Example workflows: `qlib/examples/benchmarks/`
-- Tutorial notebooks: `qlib/examples/tutorial/`
+- **Region**: Always use `REG_US`, not `REG_CN` (most Qlib examples use China data)
+- **Custom ops**: Must pass `custom_ops=TALIB_OPS` to `qlib.init()` for TA-Lib features
+- **Date format**: Yahoo Finance data uses YYYY-MM-DD, timezone stripped
+- **Instruments format**: Tab-separated `SYMBOL\tSTART_DATE\tEND_DATE` in instruments files

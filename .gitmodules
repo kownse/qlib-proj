@@ -1,0 +1,3 @@
+[submodule "autogluon"]
+	path = autogluon
+	url = https://github.com/autogluon/autogluon.git
