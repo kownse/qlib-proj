@@ -35,14 +35,24 @@ NEWS_CSV_DIR = PROJECT_ROOT / "my_data" / "news_csv"
 
 # 默认股票列表 (与现有项目一致的科技股)
 DEFAULT_SYMBOLS = [
-    # Magnificent 7
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-    # 半导体
-    "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT",
-    # 软件/云
-    "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR",
-    # 互联网/消费科技
-    "NFLX", "UBER", "ABNB", "SHOP", "PYPL", "SPOT",
+    # # Magnificent 7
+    # "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    # # 半导体
+    # "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT",
+    # # 软件/云
+    # "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR",
+    # # 互联网/消费科技
+    # "NFLX", "UBER", "ABNB", "SHOP", "PYPL", "SPOT",
+    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "AIG", "AMD", "AMGN", "AMT", "AMZN",
+    "AVGO", "AXP", "BA", "BAC", "BK", "BKNG", "BLK", "BMY", "C", "CAT",
+    "CHTR", "CL", "CMCSA", "COF", "COP", "COST", "CRM", "CSCO", "CVS", "CVX",
+    "DE", "DHR", "DIS", "DOW", "DUK", "EMR", "EXC", "F", "FDX", "GD",
+    "GE", "GILD", "GM", "GOOG", "GOOGL", "GS", "HD", "HON", "IBM", "INTC",
+    "JNJ", "JPM", "KHC", "KO", "LIN", "LLY", "LMT", "LOW", "MA", "MCD",
+    "MDLZ", "MDT", "MET", "META", "MMM", "MO", "MRK", "MS", "MSFT", "NEE",
+    "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PG", "PM", "PYPL", "QCOM",
+    "RTX", "SBUX", "SCHW", "SO", "SPG", "T", "TGT", "TMO", "TMUS", "TSLA",
+    "TXN", "UNH", "UNP", "UPS", "USB", "V", "VZ", "WFC", "WMT", "XOM",
 ]
 
 logger = logging.getLogger(__name__)
@@ -69,13 +79,12 @@ def download_news_for_symbol(
         新闻 DataFrame
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{symbol}_news.csv"
 
     client = FinnhubNewsClient(api_key=api_key)
-    df = client.download_company_news(symbol, start_date, end_date)
+    df = client.download_company_news(symbol, start_date, end_date, output_path=str(output_path))
 
     if not df.empty:
-        output_path = output_dir / f"{symbol}_news.csv"
-        df.to_csv(output_path, index=False)
         logger.info(f"已保存 {symbol} 新闻到 {output_path}")
 
     return df
@@ -115,12 +124,11 @@ def download_all_news(
     for i, symbol in enumerate(symbols):
         logger.info(f"下载进度: {i + 1}/{len(symbols)} - {symbol}")
 
-        df = client.download_company_news(symbol, start_date, end_date)
+        # 设置输出路径，让 download_company_news 支持增量下载
+        output_path = output_dir / f"{symbol}_news.csv"
+        df = client.download_company_news(symbol, start_date, end_date, output_path=str(output_path))
 
         if not df.empty:
-            # 保存单个股票的新闻
-            output_path = output_dir / f"{symbol}_news.csv"
-            df.to_csv(output_path, index=False)
             all_dfs.append(df)
 
     if all_dfs:
@@ -180,7 +188,7 @@ def main():
     parser.add_argument(
         "--start",
         type=str,
-        default="2015-01-01",
+        default="2025-01-01",
         help="开始日期 (YYYY-MM-DD)",
     )
     parser.add_argument(

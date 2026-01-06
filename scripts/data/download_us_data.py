@@ -79,8 +79,8 @@ TECH_SYMBOLS = [
 START_DATE = "2000-01-01"
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 
-# 输出路径
-PROJECT_ROOT = Path(__file__).parent.parent
+# 输出路径（文件在 scripts/data/ 下，需要向上三级）
+# PROJECT_ROOT 已在文件开头定义
 CSV_DIR = PROJECT_ROOT / "my_data" / "csv_us"
 QLIB_DIR = PROJECT_ROOT / "my_data" / "qlib_us"
 
@@ -202,7 +202,7 @@ def main():
     print("=" * 60)
     print("US Stock Data Downloader for Qlib")
     print("=" * 60)
-    print(f"Symbols: {len(TECH_SYMBOLS)}")
+    print(f"Symbols: {len(SP100_SYMBOLS)}")
     print(f"Date range: {START_DATE} to {END_DATE}")
     print(f"CSV output: {CSV_DIR}")
     print(f"Qlib output: {QLIB_DIR}")
@@ -210,7 +210,7 @@ def main():
     
     # 1. 下载数据
     print("Step 1: Downloading from Yahoo Finance\n")
-    success, failed = download_stock_data(TECH_SYMBOLS, START_DATE, END_DATE, CSV_DIR)
+    success, failed = download_stock_data(SP100_SYMBOLS, START_DATE, END_DATE, CSV_DIR)
     
     if not success:
         print("No data downloaded. Exiting.")

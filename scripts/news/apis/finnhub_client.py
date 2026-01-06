@@ -114,7 +114,7 @@ class FinnhubNewsClient:
         self, start: datetime, end: datetime, downloaded_dates: set
     ) -> bool:
         """
-        检查指定日期范围是否已经完全下载
+        检查指定日期范围内是否有任意一天已被下载
 
         Args:
             start: 开始日期
@@ -122,14 +122,13 @@ class FinnhubNewsClient:
             downloaded_dates: 已下载的日期集合
 
         Returns:
-            如果该区间所有日期都已下载返回 True
+            如果 downloaded_dates 中有至少一天在 [start, end] 范围内，返回 True
         """
-        check_date = start
-        while check_date <= end:
-            if check_date.date() not in downloaded_dates:
-                return False
-            check_date += timedelta(days=1)
-        return True
+        if not downloaded_dates:
+            return False
+        start_date = start.date()
+        end_date = end.date()
+        return any(start_date <= d <= end_date for d in downloaded_dates)
 
     def _save_news_to_disk(
         self, news: List[dict], symbol: str, output_path: str

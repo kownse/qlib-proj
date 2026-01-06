@@ -147,7 +147,24 @@ class Alpha158_Volatility_TALib_News(DataHandlerLP):
             **kwargs,
         )
 
-        # 合并新闻特征到数据中
+        # 强制加载数据，然后合并新闻特征
+        self._force_load_and_merge_news()
+
+    def _force_load_and_merge_news(self):
+        """强制加载数据并合并新闻特征"""
+        if self._news_df is None:
+            return
+
+        # 强制触发数据加载
+        # 通过访问 fetch 方法来确保 _data 被初始化
+        try:
+            # 这会触发数据加载
+            _ = self.fetch(col_set="feature")
+        except Exception as e:
+            print(f"警告: 强制加载数据时出错: {e}")
+            return
+
+        # 现在 _data 应该已经被初始化，进行合并
         self._merge_news_features()
 
     def _load_news_features(self) -> Optional[pd.DataFrame]:
@@ -179,11 +196,13 @@ class Alpha158_Volatility_TALib_News(DataHandlerLP):
     def _merge_news_features(self):
         """将新闻特征合并到主数据中"""
         if self._news_df is None:
+            print("警告: 没有新闻数据可合并")
             return
 
         # 获取主数据
         # 注意: self._data 在父类初始化后才存在
         if not hasattr(self, "_data") or self._data is None:
+            print("警告: 主数据 _data 不存在，无法合并新闻特征")
             return
 
         try:
@@ -192,14 +211,89 @@ class Alpha158_Volatility_TALib_News(DataHandlerLP):
             available_cols = [c for c in news_cols if c in self._news_df.columns]
 
             if not available_cols:
-                print("警告: 新闻数据中没有找到匹配的特征列")
+                print(f"警告: 新闻数据中没有找到匹配的特征列")
+                print(f"  期望的列: {news_cols}")
+                print(f"  实际的列: {self._news_df.columns.tolist()}")
                 return
 
-            news_subset = self._news_df[available_cols]
+            news_subset = self._news_df[available_cols].copy()
 
-            # 合并到主数据
-            # 使用 join 而不是 merge，因为两者都有 MultiIndex
-            self._data = self._data.join(news_subset, how="left")
+            # 确保索引格式匹配
+            # 主数据索引: (datetime, instrument)
+            # 需要确保新闻数据也是相同格式
+            main_index_names = self._data.index.names
+            news_index_names = news_subset.index.names
+
+            print(f"主数据索引名: {main_index_names}, 形状: {self._data.shape}")
+            print(f"新闻数据索引名: {news_index_names}, 形状: {news_subset.shape}")
+
+            # 检查主数据是否有 MultiIndex 列
+            has_multi_columns = isinstance(self._data.columns, pd.MultiIndex)
+            print(f"主数据是否有 MultiIndex 列: {has_multi_columns}")
+
+            original_cols = self._data.columns.tolist()
+
+            if has_multi_columns:
+                # 主数据有 MultiIndex 列，需要特殊处理
+                # 保存原始的 MultiIndex 列结构
+                original_column_index = self._data.columns
+
+                # 对于每个新闻特征，直接添加到 _data 中
+                # 使用索引对齐，不需要重置索引
+                for col in available_cols:
+                    if col in news_subset.columns:
+                        # 创建一个与主数据索引对齐的 Series
+                        news_series = news_subset[col]
+
+                        # 使用 reindex 对齐到主数据的索引
+                        aligned_series = news_series.reindex(self._data.index)
+
+                        # 添加为新列，使用二级列名为空字符串
+                        self._data[('feature', col)] = aligned_series
+
+                print(f"直接添加新闻特征到 MultiIndex 列数据中")
+
+            else:
+                # 主数据是普通列，使用标准 merge
+                # 重置索引进行合并
+                main_reset = self._data.reset_index()
+                news_reset = news_subset.reset_index()
+
+                # 确保日期格式一致
+                date_col = main_index_names[0]  # datetime
+                inst_col = main_index_names[1]  # instrument
+
+                # 标准化日期格式
+                main_reset[date_col] = pd.to_datetime(main_reset[date_col])
+                news_reset[news_index_names[0]] = pd.to_datetime(news_reset[news_index_names[0]])
+
+                # 重命名新闻数据的索引列以匹配主数据
+                rename_map = {}
+                if news_index_names[0] != date_col:
+                    rename_map[news_index_names[0]] = date_col
+                if news_index_names[1] != inst_col:
+                    rename_map[news_index_names[1]] = inst_col
+                if rename_map:
+                    news_reset = news_reset.rename(columns=rename_map)
+
+                # 使用 merge 合并
+                merged = pd.merge(
+                    main_reset,
+                    news_reset,
+                    on=[date_col, inst_col],
+                    how='left'
+                )
+
+                # 重新设置索引
+                merged = merged.set_index([date_col, inst_col])
+                merged.index.names = main_index_names
+
+                # 更新 _data
+                self._data = merged
+
+            # 检查新增的列
+            new_cols = [c for c in self._data.columns if c not in original_cols]
+            print(f"成功添加 {len(new_cols)} 个新闻特征列: {new_cols}")
 
             # 添加滚动特征
             if self.add_news_rolling:
@@ -208,10 +302,19 @@ class Alpha158_Volatility_TALib_News(DataHandlerLP):
             # 填充缺失值
             self._fill_news_missing()
 
-            print(f"新闻特征合并完成，新数据形状: {self._data.shape}")
+            # 最终检查 - 处理 MultiIndex 列的情况
+            if has_multi_columns:
+                news_cols_in_data = [c for c in self._data.columns
+                                     if isinstance(c, tuple) and len(c) > 1 and str(c[1]).startswith("news_")]
+            else:
+                news_cols_in_data = [c for c in self._data.columns if str(c).startswith("news_")]
+            print(f"新闻特征合并完成，总数据形状: {self._data.shape}")
+            print(f"包含 {len(news_cols_in_data)} 个新闻特征列: {news_cols_in_data}")
 
         except Exception as e:
+            import traceback
             print(f"警告: 合并新闻特征时出错: {e}")
+            traceback.print_exc()
 
     def _add_rolling_features(self):
         """添加新闻滚动特征"""
@@ -250,21 +353,54 @@ class Alpha158_Volatility_TALib_News(DataHandlerLP):
             "news_total_text_len": 0.0,
         }
 
+        # 检查是否是 MultiIndex 列
+        has_multi_columns = isinstance(self._data.columns, pd.MultiIndex)
+
+        # 找到新闻相关的列
+        if has_multi_columns:
+            news_cols = [c for c in self._data.columns
+                         if isinstance(c, tuple) and len(c) > 1 and str(c[1]).startswith("news_")]
+        else:
+            news_cols = [c for c in self._data.columns if str(c).startswith("news_")]
+
+        if not news_cols:
+            return
+
         # 先 forward fill (按股票分组)
-        news_cols = [c for c in self._data.columns if c.startswith("news_")]
-        if news_cols:
-            self._data[news_cols] = (
-                self._data.groupby(level="instrument")[news_cols]
-                .ffill(limit=5)
-            )
+        try:
+            for col in news_cols:
+                # 使用 transform 进行分组 forward fill，更简洁
+                self._data[col] = (
+                    self._data[col]
+                    .groupby(level="instrument")
+                    .transform(lambda x: x.ffill(limit=5))
+                )
+        except Exception as e:
+            # 如果分组 ffill 失败，直接对整列做 ffill
+            try:
+                for col in news_cols:
+                    self._data[col] = self._data[col].ffill(limit=5)
+            except Exception:
+                pass  # 忽略，后面会用默认值填充
 
         # 再用默认值填充剩余缺失
-        for col, value in fill_values.items():
-            if col in self._data.columns:
-                self._data[col] = self._data[col].fillna(value)
+        for col in news_cols:
+            # 获取列的简单名称用于查找默认值
+            if has_multi_columns and isinstance(col, tuple):
+                simple_name = col[1]  # ('feature', 'news_xxx') -> 'news_xxx'
+            else:
+                simple_name = col
+
+            default_value = fill_values.get(simple_name, 0.0)
+            self._data[col] = self._data[col].fillna(default_value)
 
         # 填充滚动特征的缺失值
-        rolling_cols = [c for c in self._data.columns if "_ma" in c or "_mom" in c]
+        if has_multi_columns:
+            rolling_cols = [c for c in self._data.columns
+                           if isinstance(c, tuple) and len(c) > 1 and ("_ma" in str(c[1]) or "_mom" in str(c[1]))]
+        else:
+            rolling_cols = [c for c in self._data.columns if "_ma" in str(c) or "_mom" in str(c)]
+
         for col in rolling_cols:
             self._data[col] = self._data[col].fillna(0.0)
 
