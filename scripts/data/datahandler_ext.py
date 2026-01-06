@@ -372,3 +372,112 @@ class Alpha158_Volatility_TALib(DataHandlerLP):
         """
         volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [volatility_expr], ["LABEL0"]
+
+
+class Alpha158_Direction_TALib(DataHandlerLP):
+    """
+    Alpha158 特征 + TA-Lib 技术指标 + N天涨跌方向标签（二分类）
+
+    标签定义:
+    - 1: N天后价格上涨 (Ref($close, -N) > $close)
+    - 0: N天后价格下跌或持平
+    """
+
+    def __init__(
+        self,
+        prediction_days=1,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=[],
+        learn_processors=None,
+        fit_start_time=None,
+        fit_end_time=None,
+        process_type=DataHandlerLP.PTYPE_A,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        """
+        初始化涨跌方向预测的 DataHandler
+
+        Args:
+            prediction_days: 预测天数（1表示预测明天涨跌）
+            **kwargs: 传递给父类的其他参数
+        """
+        self.prediction_days = prediction_days
+
+        from qlib.contrib.data.handler import check_transform_proc
+
+        # 对于二分类标签，使用自定义的 learn_processors
+        # 只对特征进行标准化，不对标签进行标准化
+        if learn_processors is None:
+            learn_processors = [
+                {"class": "DropnaLabel"},
+                {"class": "CSZScoreNorm", "kwargs": {"fields_group": "feature"}},  # 只标准化特征
+            ]
+
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": self.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            infer_processors=infer_processors,
+            learn_processors=learn_processors,
+            process_type=process_type,
+            **kwargs,
+        )
+
+    def get_feature_config(self):
+        """复用 Alpha158_Volatility_TALib 的特征配置"""
+        conf = {
+            "kbar": {},
+            "price": {
+                "windows": [0],
+                "feature": ["OPEN", "HIGH", "LOW", "VWAP"],
+            },
+            "rolling": {},
+        }
+        fields, names = Alpha158.get_feature_config(conf)
+
+        # 添加 TA-Lib 指标（复用现有方法）
+        talib_fields, talib_names = Alpha158_Volatility_TALib._get_talib_features(self)
+        fields.extend(talib_fields)
+        names.extend(talib_names)
+
+        return fields, names
+
+    def _get_talib_features(self):
+        """复用 Alpha158_Volatility_TALib 的 TA-Lib 特征"""
+        return Alpha158_Volatility_TALib._get_talib_features(self)
+
+    def get_label_config(self):
+        """
+        返回N天涨跌方向标签（二分类）
+
+        Returns:
+            fields: 标签表达式列表
+            names: 标签名称列表
+        """
+        # 二分类标签: 1 = 上涨, 0 = 下跌/持平
+        # Ref($close, -N) > $close 返回 True/False，转换为 1/0
+        # 使用 If 表达式：If(condition, 1, 0)
+        direction_expr = f"If(Ref($close, -{self.prediction_days}) > $close, 1, 0)"
+
+        return [direction_expr], ["LABEL0"]

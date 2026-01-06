@@ -20,9 +20,13 @@ import sys
 import datetime as dte
 from typing import Union
 
+import warnings
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+
+# Suppress expected softmax warning for single-step prediction
+warnings.filterwarnings('ignore', message='.*softmax over axis -1.*')
 
 import qlib
 from qlib.constant import REG_US
@@ -232,11 +236,14 @@ class Alpha158VolatilityTALibFormatter(GenericDataFormatter):
 
     def get_fixed_params(self):
         """Returns fixed model parameters for experiments."""
+        # Use single-step prediction to match Qlib's pre-shifted labels
+        # Qlib labels are already future values (e.g., T+2 volatility at row T)
+        # Using decoder_steps=1 ensures direct label alignment
         return {
-            "total_time_steps": 14 + 5,  # 14 days history + 5 days decoder (for valid attention)
+            "total_time_steps": 14 + 1,  # 14 days history + 1 day decoder
             "num_encoder_steps": 14,
             "num_epochs": self.epochs,
-            "early_stopping_patience": 20,  # More patience for learning
+            "early_stopping_patience": 20,
             "multiprocessing_workers": 4,
         }
 
@@ -333,11 +340,10 @@ def transform_df(df, col_name="LABEL0"):
 class TFTVolatilityModel(ModelFT):
     """TFT Model for Volatility Prediction."""
 
-    def __init__(self, feature_cols, use_talib=False, label_shift=5, epochs=50, **kwargs):
+    def __init__(self, feature_cols, use_talib=False, epochs=50, **kwargs):
         self.model = None
         self.feature_cols = feature_cols
         self.use_talib = use_talib
-        self.label_shift = label_shift
         self.epochs = epochs
         self.params = kwargs
 
@@ -352,12 +358,17 @@ class TFTVolatilityModel(ModelFT):
     def fit(self, dataset: DatasetH, model_folder="tft_volatility_model", gpu_id=0, **kwargs):
         dtrain, dvalid = self._prepare_data(dataset)
 
-        # Shift labels for multi-step prediction
-        dtrain.loc[:, "LABEL0"] = get_shifted_label(dtrain, shifts=self.label_shift, col_shift="LABEL0")
-        dvalid.loc[:, "LABEL0"] = get_shifted_label(dvalid, shifts=self.label_shift, col_shift="LABEL0")
+        # NOTE: Removed label_shift processing - Qlib labels already contain future values
+        # The TFT's _batch_data will handle sequence alignment internally
 
         train = process_qlib_data(dtrain, self.feature_cols, fillna=True).dropna()
         valid = process_qlib_data(dvalid, self.feature_cols, fillna=True).dropna()
+
+        # Debug: Print label statistics to verify data quality
+        print(f"\n    [DEBUG] Train label stats:")
+        print(f"      Mean: {train['LABEL0'].mean():.6f}, Std: {train['LABEL0'].std():.6f}")
+        print(f"      Min: {train['LABEL0'].min():.6f}, Max: {train['LABEL0'].max():.6f}")
+        print(f"      Autocorr(1): {train.groupby('instrument')['LABEL0'].apply(lambda x: x.autocorr(1)).mean():.4f}")
 
         print(f"    Training data shape: {train.shape}")
         print(f"    Validation data shape: {valid.shape}")
@@ -424,7 +435,7 @@ class TFTVolatilityModel(ModelFT):
         # Use raw data (DK_R) to match training data processing
         d_test = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_R)
         d_test = transform_df(d_test)
-        d_test.loc[:, "LABEL0"] = get_shifted_label(d_test, shifts=self.label_shift, col_shift="LABEL0")
+        # NOTE: Removed label_shift - using Qlib labels directly
         test = process_qlib_data(d_test, self.feature_cols, fillna=True).dropna()
 
         print("\n*** Begin TFT Prediction ***")
@@ -434,8 +445,9 @@ class TFTVolatilityModel(ModelFT):
         p50_forecast = self.data_formatter.format_predictions(output_map["p50"])
         p90_forecast = self.data_formatter.format_predictions(output_map["p90"])
 
-        predict50 = format_score(p50_forecast, "pred", 1)
-        predict90 = format_score(p90_forecast, "pred", 1)
+        # Extract predictions directly without shift adjustment
+        predict50 = process_predicted(p50_forecast, "pred")["pred"]
+        predict90 = process_predicted(p90_forecast, "pred")["pred"]
         predict = (predict50 + predict90) / 2
 
         print("*** Finished TFT Prediction ***")
@@ -456,9 +468,7 @@ class TFTVolatilityModel(ModelFT):
         # Prepare data to set scalers (needed for prediction)
         dtrain, dvalid = self._prepare_data(dataset)
 
-        # Shift labels for consistency
-        dtrain.loc[:, "LABEL0"] = get_shifted_label(dtrain, shifts=self.label_shift, col_shift="LABEL0")
-
+        # NOTE: Removed label_shift - using Qlib labels directly
         train = process_qlib_data(dtrain, self.feature_cols, fillna=True).dropna()
 
         # Create data formatter and set scalers
@@ -638,7 +648,6 @@ def main():
     model = TFTVolatilityModel(
         feature_cols=available_features,
         use_talib=args.use_talib,
-        label_shift=1,  # Predict 1 day ahead
         epochs=args.epochs,
     )
 
