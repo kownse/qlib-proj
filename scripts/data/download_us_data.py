@@ -1,79 +1,29 @@
 """
 从 Yahoo Finance 下载美股数据，转换为 Qlib 格式
+
+使用方法:
+    python download_us_data.py                    # 下载 SP100（默认）
+    python download_us_data.py --pool sp500       # 下载 SP500
+    python download_us_data.py --pool tech        # 下载科技股
+    python download_us_data.py --pool sp100 --convert-only  # 只转换，不下载
 """
 import os
 import sys
 import shutil
+import argparse
 from pathlib import Path
 from datetime import datetime
 
 # 确保项目路径正确
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT / "qlib"))  # 添加 qlib 源码路径
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))  # 添加 scripts 路径
 
 import pandas as pd
 import yfinance as yf
 
-# from qlib.scripts.dump_bin import DumpDataAll
-
-
-# ========== 配置 ==========
-
-# S&P 100 成分股（流动性好）
-SP100_SYMBOLS = [
-    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "AIG", "AMD", "AMGN", "AMT", "AMZN",
-    "AVGO", "AXP", "BA", "BAC", "BK", "BKNG", "BLK", "BMY", "C", "CAT",
-    "CHTR", "CL", "CMCSA", "COF", "COP", "COST", "CRM", "CSCO", "CVS", "CVX",
-    "DE", "DHR", "DIS", "DOW", "DUK", "EMR", "EXC", "F", "FDX", "GD",
-    "GE", "GILD", "GM", "GOOG", "GOOGL", "GS", "HD", "HON", "IBM", "INTC",
-    "JNJ", "JPM", "KHC", "KO", "LIN", "LLY", "LMT", "LOW", "MA", "MCD",
-    "MDLZ", "MDT", "MET", "META", "MMM", "MO", "MRK", "MS", "MSFT", "NEE",
-    "NFLX", "NKE", "NVDA", "ORCL", "PEP", "PFE", "PG", "PM", "PYPL", "QCOM",
-    "RTX", "SBUX", "SCHW", "SO", "SPG", "T", "TGT", "TMO", "TMUS", "TSLA",
-    "TXN", "UNH", "UNP", "UPS", "USB", "V", "VZ", "WFC", "WMT", "XOM",
-]
-
-# 美股核心科技股（约30只）
-TECH_SYMBOLS = [
-    # 超大型科技（Magnificent 7）
-    "AAPL",   # Apple
-    "MSFT",   # Microsoft
-    "GOOGL",  # Alphabet (Google)
-    "AMZN",   # Amazon
-    "META",   # Meta (Facebook)
-    "NVDA",   # NVIDIA
-    "TSLA",   # Tesla
-    
-    # 半导体
-    "AMD",    # AMD
-    "INTC",   # Intel
-    "AVGO",   # Broadcom
-    "QCOM",   # Qualcomm
-    "MU",     # Micron
-    "AMAT",   # Applied Materials
-    
-    # 软件/云服务
-    "CRM",    # Salesforce
-    "ORCL",   # Oracle
-    "ADBE",   # Adobe
-    "NOW",    # ServiceNow
-    "SNOW",   # Snowflake
-    "PLTR",   # Palantir
-    
-    # 互联网/消费科技
-    "NFLX",   # Netflix
-    "UBER",   # Uber
-    "ABNB",   # Airbnb
-    "SHOP",   # Shopify
-    # "SQ",     # Block (Square)
-    "PYPL",   # PayPal
-    "SPOT",   # Spotify
-    
-    # 网络/通信设备
-    "CSCO",   # Cisco
-    "PANW",   # Palo Alto Networks
-    "CRWD",   # CrowdStrike
-]
+# 从 stock_pools.py 导入股票池定义（单一数据源）
+from data.stock_pools import STOCK_POOLS, SP100_SYMBOLS, SP500_SYMBOLS, TECH_SYMBOLS
 
 # 时间范围
 START_DATE = "2000-01-01"
@@ -178,59 +128,108 @@ def convert_to_qlib_bin(csv_dir: Path, qlib_dir: Path):
 
 
 
-def create_instruments_file(symbols: list, qlib_dir: Path, start_date: str, end_date: str):
+def create_instruments_file(symbols: list, qlib_dir: Path, start_date: str, end_date: str, pool_name: str = "sp100"):
     """创建股票池文件"""
     instruments_dir = qlib_dir / "instruments"
     instruments_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # all.txt - 包含所有股票及其有效日期范围
     with open(instruments_dir / "all.txt", "w") as f:
         for symbol in symbols:
             f.write(f"{symbol}\t{start_date}\t{end_date}\n")
-    
-    # sp100.txt - 作为自定义股票池
-    with open(instruments_dir / "sp100.txt", "w") as f:
+
+    # 创建对应股票池文件（如 sp100.txt, sp500.txt）
+    with open(instruments_dir / f"{pool_name}.txt", "w") as f:
         for symbol in symbols:
             f.write(f"{symbol}\t{start_date}\t{end_date}\n")
-    
+
     print(f"Created instruments files at {instruments_dir}")
+    print(f"  - all.txt ({len(symbols)} stocks)")
+    print(f"  - {pool_name}.txt ({len(symbols)} stocks)")
 
 
 # ========== 主函数 ==========
 
 def main():
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description='Download US stock data and convert to Qlib format',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python download_us_data.py                     # Download SP100 (default)
+    python download_us_data.py --pool sp500        # Download SP500 (~500 stocks)
+    python download_us_data.py --pool tech         # Download tech stocks (~30)
+    python download_us_data.py --convert-only      # Only convert existing CSVs
+    python download_us_data.py --download-only     # Only download, skip conversion
+        """
+    )
+    parser.add_argument('--pool', type=str, default='sp100',
+                        choices=['test', 'tech', 'sp100', 'sp500'],
+                        help='Stock pool to download (default: sp100)')
+    parser.add_argument('--convert-only', action='store_true',
+                        help='Skip download, only convert existing CSV files')
+    parser.add_argument('--download-only', action='store_true',
+                        help='Only download, skip conversion to Qlib format')
+    parser.add_argument('--start-date', type=str, default=START_DATE,
+                        help=f'Start date (default: {START_DATE})')
+    parser.add_argument('--end-date', type=str, default=END_DATE,
+                        help=f'End date (default: {END_DATE})')
+    args = parser.parse_args()
+
+    # 获取选定的股票池
+    symbols = STOCK_POOLS[args.pool]
+
     print("=" * 60)
     print("US Stock Data Downloader for Qlib")
     print("=" * 60)
-    print(f"Symbols: {len(SP100_SYMBOLS)}")
-    print(f"Date range: {START_DATE} to {END_DATE}")
+    print(f"Stock pool: {args.pool} ({len(symbols)} stocks)")
+    print(f"Date range: {args.start_date} to {args.end_date}")
     print(f"CSV output: {CSV_DIR}")
     print(f"Qlib output: {QLIB_DIR}")
+    if args.convert_only:
+        print("Mode: Convert only (skip download)")
+    elif args.download_only:
+        print("Mode: Download only (skip conversion)")
     print("=" * 60 + "\n")
-    
+
+    success = symbols  # 默认假设所有股票都成功
+
     # 1. 下载数据
-    print("Step 1: Downloading from Yahoo Finance\n")
-    success, failed = download_stock_data(SP100_SYMBOLS, START_DATE, END_DATE, CSV_DIR)
-    
-    if not success:
-        print("No data downloaded. Exiting.")
-        sys.exit(1)
-    
+    if not args.convert_only:
+        print("Step 1: Downloading from Yahoo Finance\n")
+        success, failed = download_stock_data(symbols, args.start_date, args.end_date, CSV_DIR)
+
+        if not success:
+            print("No data downloaded. Exiting.")
+            sys.exit(1)
+    else:
+        print("Step 1: Skipped (convert-only mode)\n")
+        # 检查已有的 CSV 文件
+        existing_csvs = list(CSV_DIR.glob("*.csv"))
+        success = [f.stem for f in existing_csvs if f.stem in symbols]
+        print(f"Found {len(success)} existing CSV files for {args.pool} pool")
+
+    if args.download_only:
+        print("\nDownload complete (conversion skipped).")
+        return
+
     # 2. 转换格式
     print("\n" + "=" * 60)
     print("Step 2: Converting to Qlib format")
     print("=" * 60)
     convert_to_qlib_bin(CSV_DIR, QLIB_DIR)
-    
+
     # 3. 创建股票池文件
     print("\n" + "=" * 60)
     print("Step 3: Creating instruments files")
     print("=" * 60)
-    create_instruments_file(success, QLIB_DIR, START_DATE, END_DATE)
-    
+    create_instruments_file(success, QLIB_DIR, args.start_date, args.end_date, args.pool)
+
     print("\n" + "=" * 60)
     print("Done!")
     print(f"Qlib data path: {QLIB_DIR}")
+    print(f"Stock pool: {args.pool} ({len(success)} stocks)")
     print("=" * 60)
 
 

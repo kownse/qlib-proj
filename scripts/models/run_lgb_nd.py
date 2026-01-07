@@ -33,6 +33,9 @@ from utils.talib_ops import TALIB_OPS
 from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
 from data.datahandler_news import Alpha158_Volatility_TALib_News
 
+# Import stock pools
+from data.stock_pools import STOCK_POOLS
+
 
 # ========== 配置 ==========
 
@@ -40,9 +43,6 @@ from data.datahandler_news import Alpha158_Volatility_TALib_News
 PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.parquet"
-
-# 股票池
-TEST_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ"]
 
 # 时间划分
 # TRAIN_START = "2025-01-01"
@@ -73,7 +73,12 @@ def main():
     parser.add_argument('--news-rolling', action='store_true', help='Add rolling news features (default: False)')
     parser.add_argument('--top-k', type=int, default=0,
                         help='Number of top features to select for retraining (0 = disable feature selection)')
+    parser.add_argument('--stock-pool', type=str, default='test', choices=['test', 'tech', 'sp100', 'sp500'],
+                        help='Stock pool to use: test (10), tech (~30), sp100 (100), sp500 (~500) (default: test)')
     args = parser.parse_args()
+
+    # 选择股票池
+    symbols = STOCK_POOLS[args.stock_pool]
 
     # 更新全局变量
     global VOLATILITY_WINDOW
@@ -81,6 +86,7 @@ def main():
 
     print("=" * 70)
     print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
+    print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
     if args.use_news:
         print("Features: Alpha158 + TA-Lib + News Features")
         print(f"    News feature set: {args.news_features}")
@@ -132,7 +138,7 @@ def main():
     if args.use_news:
         handler = Alpha158_Volatility_TALib_News(
             volatility_window=VOLATILITY_WINDOW,
-            instruments=TEST_SYMBOLS,
+            instruments=symbols,
             start_time=TRAIN_START,
             end_time=TEST_END,
             fit_start_time=TRAIN_START,
@@ -146,7 +152,7 @@ def main():
     elif args.use_talib:
         handler = Alpha158_Volatility_TALib(
             volatility_window=VOLATILITY_WINDOW,
-            instruments=TEST_SYMBOLS,
+            instruments=symbols,
             start_time=TRAIN_START,
             end_time=TEST_END,
             fit_start_time=TRAIN_START,
@@ -157,7 +163,7 @@ def main():
     else:
         handler = Alpha158_Volatility(
             volatility_window=VOLATILITY_WINDOW,
-            instruments=TEST_SYMBOLS,
+            instruments=symbols,
             start_time=TRAIN_START,
             end_time=TEST_END,
             fit_start_time=TRAIN_START,
