@@ -120,8 +120,8 @@ def estimate_return_from_ic(
 if __name__ == "__main__":
     # 使用你的实际 IC 结果
     results = estimate_return_from_ic(
-        ic_mean=0.0113,
-        ic_std=0.2031,
+        ic_mean=0.0183,
+        ic_std=0.1166,
         topk=10,       # TopkDropoutStrategy 默认 topk
-        n_stocks=100,  # SP100 股票池
+        n_stocks=500,  # SP100 股票池
     )

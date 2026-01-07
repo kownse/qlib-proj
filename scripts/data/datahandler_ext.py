@@ -11,11 +11,48 @@ from pathlib import Path
 script_dir = Path(__file__).parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
-from qlib.contrib.data.handler import Alpha158
+from qlib.contrib.data.handler import Alpha158, Alpha360
 from qlib.data.dataset.handler import DataHandlerLP
 
 # Import TA-Lib custom operators
 from utils.talib_ops import TALIB_OPS
+
+
+class Alpha360_Volatility(Alpha360):
+    """
+    Alpha360 特征 + N天价格波动率标签
+
+    继承 Alpha360 的所有特征（60天的 OHLCV 数据），只修改标签为N天波动率
+
+    Alpha360 特征说明：
+    - 使用最近60天的价格和成交量数据
+    - 包含 CLOSE, OPEN, HIGH, LOW, VWAP, VOLUME 各60天历史
+    - 所有价格数据都用当前 $close 标准化
+    - 成交量数据用当前 $volume 标准化
+    - 总共 360 个特征 (6 * 60)
+    """
+
+    def __init__(self, volatility_window=2, **kwargs):
+        """
+        初始化波动率预测的 Alpha360 DataHandler
+
+        Args:
+            volatility_window: 波动率预测窗口（天数）
+            **kwargs: 传递给父类的其他参数
+        """
+        self.volatility_window = volatility_window
+        super().__init__(**kwargs)
+
+    def get_label_config(self):
+        """
+        返回N天波动率标签
+
+        Returns:
+            fields: 标签表达式列表
+            names: 标签名称列表
+        """
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]
 
 
 class Alpha158_Volatility(Alpha158):

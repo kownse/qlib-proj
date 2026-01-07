@@ -30,8 +30,9 @@ from qlib.data.dataset.handler import DataHandlerLP
 from utils.talib_ops import TALIB_OPS
 
 # Import extended data handlers
-from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
+from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib, Alpha360_Volatility
 from data.datahandler_news import Alpha158_Volatility_TALib_News
+from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatility_Pandas
 
 # Import stock pools
 from data.stock_pools import STOCK_POOLS
@@ -62,20 +63,81 @@ TEST_END = "2025-12-31"
 # 波动率预测窗口（天数）
 VOLATILITY_WINDOW = 2
 
+# Handler 配置映射
+HANDLER_CONFIG = {
+    'alpha158': {
+        'class': Alpha158_Volatility,
+        'description': 'Alpha158 (158 technical indicators)',
+        'use_talib': False,
+    },
+    'alpha360': {
+        'class': Alpha360_Volatility,
+        'description': 'Alpha360 (360 features - 60 days OHLCV)',
+        'use_talib': False,
+    },
+    'alpha158-talib': {
+        'class': Alpha158_Volatility_TALib,
+        'description': 'Alpha158 + TA-Lib (~300+ technical indicators)',
+        'use_talib': True,
+    },
+    'alpha158-pandas': {
+        'class': Alpha158_Volatility_Pandas,
+        'description': 'Alpha158 + Pandas indicators (no TA-Lib)',
+        'use_talib': False,
+    },
+    'alpha360-pandas': {
+        'class': Alpha360_Volatility_Pandas,
+        'description': 'Alpha360 + Pandas (no TA-Lib, 360 features)',
+        'use_talib': False,
+    },
+    'alpha158-news': {
+        'class': Alpha158_Volatility_TALib_News,
+        'description': 'Alpha158 + TA-Lib + News features',
+        'use_talib': True,
+    },
+}
+
+
 def main():
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='Qlib Stock Price Volatility Prediction')
-    parser.add_argument('--nday', type=int, default=2, help='Volatility prediction window in days (default: 2)')
-    parser.add_argument('--use-talib', action='store_true', help='Use extended TA-Lib features (default: False)')
-    parser.add_argument('--use-news', action='store_true', help='Use Alpha158 + TA-Lib + News features (default: False)')
-    parser.add_argument('--news-features', type=str, default='core', choices=['all', 'sentiment', 'stats', 'core'],
-                        help='News feature set to use (default: core)')
-    parser.add_argument('--news-rolling', action='store_true', help='Add rolling news features (default: False)')
+    parser = argparse.ArgumentParser(
+        description='Qlib Stock Price Volatility Prediction',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Handler choices:
+  alpha158        Alpha158 features (158 technical indicators) [default]
+  alpha360        Alpha360 features (60 days of OHLCV = 360 features)
+  alpha158-talib  Alpha158 + TA-Lib indicators (~300+ features, requires TA-Lib)
+  alpha158-pandas Alpha158 + Pandas indicators (no TA-Lib, for large datasets)
+  alpha360-pandas Alpha360 features via Pandas (no TA-Lib)
+  alpha158-news   Alpha158 + TA-Lib + News sentiment features
+
+Examples:
+  python run_lgb_nd.py --stock-pool sp100 --handler alpha158
+  python run_lgb_nd.py --stock-pool sp500 --handler alpha360-pandas
+  python run_lgb_nd.py --stock-pool sp100 --handler alpha158-news --news-features core
+        """
+    )
+    parser.add_argument('--nday', type=int, default=2,
+                        help='Volatility prediction window in days (default: 2)')
+    parser.add_argument('--handler', type=str, default='alpha158',
+                        choices=list(HANDLER_CONFIG.keys()),
+                        help='Handler type (default: alpha158)')
+    parser.add_argument('--stock-pool', type=str, default='test',
+                        choices=['test', 'tech', 'sp100', 'sp500'],
+                        help='Stock pool: test (10), tech (~30), sp100 (100), sp500 (~500) (default: test)')
     parser.add_argument('--top-k', type=int, default=0,
-                        help='Number of top features to select for retraining (0 = disable feature selection)')
-    parser.add_argument('--stock-pool', type=str, default='test', choices=['test', 'tech', 'sp100', 'sp500'],
-                        help='Stock pool to use: test (10), tech (~30), sp100 (100), sp500 (~500) (default: test)')
+                        help='Top features for retraining (0 = disable feature selection)')
+    # News-specific options (only used with alpha158-news handler)
+    parser.add_argument('--news-features', type=str, default='core',
+                        choices=['all', 'sentiment', 'stats', 'core'],
+                        help='News feature set (only for alpha158-news handler)')
+    parser.add_argument('--news-rolling', action='store_true',
+                        help='Add rolling news features (only for alpha158-news handler)')
     args = parser.parse_args()
+
+    # 获取 handler 配置
+    handler_config = HANDLER_CONFIG[args.handler]
 
     # 选择股票池
     symbols = STOCK_POOLS[args.stock_pool]
@@ -87,21 +149,18 @@ def main():
     print("=" * 70)
     print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
     print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
-    if args.use_news:
-        print("Features: Alpha158 + TA-Lib + News Features")
+    print(f"Handler: {args.handler}")
+    print(f"Features: {handler_config['description']}")
+    if args.handler == 'alpha158-news':
         print(f"    News feature set: {args.news_features}")
         print(f"    News rolling features: {args.news_rolling}")
-    elif args.use_talib:
-        print("Features: Alpha158 + TA-Lib Technical Indicators")
-    else:
-        print("Features: Alpha158 (default)")
     if args.top_k > 0:
-        print(f"Feature Selection: Top {args.top_k} features will be selected for retraining")
+        print(f"Feature Selection: Top {args.top_k} features")
     print("=" * 70)
 
-    # 1. 初始化 Qlib (包含 TA-Lib 自定义算子)
+    # 1. 初始化 Qlib
     print("\n[1] Initializing Qlib...")
-    if args.use_talib or args.use_news:
+    if handler_config['use_talib']:
         qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US, custom_ops=TALIB_OPS)
         print("    ✓ Qlib initialized with TA-Lib custom operators")
     else:
@@ -126,51 +185,35 @@ def main():
 
     # 3. 创建 DataHandler
     print(f"\n[3] Creating DataHandler with {VOLATILITY_WINDOW}-day volatility label...")
-    if args.use_news:
-        print(f"    Features: Alpha158 + TA-Lib + News (~250+ technical indicators + news features)")
-        print(f"    News data path: {NEWS_DATA_PATH}")
-    elif args.use_talib:
-        print(f"    Features: Alpha158 + TA-Lib (~300+ technical indicators)")
-    else:
-        print(f"    Features: Alpha158 (158 technical indicators)")
+    print(f"    Features: {handler_config['description']}")
     print(f"    Label: {VOLATILITY_WINDOW}-day realized volatility")
 
-    if args.use_news:
-        handler = Alpha158_Volatility_TALib_News(
-            volatility_window=VOLATILITY_WINDOW,
-            instruments=symbols,
-            start_time=TRAIN_START,
-            end_time=TEST_END,
-            fit_start_time=TRAIN_START,
-            fit_end_time=TRAIN_END,
-            infer_processors=[],
-            news_data_path=str(NEWS_DATA_PATH) if NEWS_DATA_PATH.exists() else None,
-            news_features=args.news_features,
-            add_news_rolling=args.news_rolling,
-        )
+    # 通用参数
+    handler_kwargs = {
+        'volatility_window': VOLATILITY_WINDOW,
+        'instruments': symbols,
+        'start_time': TRAIN_START,
+        'end_time': TEST_END,
+        'fit_start_time': TRAIN_START,
+        'fit_end_time': TRAIN_END,
+        'infer_processors': [],
+    }
+
+    # News handler 需要额外参数
+    if args.handler == 'alpha158-news':
+        handler_kwargs['news_data_path'] = str(NEWS_DATA_PATH) if NEWS_DATA_PATH.exists() else None
+        handler_kwargs['news_features'] = args.news_features
+        handler_kwargs['add_news_rolling'] = args.news_rolling
+        print(f"    News data path: {NEWS_DATA_PATH}")
+
+    # 创建 handler
+    HandlerClass = handler_config['class']
+    handler = HandlerClass(**handler_kwargs)
+
+    if args.handler == 'alpha158-news':
         print(f"    ✓ DataHandler created with news features: {handler.get_news_feature_names()}")
-    elif args.use_talib:
-        handler = Alpha158_Volatility_TALib(
-            volatility_window=VOLATILITY_WINDOW,
-            instruments=symbols,
-            start_time=TRAIN_START,
-            end_time=TEST_END,
-            fit_start_time=TRAIN_START,
-            fit_end_time=TRAIN_END,
-            infer_processors=[],
-        )
-        print("    ✓ DataHandler created")
     else:
-        handler = Alpha158_Volatility(
-            volatility_window=VOLATILITY_WINDOW,
-            instruments=symbols,
-            start_time=TRAIN_START,
-            end_time=TEST_END,
-            fit_start_time=TRAIN_START,
-            fit_end_time=TRAIN_END,
-            infer_processors=[],
-        )
-        print("    ✓ DataHandler created")
+        print(f"    ✓ DataHandler created: {args.handler}")
 
     # 4. 创建 Dataset
     print("\n[4] Creating Dataset...")
@@ -193,11 +236,20 @@ def main():
     dropped_cols = []
     for col in train_data.columns:
         col_data = train_data[col]
-        if col_data.isna().all():
-            dropped_cols.append(col)
-        elif col_data.nunique(dropna=True) <= 1:
-            dropped_cols.append(col)
-        else:
+        # Handle case where col_data might be DataFrame (duplicate column names)
+        if isinstance(col_data, pd.DataFrame):
+            col_data = col_data.iloc[:, 0]
+        try:
+            is_all_na = col_data.isna().all()
+            n_unique = col_data.nunique(dropna=True)
+            if is_all_na:
+                dropped_cols.append(col)
+            elif n_unique <= 1:
+                dropped_cols.append(col)
+            else:
+                valid_cols.append(col)
+        except Exception:
+            # If any error, keep the column
             valid_cols.append(col)
 
     if dropped_cols:
@@ -238,7 +290,7 @@ def main():
         learning_rate=0.01,
         max_depth=8,
         num_leaves=128,
-        num_threads=4,
+        num_threads=16,
         n_estimators=200,
         early_stopping_rounds=30,
         verbose=-1,  # 减少训练输出
@@ -351,20 +403,50 @@ def main():
     else:
         # 原始模型预测
         print("\n[8] Generating predictions...")
-        # Get test features - use DK_I for inference (matches qlib's predict)
-        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_I)
+        # Get test features - use DK_L (same as training) to ensure consistent features
+        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
         print(f"    Test data shape: {test_data.shape}")
 
-        # Filter to match training features exactly
-        missing_features = [f for f in feature_names if f not in test_data.columns]
-        if missing_features:
-            print(f"    ⚠ {len(missing_features)} training features missing in test data")
-            # Add missing columns as NaN
-            for f in missing_features:
-                test_data[f] = np.nan
+        # Ensure column names are unique (handle duplicates)
+        if test_data.columns.duplicated().any():
+            print(f"    ⚠ Found duplicate column names, making unique...")
+            test_data.columns = [f"{col}_{i}" if test_data.columns.tolist()[:i].count(col) > 0 else col
+                                 for i, col in enumerate(test_data.columns)]
 
-        test_data_filtered = test_data[feature_names]
-        print(f"    Filtered test features: {test_data_filtered.shape[1]} (expected: {len(feature_names)})")
+        # Get training data with same DK_L to ensure same columns
+        train_cols = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L).columns.tolist()
+
+        # Make training column names unique in same way
+        train_cols_unique = []
+        seen = {}
+        for col in train_cols:
+            if col in seen:
+                train_cols_unique.append(f"{col}_{seen[col]}")
+                seen[col] += 1
+            else:
+                train_cols_unique.append(col)
+                seen[col] = 1
+
+        # Use the first N columns that match training (N = model features)
+        model_n_features = model.model.num_feature()
+        print(f"    Model expects {model_n_features} features")
+
+        # Select only columns present in both, up to model_n_features
+        available_cols = [c for c in test_data.columns if c in train_cols_unique[:model_n_features]]
+
+        # If we have enough columns, use them directly
+        if len(available_cols) >= model_n_features:
+            # Take only the first model_n_features columns from test_data
+            test_data_filtered = test_data.iloc[:, :model_n_features]
+        else:
+            # Need to add missing columns
+            print(f"    ⚠ Only {len(available_cols)} columns available, need {model_n_features}")
+            test_data_filtered = test_data.iloc[:, :model_n_features].copy()
+            # Pad with NaN if needed
+            for i in range(len(available_cols), model_n_features):
+                test_data_filtered[f"_missing_{i}"] = np.nan
+
+        print(f"    Filtered test features: {test_data_filtered.shape[1]} (expected: {model_n_features})")
 
         pred_values = model.model.predict(test_data_filtered.values)
         test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')

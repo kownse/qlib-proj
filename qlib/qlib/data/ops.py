@@ -765,7 +765,7 @@ class Rolling(ExpressionOps):
         if self.N == 0:
             # FIXME: How to make this accurate and efficiently? Or  should we
             # remove such support for N == 0?
-            get_module_logger(self.__class__.__name__).warning("The Rolling(ATTR, 0) will not be accurately calculated")
+            # get_module_logger(self.__class__.__name__).warning("The Rolling(ATTR, 0) will not be accurately calculated")
             return self.feature.get_extended_window_size()
         elif 0 < self.N < 1:
             lft_etd, rght_etd = self.feature.get_extended_window_size()

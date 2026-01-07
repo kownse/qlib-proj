@@ -244,35 +244,35 @@ def evaluate_model(dataset, test_pred, project_root, nday):
     print(f"    ║  MAPE (Mean Abs % Error):    {mape:>7.2f}%  ║")
     print(f"    ╚════════════════════════════════════════╝")
 
-    # 展示预测样本
-    print(f"\n[9] Sample Predictions (Test Set):")
-    print(f"    Showing first 20 predictions...\n")
+    # # 展示预测样本
+    # print(f"\n[9] Sample Predictions (Test Set):")
+    # print(f"    Showing first 20 predictions...\n")
 
-    comparison = pd.DataFrame({
-        "Predicted_Vol": test_pred_clean,
-        "Actual_Vol": label_clean,
-        "Error": test_pred_clean - label_clean,
-        "Error_%": ((test_pred_clean - label_clean) / label_clean * 100).round(2)
-    })
+    # comparison = pd.DataFrame({
+    #     "Predicted_Vol": test_pred_clean,
+    #     "Actual_Vol": label_clean,
+    #     "Error": test_pred_clean - label_clean,
+    #     "Error_%": ((test_pred_clean - label_clean) / label_clean * 100).round(2)
+    # })
 
-    print(comparison.head(20).to_string())
+    # print(comparison.head(20).to_string())
 
-    # 按股票统计
-    print(f"\n[10] Performance by Stock:")
-    print(f"     (Average prediction error for each stock)\n")
+    # # 按股票统计
+    # print(f"\n[10] Performance by Stock:")
+    # print(f"     (Average prediction error for each stock)\n")
 
-    stock_performance = comparison.groupby(level="instrument").agg({
-        "Predicted_Vol": "mean",
-        "Actual_Vol": "mean",
-        "Error": lambda x: x.abs().mean(),
-        "Error_%": lambda x: x.abs().mean()
-    }).round(4)
-    stock_performance.columns = ["Pred_Mean", "Actual_Mean", "MAE", "MAPE"]
-    print(stock_performance.to_string())
+    # stock_performance = comparison.groupby(level="instrument").agg({
+    #     "Predicted_Vol": "mean",
+    #     "Actual_Vol": "mean",
+    #     "Error": lambda x: x.abs().mean(),
+    #     "Error_%": lambda x: x.abs().mean()
+    # }).round(4)
+    # stock_performance.columns = ["Pred_Mean", "Actual_Mean", "MAE", "MAPE"]
+    # print(stock_performance.to_string())
 
-    # 生成可视化图表
-    output_dir = project_root / "outputs" / "volatility_prediction"
-    plot_predictions(comparison, output_dir, nday)
+    # # 生成可视化图表
+    # output_dir = project_root / "outputs" / "volatility_prediction"
+    # plot_predictions(comparison, output_dir, nday)
 
     print("\n" + "=" * 70)
     print("✓ Volatility Prediction Completed Successfully!")

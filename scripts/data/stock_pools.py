@@ -51,9 +51,9 @@ SP500_SYMBOLS = [
     "AKAM", "ALB", "ALGN", "ALL", "ALLE", "AMAT", "AMCR", "AMD", "AME", "AMGN",
     "AMP", "AMT", "AMZN", "ANET", "ANSS", "AON", "AOS", "APA", "APD", "APH",
     "APTV", "ARE", "ATO", "AVB", "AVGO", "AVY", "AWK", "AXON", "AXP", "AZO",
-    # B
-    "BA", "BAC", "BALL", "BAX", "BBWI", "BBY", "BDX", "BEN", "BF.B", "BG",
-    "BIIB", "BIO", "BK", "BKNG", "BKR", "BLDR", "BLK", "BMY", "BR", "BRK.B",
+    # B (注: BF.B 和 BRK.B 因含 "." 导致处理问题，已剔除)
+    "BA", "BAC", "BALL", "BAX", "BBWI", "BBY", "BDX", "BEN", "BG",
+    "BIIB", "BIO", "BK", "BKNG", "BKR", "BLDR", "BLK", "BMY", "BR",
     "BRO", "BSX", "BWA", "BX", "BXP",
     # C
     "C", "CAG", "CAH", "CARR", "CAT", "CB", "CBOE", "CBRE", "CCI", "CCL",
