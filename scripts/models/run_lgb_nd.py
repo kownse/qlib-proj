@@ -8,6 +8,7 @@
 
 import sys
 from pathlib import Path
+from datetime import datetime
 
 # Add scripts directory to path for imports
 script_dir = Path(__file__).parent.parent  # scripts directory
@@ -17,6 +18,9 @@ from pathlib import Path
 import argparse
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pickle
 from utils.utils import evaluate_model
 
 import qlib
@@ -25,6 +29,10 @@ from qlib.data import D
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
+
+# Import backtest components
+from qlib.backtest import backtest as qlib_backtest
+from qlib.contrib.evaluate import risk_analysis
 
 # Import TA-Lib custom operators
 from utils.talib_ops import TALIB_OPS
@@ -37,6 +45,12 @@ from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatil
 # Import stock pools
 from data.stock_pools import STOCK_POOLS
 
+# Import custom strategy
+from utils.strategy import get_strategy_config
+
+# Import backtest utilities
+from utils.backtest_utils import plot_backtest_curve, generate_trade_records
+
 
 # ========== 配置 ==========
 
@@ -44,6 +58,7 @@ from data.stock_pools import STOCK_POOLS
 PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.parquet"
+MODEL_SAVE_PATH = PROJECT_ROOT / "my_models"
 
 # 时间划分
 # TRAIN_START = "2025-01-01"
@@ -53,7 +68,7 @@ NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.pa
 # TEST_START = "2025-12-01"
 # TEST_END = "2025-12-31"
 
-TRAIN_START = "2015-01-01"
+TRAIN_START = "2000-01-01"
 TRAIN_END = "2023-12-31"
 VALID_START = "2024-01-01"
 VALID_END = "2024-12-31"
@@ -64,6 +79,33 @@ TEST_END = "2025-12-31"
 VOLATILITY_WINDOW = 2
 
 # Handler 配置映射
+def save_model(lgb_model, model_path, meta_data):
+    """
+    保存 LightGBM 模型和元数据
+
+    Parameters
+    ----------
+    lgb_model : lightgbm.Booster
+        训练好的 LightGBM 模型
+    model_path : Path or str
+        模型保存路径（.txt 文件）
+    meta_data : dict
+        元数据字典，包含 handler, stock_pool, nday, top_k, feature_names 等信息
+    """
+    model_path = Path(model_path)
+
+    # 保存模型
+    lgb_model.save_model(str(model_path))
+
+    # 保存元数据
+    meta_path = model_path.with_suffix('.meta.pkl')
+    with open(meta_path, 'wb') as f:
+        pickle.dump(meta_data, f)
+
+    print(f"    ✓ Model saved to: {model_path}")
+    print(f"    ✓ Metadata saved to: {meta_path}")
+
+
 HANDLER_CONFIG = {
     'alpha158': {
         'class': Alpha158_Volatility,
@@ -98,7 +140,7 @@ HANDLER_CONFIG = {
 }
 
 
-def main():
+def main_train_impl():
     # 解析命令行参数
     parser = argparse.ArgumentParser(
         description='Qlib Stock Price Volatility Prediction',
@@ -116,6 +158,8 @@ Examples:
   python run_lgb_nd.py --stock-pool sp100 --handler alpha158
   python run_lgb_nd.py --stock-pool sp500 --handler alpha360-pandas
   python run_lgb_nd.py --stock-pool sp100 --handler alpha158-news --news-features core
+  python run_lgb_nd.py --stock-pool sp100 --max-train  # Max training data for deployment
+  python run_lgb_nd.py --stock-pool sp100 --backtest --rebalance-freq 5  # Rebalance every 5 days
         """
     )
     parser.add_argument('--nday', type=int, default=2,
@@ -134,6 +178,20 @@ Examples:
                         help='News feature set (only for alpha158-news handler)')
     parser.add_argument('--news-rolling', action='store_true',
                         help='Add rolling news features (only for alpha158-news handler)')
+    # Time split options
+    parser.add_argument('--max-train', action='store_true',
+                        help='Use maximum training data (train to 2025-09, valid 2025-10-12, no test) for deployment')
+    # Backtest options
+    parser.add_argument('--backtest', action='store_true',
+                        help='Run backtest after training using TopkDropoutStrategy')
+    parser.add_argument('--topk', type=int, default=10,
+                        help='Number of stocks to hold in TopkDropoutStrategy (default: 10)')
+    parser.add_argument('--n-drop', type=int, default=2,
+                        help='Number of stocks to drop/replace each day (default: 2)')
+    parser.add_argument('--account', type=float, default=1000000,
+                        help='Initial account value for backtest (default: 1000000)')
+    parser.add_argument('--rebalance-freq', type=int, default=1,
+                        help='Rebalance frequency in days (default: 1, i.e., rebalance every day)')
     args = parser.parse_args()
 
     # 获取 handler 配置
@@ -143,19 +201,33 @@ Examples:
     symbols = STOCK_POOLS[args.stock_pool]
 
     # 更新全局变量
-    global VOLATILITY_WINDOW
+    global VOLATILITY_WINDOW, TRAIN_START, TRAIN_END, VALID_START, VALID_END, TEST_START, TEST_END
     VOLATILITY_WINDOW = args.nday
+
+    # 根据 --max-train 参数调整时间划分
+    if args.max_train:
+        TRAIN_START = "2000-01-01"
+        TRAIN_END = "2025-09-30"
+        VALID_START = "2025-10-01"
+        VALID_END = "2025-12-31"
+        TEST_START = "2025-10-01"  # 测试集与验证集相同（用于部署场景）
+        TEST_END = "2025-12-31"
 
     print("=" * 70)
     print(f"Qlib {VOLATILITY_WINDOW}-Day Stock Price Volatility Prediction")
     print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
     print(f"Handler: {args.handler}")
+    if args.max_train:
+        print(f"Time Split: MAX-TRAIN mode (for deployment)")
     print(f"Features: {handler_config['description']}")
     if args.handler == 'alpha158-news':
         print(f"    News feature set: {args.news_features}")
         print(f"    News rolling features: {args.news_rolling}")
     if args.top_k > 0:
         print(f"Feature Selection: Top {args.top_k} features")
+    if args.backtest:
+        rebalance_info = f", rebalance_freq={args.rebalance_freq}" if args.rebalance_freq > 1 else ""
+        print(f"Backtest: Enabled (topk={args.topk}, n_drop={args.n_drop}{rebalance_info})")
     print("=" * 70)
 
     # 1. 初始化 Qlib
@@ -278,21 +350,14 @@ Examples:
 
     # 5. 训练模型
     print("\n[6] Training LightGBM model...")
-    print("    Model parameters:")
-    print(f"      - loss: mse")
-    print(f"      - learning_rate: 0.05")
-    print(f"      - max_depth: 8")
-    print(f"      - num_leaves: 128")
-    print(f"      - n_estimators: 200")
-
     model = LGBModel(
         loss="mse",
         learning_rate=0.01,
         max_depth=8,
         num_leaves=128,
         num_threads=16,
-        n_estimators=200,
-        early_stopping_rounds=30,
+        n_estimators=400,
+        early_stopping_rounds=100,
         verbose=-1,  # 减少训练输出
     )
 
@@ -400,18 +465,37 @@ Examples:
         # 评估
         print("\n[10] Evaluation with selected features...")
         evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
+
+        # 保存模型
+        print("\n[11] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_filename = f"lgb_{args.handler}_{args.stock_pool}_{args.nday}d_topk{args.top_k}_{timestamp}.txt"
+        model_path = MODEL_SAVE_PATH / model_filename
+        meta_data = {
+            'handler': args.handler,
+            'stock_pool': args.stock_pool,
+            'nday': args.nday,
+            'top_k': args.top_k,
+            'feature_names': top_features,
+            'train_start': TRAIN_START,
+            'train_end': TRAIN_END,
+            'valid_start': VALID_START,
+            'valid_end': VALID_END,
+            'test_start': TEST_START,
+            'test_end': TEST_END,
+            'use_talib': handler_config['use_talib'],
+        }
+        save_model(lgb_model, model_path, meta_data)
+
+        # 返回预测结果和模型路径供 backtest 使用
+        return model_path, dataset, test_pred, args
     else:
         # 原始模型预测
         print("\n[8] Generating predictions...")
         # Get test features - use DK_L (same as training) to ensure consistent features
         test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
         print(f"    Test data shape: {test_data.shape}")
-
-        # Ensure column names are unique (handle duplicates)
-        if test_data.columns.duplicated().any():
-            print(f"    ⚠ Found duplicate column names, making unique...")
-            test_data.columns = [f"{col}_{i}" if test_data.columns.tolist()[:i].count(col) > 0 else col
-                                 for i, col in enumerate(test_data.columns)]
 
         # Get training data with same DK_L to ensure same columns
         train_cols = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L).columns.tolist()
@@ -456,6 +540,225 @@ Examples:
         # 评估
         print("\n[9] Evaluation...")
         evaluate_model(dataset, test_pred, PROJECT_ROOT, VOLATILITY_WINDOW)
+
+        # 保存模型
+        print("\n[10] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_filename = f"lgb_{args.handler}_{args.stock_pool}_{args.nday}d_{timestamp}.txt"
+        model_path = MODEL_SAVE_PATH / model_filename
+        meta_data = {
+            'handler': args.handler,
+            'stock_pool': args.stock_pool,
+            'nday': args.nday,
+            'top_k': 0,
+            'feature_names': valid_cols,
+            'train_start': TRAIN_START,
+            'train_end': TRAIN_END,
+            'valid_start': VALID_START,
+            'valid_end': VALID_END,
+            'test_start': TEST_START,
+            'test_end': TEST_END,
+            'use_talib': handler_config['use_talib'],
+        }
+        save_model(model.model, model_path, meta_data)
+
+        # 返回预测结果和模型路径供 backtest 使用
+        return model_path, dataset, test_pred, args
+
+
+def run_backtest(model_path, dataset, pred, args):
+    """
+    使用 TopkDropoutStrategy 进行回测
+
+    Parameters
+    ----------
+    model_path : Path or str
+        训练好的模型保存路径
+    dataset : DatasetH
+        数据集
+    pred : pd.Series
+        预测结果
+    args : argparse.Namespace
+        命令行参数
+    """
+    import lightgbm as lgb
+
+    print("\n" + "=" * 70)
+    print("BACKTEST with TopkDropoutStrategy")
+    print("=" * 70)
+
+    # 加载模型和元数据
+    model_path = Path(model_path)
+    meta_path = model_path.with_suffix('.meta.pkl')
+
+    print(f"\n[BT-0] Loading model from: {model_path}")
+    loaded_model = lgb.Booster(model_file=str(model_path))
+    print(f"    ✓ Model loaded successfully")
+    print(f"    Model features: {loaded_model.num_feature()}")
+
+    if meta_path.exists():
+        with open(meta_path, 'rb') as f:
+            meta_data = pickle.load(f)
+        print(f"    ✓ Metadata loaded")
+        print(f"    Handler: {meta_data.get('handler', 'N/A')}")
+        print(f"    Stock pool: {meta_data.get('stock_pool', 'N/A')}")
+        print(f"    N-day: {meta_data.get('nday', 'N/A')}")
+        if meta_data.get('top_k', 0) > 0:
+            print(f"    Top-k features: {meta_data.get('top_k')}")
+    else:
+        print(f"    ⚠ Metadata file not found: {meta_path}")
+        meta_data = {}
+
+    # 将预测结果转换为 DataFrame 格式
+    if isinstance(pred, pd.Series):
+        pred_df = pred.to_frame("score")
+    else:
+        pred_df = pred
+
+    print(f"\n[BT-1] Configuring backtest...")
+    print(f"    Topk: {args.topk}")
+    print(f"    N_drop: {args.n_drop}")
+    print(f"    Account: ${args.account:,.0f}")
+    print(f"    Rebalance Freq: every {args.rebalance_freq} day(s)")
+    print(f"    Period: {TEST_START} to {TEST_END}")
+
+    # 配置策略
+    strategy_config = get_strategy_config(pred_df, args.topk, args.n_drop, args.rebalance_freq)
+
+    # 配置执行器
+    executor_config = {
+        "class": "SimulatorExecutor",
+        "module_path": "qlib.backtest.executor",
+        "kwargs": {
+            "time_per_step": "day",
+            "generate_portfolio_metrics": True,
+        },
+    }
+
+    # 配置回测参数（美股市场）
+    # 使用 AAPL 作为基准（如果需要 benchmark）
+    # 或者使用股票池中所有股票的平均作为基准
+    from data.stock_pools import STOCK_POOLS
+    pool_symbols = STOCK_POOLS[args.stock_pool]
+
+    backtest_config = {
+        "start_time": TEST_START,
+        "end_time": TEST_END,
+        "account": args.account,
+        "benchmark": pool_symbols,  # 使用股票池平均作为基准
+        "exchange_kwargs": {
+            "freq": "day",
+            "limit_threshold": None,  # 美股无涨跌停限制
+            "deal_price": "close",
+            "open_cost": 0.0005,  # 买入成本 0.05%
+            "close_cost": 0.0005,  # 卖出成本 0.05%
+            "min_cost": 1,  # 最小交易成本 $1
+        },
+    }
+
+    print(f"\n[BT-2] Running backtest...")
+    try:
+        portfolio_metric_dict, indicator_dict = qlib_backtest(
+            executor=executor_config,
+            strategy=strategy_config,
+            **backtest_config
+        )
+
+        print("    ✓ Backtest completed")
+
+        # 分析结果
+        print(f"\n[BT-3] Analyzing results...")
+
+        for freq, (report_df, positions) in portfolio_metric_dict.items():
+            print(f"\n    Frequency: {freq}")
+            print(f"    Report shape: {report_df.shape}")
+            print(f"    Date range: {report_df.index.min()} to {report_df.index.max()}")
+
+            # 计算关键指标
+            total_return = (report_df["return"] + 1).prod() - 1
+
+            # 检查是否有 benchmark
+            has_bench = "bench" in report_df.columns and not report_df["bench"].isna().all()
+            if has_bench:
+                bench_return = (report_df["bench"] + 1).prod() - 1
+                excess_return = total_return - bench_return
+                excess_return_series = report_df["return"] - report_df["bench"]
+                analysis = risk_analysis(excess_return_series, freq=freq)
+            else:
+                bench_return = None
+                excess_return = None
+                # 对策略收益进行风险分析
+                analysis = risk_analysis(report_df["return"], freq=freq)
+
+            print(f"\n    Performance Summary:")
+            print(f"    " + "-" * 50)
+            print(f"    Total Return:      {total_return:>10.2%}")
+            if has_bench:
+                print(f"    Benchmark Return:  {bench_return:>10.2%}")
+                print(f"    Excess Return:     {excess_return:>10.2%}")
+            else:
+                print(f"    Benchmark Return:  N/A (no benchmark)")
+            print(f"    " + "-" * 50)
+
+            if analysis is not None and not analysis.empty:
+                analysis_title = "Risk Analysis (Excess Return)" if has_bench else "Risk Analysis (Strategy Return)"
+                print(f"\n    {analysis_title}:")
+                print(f"    " + "-" * 50)
+                for metric, value in analysis.items():
+                    if isinstance(value, (int, float)):
+                        print(f"    {metric:<25s}: {value:>10.4f}")
+                print(f"    " + "-" * 50)
+
+            # 输出详细报告
+            print(f"\n    Daily Returns Statistics:")
+            print(f"    " + "-" * 50)
+            print(f"    Mean Daily Return:   {report_df['return'].mean():>10.4%}")
+            print(f"    Std Daily Return:    {report_df['return'].std():>10.4%}")
+            print(f"    Max Daily Return:    {report_df['return'].max():>10.4%}")
+            print(f"    Min Daily Return:    {report_df['return'].min():>10.4%}")
+            print(f"    Total Trading Days:  {len(report_df):>10d}")
+            print(f"    " + "-" * 50)
+
+            # 保存报告
+            output_path = PROJECT_ROOT / "outputs" / f"backtest_report_{freq}.csv"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            report_df.to_csv(output_path)
+            print(f"\n    ✓ Report saved to: {output_path}")
+
+            # [BT-4] 绘制净值曲线图
+            print(f"\n[BT-4] Generating performance chart...")
+            plot_backtest_curve(report_df, args, freq, PROJECT_ROOT, model_name="LightGBM")
+
+            # [BT-5] 生成交易记录 CSV
+            print(f"\n[BT-5] Generating trade records...")
+            generate_trade_records(positions, args, freq, PROJECT_ROOT, model_name="lightgbm")
+
+        # 输出交易指标
+        for freq, (indicator_df, indicator_obj) in indicator_dict.items():
+            if indicator_df is not None and not indicator_df.empty:
+                print(f"\n    Trading Indicators ({freq}):")
+                print(f"    " + "-" * 50)
+                print(indicator_df.head(20).to_string(index=True))
+                if len(indicator_df) > 20:
+                    print(f"    ... ({len(indicator_df)} rows total)")
+
+    except Exception as e:
+        print(f"\n    ✗ Backtest failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n" + "=" * 70)
+    print("BACKTEST COMPLETED")
+    print("=" * 70)
+
+
+def main():
+    result = main_train_impl()
+    if result is not None:
+        model_path, dataset, pred, args = result
+        if args.backtest:
+            run_backtest(model_path, dataset, pred, args)
 
 
 if __name__ == "__main__":
