@@ -84,14 +84,38 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
         pred_df = pred
 
     print(f"\n[BT-1] Configuring backtest...")
+    print(f"    Strategy: {args.strategy}")
     print(f"    Topk: {args.topk}")
     print(f"    N_drop: {args.n_drop}")
     print(f"    Account: ${args.account:,.0f}")
     print(f"    Rebalance Freq: every {args.rebalance_freq} day(s)")
     print(f"    Period: {time_splits['test_start']} to {time_splits['test_end']}")
 
+    # 动态风险策略参数
+    dynamic_risk_params = None
+    if args.strategy == "dynamic_risk":
+        dynamic_risk_params = {
+            "lookback": args.risk_lookback,
+            "drawdown_threshold": args.drawdown_threshold,
+            "momentum_threshold": args.momentum_threshold,
+            "risk_degree_high": args.risk_high,
+            "risk_degree_medium": args.risk_medium,
+            "risk_degree_normal": args.risk_normal,
+            "market_proxy": args.market_proxy,
+        }
+        print(f"    Dynamic Risk Params:")
+        print(f"      Lookback: {args.risk_lookback} days")
+        print(f"      Drawdown Threshold: {args.drawdown_threshold:.1%}")
+        print(f"      Momentum Threshold: {args.momentum_threshold:.1%}")
+        print(f"      Risk Degrees: high={args.risk_high:.0%}, medium={args.risk_medium:.0%}, normal={args.risk_normal:.0%}")
+        print(f"      Market Proxy: {args.market_proxy}")
+
     # 配置策略
-    strategy_config = get_strategy_config(pred_df, args.topk, args.n_drop, args.rebalance_freq)
+    strategy_config = get_strategy_config(
+        pred_df, args.topk, args.n_drop, args.rebalance_freq,
+        strategy_type=args.strategy,
+        dynamic_risk_params=dynamic_risk_params
+    )
 
     # 配置执行器
     executor_config = {

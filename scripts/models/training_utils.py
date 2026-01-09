@@ -86,6 +86,8 @@ Examples:
     # 回测参数
     parser.add_argument('--backtest', action='store_true',
                         help='Run backtest after training using TopkDropoutStrategy')
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to a pre-trained model. If provided, skip training and run backtest directly')
     parser.add_argument('--topk', type=int, default=10,
                         help='Number of stocks to hold in TopkDropoutStrategy (default: 10)')
     parser.add_argument('--n-drop', type=int, default=2,
@@ -94,6 +96,27 @@ Examples:
                         help='Initial account value for backtest (default: 1000000)')
     parser.add_argument('--rebalance-freq', type=int, default=1,
                         help='Rebalance frequency in days (default: 1, i.e., rebalance every day)')
+
+    # 策略类型参数
+    parser.add_argument('--strategy', type=str, default='topk',
+                        choices=['topk', 'dynamic_risk'],
+                        help='Strategy type: topk (default TopkDropoutStrategy) or dynamic_risk (momentum+volatility risk control)')
+
+    # 动态风险策略参数
+    parser.add_argument('--risk-lookback', type=int, default=20,
+                        help='Lookback days for momentum/drawdown calculation (default: 20)')
+    parser.add_argument('--drawdown-threshold', type=float, default=-0.10,
+                        help='Drawdown threshold for high risk mode (default: -0.10, i.e., 10%% drawdown)')
+    parser.add_argument('--momentum-threshold', type=float, default=0.03,
+                        help='Momentum threshold for trend detection (default: 0.03, i.e., 3%%)')
+    parser.add_argument('--risk-high', type=float, default=0.50,
+                        help='Position ratio at high risk (default: 0.50)')
+    parser.add_argument('--risk-medium', type=float, default=0.75,
+                        help='Position ratio at medium risk (default: 0.75)')
+    parser.add_argument('--risk-normal', type=float, default=0.95,
+                        help='Normal position ratio (default: 0.95)')
+    parser.add_argument('--market-proxy', type=str, default='SPY',
+                        help='Market proxy symbol for risk calculation (default: SPY)')
 
     return parser
 
@@ -133,7 +156,10 @@ def print_training_header(model_name: str, args, symbols: list, handler_config: 
         print(f"Feature Selection: Top {args.top_k} features")
     if args.backtest:
         rebalance_info = f", rebalance_freq={args.rebalance_freq}" if args.rebalance_freq > 1 else ""
-        print(f"Backtest: Enabled (topk={args.topk}, n_drop={args.n_drop}{rebalance_info})")
+        strategy_info = f", strategy={args.strategy}" if args.strategy != "topk" else ""
+        print(f"Backtest: Enabled (topk={args.topk}, n_drop={args.n_drop}{rebalance_info}{strategy_info})")
+        if args.strategy == "dynamic_risk":
+            print(f"  Dynamic Risk: lookback={args.risk_lookback}, drawdown={args.drawdown_threshold:.0%}, momentum={args.momentum_threshold:.0%}")
     print("=" * 70)
 
 

@@ -254,8 +254,111 @@ def get_lightgbm_feature_count(model):
     return model.num_feature()
 
 
+def backtest_only_impl(args):
+    """
+    跳过训练，直接加载模型进行回测
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        命令行参数，必须包含 model_path
+    """
+    import pickle
+
+    model_path = Path(args.model_path)
+    meta_path = model_path.with_suffix('.meta.pkl')
+
+    print("=" * 70)
+    print("BACKTEST ONLY MODE (Skip Training)")
+    print("=" * 70)
+
+    # 加载模型元数据
+    if not meta_path.exists():
+        print(f"Error: Metadata file not found: {meta_path}")
+        print("Please provide a model with .meta.pkl file")
+        return None
+
+    with open(meta_path, 'rb') as f:
+        meta_data = pickle.load(f)
+
+    print(f"\n[1] Loading model metadata...")
+    print(f"    Model path: {model_path}")
+    print(f"    Handler: {meta_data.get('handler', 'N/A')}")
+    print(f"    Stock pool: {meta_data.get('stock_pool', 'N/A')}")
+    print(f"    N-day: {meta_data.get('nday', 'N/A')}")
+    print(f"    Top-k features: {meta_data.get('top_k', 0)}")
+
+    # 使用元数据中的配置，但允许 CLI 覆盖部分参数
+    handler_name = meta_data.get('handler', args.handler)
+    stock_pool = meta_data.get('stock_pool', args.stock_pool)
+
+    handler_config = HANDLER_CONFIG[handler_name]
+    symbols = STOCK_POOLS[stock_pool]
+    time_splits = get_time_splits(args.max_train)
+
+    # 初始化 Qlib
+    print(f"\n[2] Initializing Qlib...")
+    init_qlib(handler_config['use_talib'])
+
+    # 创建数据集（只需要测试集用于预测）
+    print(f"\n[3] Creating dataset for prediction...")
+    handler = create_data_handler(args, handler_config, symbols, time_splits)
+    dataset = create_dataset(handler, time_splits)
+
+    # 加载模型
+    print(f"\n[4] Loading model...")
+    model = load_lightgbm_model(model_path)
+    num_features = model.num_feature()
+    print(f"    ✓ Model loaded, features: {num_features}")
+
+    # 准备测试数据
+    print(f"\n[5] Preparing test data...")
+    feature_names = meta_data.get('feature_names', [])
+    top_k = meta_data.get('top_k', 0)
+
+    if top_k > 0 and feature_names:
+        # 使用保存的特征名
+        test_data = dataset.prepare("test", col_set="feature")
+        available_features = [f for f in feature_names if f in test_data.columns]
+        if len(available_features) < len(feature_names):
+            print(f"    ⚠ Some features missing: {len(available_features)}/{len(feature_names)}")
+        test_data_filtered = test_data[available_features]
+    else:
+        # 使用所有特征
+        test_data_filtered = prepare_test_data_for_prediction(dataset, num_features)
+
+    print(f"    Test data shape: {test_data_filtered.shape}")
+
+    # 生成预测
+    print(f"\n[6] Generating predictions...")
+    pred_values = model.predict(test_data_filtered.values)
+    test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')
+    print_prediction_stats(test_pred)
+
+    # 评估
+    print(f"\n[7] Evaluation...")
+    evaluate_model(dataset, test_pred, PROJECT_ROOT, meta_data.get('nday', args.nday))
+
+    return model_path, dataset, test_pred, args, time_splits
+
+
 def main():
-    result = main_train_impl()
+    # 解析命令行参数
+    parser = create_argument_parser("LightGBM", "run_lgb_nd.py")
+    args = parser.parse_args()
+
+    # 检查是否为仅回测模式
+    if args.model_path:
+        # 跳过训练，直接回测
+        if not args.backtest:
+            print("Warning: --model-path provided but --backtest not set. Enabling backtest automatically.")
+            args.backtest = True
+
+        result = backtest_only_impl(args)
+    else:
+        # 正常训练流程
+        result = main_train_impl()
+
     if result is not None:
         model_path, dataset, pred, args, time_splits = result
         if args.backtest:

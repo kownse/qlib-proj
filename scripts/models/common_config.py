@@ -22,10 +22,10 @@ MODEL_SAVE_PATH = PROJECT_ROOT / "my_models"
 # ========== 默认时间划分 ==========
 DEFAULT_TIME_SPLITS = {
     'train_start': "2000-01-01",
-    'train_end': "2023-12-31",
-    'valid_start': "2024-01-01",
-    'valid_end': "2024-12-31",
-    'test_start': "2025-01-01",
+    'train_end': "2022-12-31",
+    'valid_start': "2023-01-01",
+    'valid_end': "2023-12-31",
+    'test_start': "2024-01-01",
     'test_end': "2025-12-31",
 }
 
