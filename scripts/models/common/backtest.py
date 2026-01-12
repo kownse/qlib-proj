@@ -15,7 +15,7 @@ from data.stock_pools import STOCK_POOLS
 from utils.strategy import get_strategy_config
 from utils.backtest_utils import plot_backtest_curve, generate_trade_records
 
-from .common_config import PROJECT_ROOT
+from .config import PROJECT_ROOT
 
 
 def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name: str,

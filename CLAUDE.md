@@ -17,9 +17,13 @@ qlib-proj/
 │   │   ├── download_us_data.py   # Yahoo Finance data downloader
 │   │   ├── datahandler_ext.py    # Extended handlers with TA-Lib
 │   │   └── datahandler_news.py   # Handlers with news features
-│   ├── models/              # Training scripts
-│   │   ├── run_baseline.py       # Basic LightGBM training
-│   │   └── run_lgb_enhanced.py   # Enhanced training with regularization, CV, transfer learning
+│   ├── models/              # Training scripts (organized by model type)
+│   │   ├── common/               # Shared config, training utils, backtest logic
+│   │   ├── tree/                 # Tree-based: LightGBM, CatBoost, XGBoost
+│   │   ├── deep/                 # Deep learning: ALSTM, TCN, Transformer, TFT
+│   │   ├── autogluon/            # AutoGluon TimeSeriesPredictor
+│   │   ├── ensemble/             # Ensemble backtesting
+│   │   └── analysis/             # IC analysis, param search, diagnostics
 │   ├── news/                # News data acquisition
 │   │   ├── download_news.py      # Finnhub news downloader
 │   │   └── process_news.py       # Sentiment analysis pipeline
@@ -58,16 +62,26 @@ python scripts/news/process_news.py
 ### Training Models
 
 ```bash
-# Basic LightGBM baseline
-python scripts/models/run_baseline.py
+# Tree-based models
+python scripts/models/tree/run_baseline.py                              # Basic test
+python scripts/models/tree/run_lgb_nd.py --stock-pool sp500 --backtest  # LightGBM
+python scripts/models/tree/run_catboost_nd.py --stock-pool sp500        # CatBoost
+python scripts/models/tree/run_xgboost_nd.py --stock-pool sp500         # XGBoost
 
-# Enhanced training with options
-python scripts/models/run_lgb_enhanced.py --help
+# Deep learning models
+python scripts/models/deep/run_alstm.py --stock-pool sp500 --handler alpha360
+python scripts/models/deep/run_tcn.py --stock-pool sp500 --handler alpha360
+python scripts/models/deep/run_transformer.py --stock-pool sp500 --handler alpha360
 
-# Examples:
-python scripts/models/run_lgb_enhanced.py --nday 2 --stock-pool medium --regularization medium
-python scripts/models/run_lgb_enhanced.py --use-news --transfer-learning --feature-selection
-python scripts/models/run_lgb_enhanced.py --cross-validation --cv-folds 3
+# AutoGluon models
+python scripts/models/autogluon/run_ag_ts.py
+python scripts/models/autogluon/run_ag_tft.py
+
+# Ensemble backtest
+python scripts/models/ensemble/run_ensemble_backtest.py --stock-pool sp500
+
+# Analysis
+python scripts/models/analysis/param_search.py --model-path ./my_models/model.txt
 ```
 
 ### Qlib Initialization
@@ -101,13 +115,15 @@ Custom operators in `scripts/utils/talib_ops.py` registered via `custom_ops` par
 - `TALIB_RSI`, `TALIB_MACD_*`, `TALIB_ATR`, `TALIB_BBANDS_*`, `TALIB_ADX`, etc.
 - Requires TA-Lib C library: `brew install ta-lib && pip install TA-Lib`
 
-### Enhanced Training Features (`run_lgb_enhanced.py`)
+### Model Training Features
 
-1. **Regularization levels**: light/medium/strong presets for different data sizes
-2. **Stock pools**: small (10), medium (30), large (100 S&P stocks)
-3. **Feature selection**: Based on LightGBM feature importance
-4. **Time series CV**: Walk-forward validation with gap days
-5. **Transfer learning**: Pretrain on historical data, finetune with news
+All training scripts in `scripts/models/` share common utilities from `models/common/`:
+
+1. **Stock pools**: test (10), tech (~30), sp100 (100), sp500 (~500 stocks)
+2. **Handlers**: alpha158, alpha360, alpha158-talib, alpha158-news
+3. **Backtest integration**: Use `--backtest` flag to run TopkDropoutStrategy
+4. **Feature selection**: Use `--top-k N` for top-N feature retraining
+5. **Strategies**: topk, dynamic_risk, vol_stoploss
 
 ### News Pipeline
 
@@ -117,10 +133,12 @@ Custom operators in `scripts/utils/talib_ops.py` registered via `custom_ops` par
 
 ## Stock Pools
 
-Defined in `scripts/data/download_us_data.py` and `scripts/models/run_lgb_enhanced.py`:
+Defined in `scripts/data/stock_pools.py`:
 
+- **TEST_SYMBOLS**: 10 test stocks
 - **TECH_SYMBOLS**: ~30 tech stocks (Mag 7, semis, software, internet)
 - **SP100_SYMBOLS**: S&P 100 components
+- **SP500_SYMBOLS**: S&P 500 components
 
 ## Time Periods
 

@@ -21,7 +21,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Add scripts directory to path for imports
-script_dir = Path(__file__).parent.parent  # scripts directory
+script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 import argparse
@@ -45,7 +45,7 @@ from data.datahandler_ext import Alpha158_Volatility_TALib
 # ========== 配置 ==========
 
 # 数据路径
-PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 OUTPUT_PATH = PROJECT_ROOT / "outputs" / "autogluon_ts"
 

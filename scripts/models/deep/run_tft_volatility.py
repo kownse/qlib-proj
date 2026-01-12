@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 # Add scripts directory to path for imports
-script_dir = Path(__file__).parent.parent  # scripts directory
+script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 from pathlib import Path
@@ -45,8 +45,8 @@ from data.datahandler_ext import Alpha158_Volatility, Alpha158_Volatility_TALib
 from utils.utils import evaluate_model
 
 # Add TFT benchmark path for imports
-# Path(__file__).parent.parent.parent is the project root (qlib-proj/)
-TFT_PATH = Path(__file__).parent.parent.parent / "qlib" / "examples" / "benchmarks" / "TFT"
+# Path(__file__).parent.parent.parent.parent is the project root (qlib-proj/)
+TFT_PATH = Path(__file__).parent.parent.parent.parent / "qlib" / "examples" / "benchmarks" / "TFT"
 sys.path.insert(0, str(TFT_PATH))
 
 import data_formatters.base
@@ -58,7 +58,7 @@ import sklearn.preprocessing
 # ========== 配置 ==========
 
 # 数据路径
-PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 
 # 股票池

@@ -1,29 +1,30 @@
 """
-运行 Transformer 模型
+运行 ALSTM (Attention LSTM) 模型
 
-Transformer 使用自注意力机制，能够更好地捕捉长距离依赖关系。
+ALSTM 是 LSTM 的增强版本，加入了注意力机制，能更好地捕捉时序特征。
 
 使用方法:
-    python scripts/models/run_transformer.py --stock-pool sp500 --handler alpha360 --nday 5 --backtest
+    python scripts/models/run_alstm.py --stock-pool sp500 --handler alpha360 --nday 5 --backtest
 """
 
 import sys
 from pathlib import Path
 
-script_dir = Path(__file__).parent.parent
+script_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(script_dir))
 
 import torch
 import numpy as np
 import pandas as pd
 
-from qlib.contrib.model.pytorch_transformer import TransformerModel
+from qlib.contrib.model.pytorch_alstm import ALSTM
+from qlib.data.dataset.handler import DataHandlerLP
 
 from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
 
-from models.common_config import HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH
-from models.training_utils import (
+from models.common import (
+    HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
     create_argument_parser,
     get_time_splits,
     print_training_header,
@@ -34,32 +35,28 @@ from models.training_utils import (
     analyze_features,
     analyze_label_distribution,
     print_prediction_stats,
+    run_backtest,
 )
-from models.backtest_common import run_backtest
 
 
-def add_transformer_args(parser):
-    """添加 Transformer 特定参数"""
+def add_alstm_args(parser):
+    """添加 ALSTM 特定参数"""
     parser.add_argument('--d-feat', type=int, default=6,
                         help='Base features per timestep (default: 6 for Alpha360)')
-    parser.add_argument('--d-model', type=int, default=64,
-                        help='Model dimension (default: 64)')
-    parser.add_argument('--nhead', type=int, default=4,
-                        help='Number of attention heads (default: 4)')
+    parser.add_argument('--hidden-size', type=int, default=64,
+                        help='Hidden size of LSTM (default: 64)')
     parser.add_argument('--num-layers', type=int, default=2,
-                        help='Number of transformer layers (default: 2)')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                        help='Dropout rate (default: 0.1)')
+                        help='Number of LSTM layers (default: 2)')
+    parser.add_argument('--dropout', type=float, default=0.0,
+                        help='Dropout rate (default: 0.0)')
     parser.add_argument('--n-epochs', type=int, default=200,
                         help='Number of training epochs (default: 200)')
-    parser.add_argument('--lr', type=float, default=0.0001,
-                        help='Learning rate (default: 0.0001)')
-    parser.add_argument('--batch-size', type=int, default=2048,
-                        help='Batch size (default: 2048)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate (default: 0.001)')
+    parser.add_argument('--batch-size', type=int, default=2000,
+                        help='Batch size (default: 2000)')
     parser.add_argument('--early-stop', type=int, default=20,
                         help='Early stopping patience (default: 20)')
-    parser.add_argument('--reg', type=float, default=1e-3,
-                        help='L2 regularization weight (default: 1e-3)')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
     return parser
@@ -77,8 +74,8 @@ HANDLER_D_FEAT = {
 
 def main():
     # 解析命令行参数
-    parser = create_argument_parser("Transformer", "run_transformer.py")
-    parser = add_transformer_args(parser)
+    parser = create_argument_parser("ALSTM", "run_alstm.py")
+    parser = add_alstm_args(parser)
     args = parser.parse_args()
 
     # 获取配置
@@ -87,7 +84,7 @@ def main():
     time_splits = get_time_splits(args.max_train)
 
     # 打印头部信息
-    print_training_header("Transformer", args, symbols, handler_config, time_splits)
+    print_training_header("ALSTM", args, symbols, handler_config, time_splits)
 
     # 初始化和数据准备
     init_qlib(handler_config['use_talib'])
@@ -98,14 +95,12 @@ def main():
     analyze_label_distribution(dataset)
 
     # 获取实际的特征数量（从训练数据中）
-    # valid_cols 是去掉全 NaN 列后的数量，但模型实际接收的是原始特征
     actual_train_data = dataset.prepare("train", col_set="feature")
     total_features = actual_train_data.shape[1]
     print(f"\n    Actual training data shape: {actual_train_data.shape}")
 
-    # 对于 Transformer，d_feat 是每个时间步的基础特征数
+    # 对于 ALSTM，d_feat 是每个时间步的基础特征数
     # Alpha360: 6 features × 60 timesteps = 360
-    # 如果用户指定了 --d-feat，则使用用户的值
     if args.d_feat:
         d_feat = args.d_feat
     else:
@@ -143,28 +138,24 @@ def main():
         print("    Model loaded successfully")
     else:
         # 正常训练流程
-        print(f"    Model dimension: {args.d_model}")
-        print(f"    Attention heads: {args.nhead}")
+        print(f"    Hidden size: {args.hidden_size}")
         print(f"    Num layers: {args.num_layers}")
         print(f"    Dropout: {args.dropout}")
         print(f"    Learning rate: {args.lr}")
-        print(f"    L2 regularization: {args.reg}")
         print(f"    Batch size: {args.batch_size}")
         print(f"    Epochs: {args.n_epochs}")
         print(f"    Early stop: {args.early_stop}")
         print(f"    GPU: {args.gpu}")
 
         # 创建模型
-        print("\n[7] Training Transformer model...")
-        model = TransformerModel(
+        print("\n[7] Training ALSTM model...")
+        model = ALSTM(
             d_feat=d_feat,
-            d_model=args.d_model,
-            nhead=args.nhead,
+            hidden_size=args.hidden_size,
             num_layers=args.num_layers,
             dropout=args.dropout,
             n_epochs=args.n_epochs,
             lr=args.lr,
-            reg=args.reg,
             early_stop=args.early_stop,
             batch_size=args.batch_size,
             metric="loss",
@@ -174,14 +165,14 @@ def main():
 
         # 训练
         model.fit(dataset)
-        print("    Model training completed")
+        print("    ✓ Model training completed")
 
         # 保存模型
         print("\n[10] Saving model...")
         MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-        model_path = MODEL_SAVE_PATH / f"transformer_{args.handler}_{args.stock_pool}_{args.nday}d.pt"
+        model_path = MODEL_SAVE_PATH / f"alstm_{args.handler}_{args.stock_pool}_{args.nday}d.pt"
         torch.save(model, model_path)
-        print(f"    Model saved to: {model_path}")
+        print(f"    ✓ Model saved to: {model_path}")
 
     # 预测
     print("\n[8] Generating predictions...")
@@ -224,16 +215,16 @@ def main():
 
         # 使用归一化后的数据进行预测
         print("    Generating predictions with normalized test data...")
-        model.model.eval()
+        model.ALSTM_model.eval()
         test_values = test_data_normalized.values
         preds = []
-        batch_size = getattr(model, 'batch_size', 2048)
+        batch_size = getattr(model, 'batch_size', 2000)
 
         with torch.no_grad():
             for i in range(0, len(test_values), batch_size):
                 batch = test_values[i:i+batch_size]
                 batch_tensor = torch.from_numpy(batch).float().to(model.device)
-                batch_pred = model.model(batch_tensor)
+                batch_pred = model.ALSTM_model(batch_tensor)
                 preds.append(batch_pred.cpu().numpy())
 
         pred_values = np.concatenate(preds)
@@ -265,7 +256,7 @@ def main():
 
         run_backtest(
             model_path, dataset, pred_df, args, time_splits,
-            model_name="Transformer",
+            model_name="ALSTM",
             load_model_func=load_model,
             get_feature_count_func=get_feature_count
         )

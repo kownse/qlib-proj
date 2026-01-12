@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 # Add scripts directory to path for imports
-script_dir = Path(__file__).parent.parent  # scripts directory
+script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 import argparse
@@ -33,7 +33,7 @@ from utils.strategy import get_strategy_config
 from utils.backtest_utils import plot_backtest_curve, generate_trade_records
 from data.stock_pools import STOCK_POOLS
 
-from models.common_config import (
+from models.common import (
     HANDLER_CONFIG,
     PROJECT_ROOT,
     QLIB_DATA_PATH,

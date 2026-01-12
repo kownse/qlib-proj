@@ -10,14 +10,14 @@ from pathlib import Path
 import itertools
 import pandas as pd
 
-script_dir = Path(__file__).parent.parent
+script_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(script_dir))
 
 import pickle
 import lightgbm as lgb
 
-from models.common_config import HANDLER_CONFIG, PROJECT_ROOT, QLIB_DATA_PATH
-from models.training_utils import (
+from models.common import (
+    HANDLER_CONFIG, PROJECT_ROOT, QLIB_DATA_PATH,
     init_qlib,
     create_data_handler,
     create_dataset,

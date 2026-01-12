@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 # Add scripts directory to path for imports
-script_dir = Path(__file__).parent.parent  # scripts directory
+script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 import numpy as np
@@ -22,8 +22,8 @@ from qlib.data.dataset.handler import DataHandlerLP
 from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
 
-from models.common_config import HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH
-from models.training_utils import (
+from models.common import (
+    HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
     create_argument_parser,
     get_time_splits,
     print_training_header,
@@ -39,8 +39,8 @@ from models.training_utils import (
     generate_model_filename,
     prepare_test_data_for_prediction,
     print_prediction_stats,
+    run_backtest,
 )
-from models.backtest_common import run_backtest
 
 
 def train_xgboost(dataset, valid_cols):

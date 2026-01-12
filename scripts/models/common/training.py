@@ -20,7 +20,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
 
-from .common_config import (
+from .config import (
     HANDLER_CONFIG,
     PROJECT_ROOT,
     QLIB_DATA_PATH,

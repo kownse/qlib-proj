@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Add scripts directory to path for imports
-script_dir = Path(__file__).parent.parent
+script_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(script_dir))
 
 import numpy as np
@@ -22,7 +22,7 @@ from utils.talib_ops import TALIB_OPS
 from data.datahandler_ext import Alpha158_Volatility_TALib
 
 # 配置
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 
 TEST_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "JNJ"]
