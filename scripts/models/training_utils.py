@@ -99,24 +99,34 @@ Examples:
 
     # 策略类型参数
     parser.add_argument('--strategy', type=str, default='topk',
-                        choices=['topk', 'dynamic_risk'],
-                        help='Strategy type: topk (default TopkDropoutStrategy) or dynamic_risk (momentum+volatility risk control)')
+                        choices=['topk', 'dynamic_risk', 'vol_stoploss'],
+                        help='Strategy type: topk (default), dynamic_risk (momentum-based), vol_stoploss (volatility+stop-loss, recommended)')
 
     # 动态风险策略参数
     parser.add_argument('--risk-lookback', type=int, default=20,
-                        help='Lookback days for momentum/drawdown calculation (default: 20)')
+                        help='Lookback days for volatility/momentum calculation (default: 20)')
     parser.add_argument('--drawdown-threshold', type=float, default=-0.10,
-                        help='Drawdown threshold for high risk mode (default: -0.10, i.e., 10%% drawdown)')
+                        help='[dynamic_risk] Drawdown threshold for high risk (default: -0.10)')
     parser.add_argument('--momentum-threshold', type=float, default=0.03,
-                        help='Momentum threshold for trend detection (default: 0.03, i.e., 3%%)')
+                        help='[dynamic_risk] Momentum threshold for trend detection (default: 0.03)')
     parser.add_argument('--risk-high', type=float, default=0.50,
-                        help='Position ratio at high risk (default: 0.50)')
+                        help='Position ratio at high risk/volatility (default: 0.50)')
     parser.add_argument('--risk-medium', type=float, default=0.75,
-                        help='Position ratio at medium risk (default: 0.75)')
+                        help='Position ratio at medium risk/volatility (default: 0.75)')
     parser.add_argument('--risk-normal', type=float, default=0.95,
                         help='Normal position ratio (default: 0.95)')
-    parser.add_argument('--market-proxy', type=str, default='SPY',
-                        help='Market proxy symbol for risk calculation (default: SPY)')
+    parser.add_argument('--market-proxy', type=str, default='AAPL',
+                        help='Market proxy symbol for risk calculation (default: AAPL)')
+
+    # vol_stoploss 策略特有参数
+    parser.add_argument('--vol-high', type=float, default=0.35,
+                        help='[vol_stoploss] High volatility threshold (annualized, default: 0.35)')
+    parser.add_argument('--vol-medium', type=float, default=0.25,
+                        help='[vol_stoploss] Medium volatility threshold (annualized, default: 0.25)')
+    parser.add_argument('--stop-loss', type=float, default=-0.15,
+                        help='[vol_stoploss] Stop loss threshold per stock (default: -0.15, i.e., -15%%)')
+    parser.add_argument('--no-sell-after-drop', type=float, default=-0.20,
+                        help='[vol_stoploss] Do not sell if already dropped more than this (default: -0.20)')
 
     return parser
 

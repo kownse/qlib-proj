@@ -93,7 +93,25 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
 
     # 动态风险策略参数
     dynamic_risk_params = None
-    if args.strategy == "dynamic_risk":
+    if args.strategy == "vol_stoploss":
+        dynamic_risk_params = {
+            "lookback": args.risk_lookback,
+            "vol_threshold_high": args.vol_high,
+            "vol_threshold_medium": args.vol_medium,
+            "stop_loss_threshold": args.stop_loss,
+            "no_sell_after_drop": args.no_sell_after_drop,
+            "risk_degree_high": args.risk_high,
+            "risk_degree_medium": args.risk_medium,
+            "risk_degree_normal": args.risk_normal,
+            "market_proxy": args.market_proxy,
+        }
+        print(f"    Vol+StopLoss Strategy Params:")
+        print(f"      Lookback: {args.risk_lookback} days")
+        print(f"      Volatility Thresholds: high={args.vol_high:.0%}, medium={args.vol_medium:.0%}")
+        print(f"      Stop Loss: {args.stop_loss:.0%}, No-sell-after-drop: {args.no_sell_after_drop:.0%}")
+        print(f"      Risk Degrees: high={args.risk_high:.0%}, medium={args.risk_medium:.0%}, normal={args.risk_normal:.0%}")
+        print(f"      Market Proxy: {args.market_proxy}")
+    elif args.strategy == "dynamic_risk":
         dynamic_risk_params = {
             "lookback": args.risk_lookback,
             "drawdown_threshold": args.drawdown_threshold,

@@ -10,9 +10,335 @@ import pandas as pd
 from qlib.data import D
 
 
+class VolatilityStopLossStrategy:
+    """
+    波动率预警 + 个股止损策略
+
+    核心思路：
+    1. 用波动率预警：波动率上升时提前降仓，不等确认下跌
+    2. 个股止损：单只股票亏损超过阈值就卖出
+    3. 大跌后不追卖：已经大跌的不再卖（可能是反弹机会）
+
+    优点：
+    - 提前预警，不是追涨杀跌
+    - 止损明确，控制单票风险
+    - 不会在底部恐慌抛售
+    """
+
+    @staticmethod
+    def create_strategy_class(
+        rebalance_freq=1,
+        lookback=20,
+        vol_threshold_high=0.35,      # 年化波动率超过35%为高波动
+        vol_threshold_medium=0.25,    # 年化波动率超过25%为中波动
+        stop_loss_threshold=-0.15,    # 单股止损线：亏损15%
+        no_sell_after_drop=-0.20,     # 已跌超过20%不再卖出（等反弹）
+        risk_degree_high_vol=0.60,    # 高波动时仓位
+        risk_degree_medium_vol=0.80,  # 中波动时仓位
+        risk_degree_normal=0.95,      # 正常仓位
+        market_proxy="SPY",
+    ):
+        """
+        创建波动率+止损策略类
+
+        Parameters
+        ----------
+        vol_threshold_high : float
+            高波动率阈值（年化），超过此值大幅降仓
+        vol_threshold_medium : float
+            中波动率阈值（年化）
+        stop_loss_threshold : float
+            个股止损阈值，如 -0.15 表示亏损15%止损
+        no_sell_after_drop : float
+            已跌超过此值不再卖出（避免底部抛售）
+        """
+        from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
+        from qlib.backtest.decision import Order, OrderDir, TradeDecisionWO
+
+        class VolatilityStopLossTopkStrategy(TopkDropoutStrategy):
+            """波动率预警+止损策略"""
+
+            def __init__(self, *, rebalance_freq=1, **kwargs):
+                super().__init__(**kwargs)
+                self._rebalance_freq = rebalance_freq
+                self._lookback = lookback
+                self._vol_threshold_high = vol_threshold_high
+                self._vol_threshold_medium = vol_threshold_medium
+                self._stop_loss_threshold = stop_loss_threshold
+                self._no_sell_after_drop = no_sell_after_drop
+                self._risk_degree_high_vol = risk_degree_high_vol
+                self._risk_degree_medium_vol = risk_degree_medium_vol
+                self._risk_degree_normal = risk_degree_normal
+                self._market_proxy = market_proxy
+                self._cache = {}
+                # 记录每只股票的买入成本
+                self._cost_basis = {}
+
+            def _get_market_volatility(self, trade_date):
+                """获取市场波动率（年化）"""
+                date_key = f"vol_{str(trade_date)[:10]}"
+                if date_key in self._cache:
+                    return self._cache[date_key]
+
+                try:
+                    start_date = pd.Timestamp(trade_date) - pd.Timedelta(days=self._lookback * 2)
+
+                    # 尝试获取市场代理数据
+                    market_proxies = [self._market_proxy, "AAPL", "MSFT", "GOOGL"]
+                    for proxy in market_proxies:
+                        data = D.features(
+                            [proxy],
+                            ["$close"],
+                            start_time=start_date,
+                            end_time=trade_date
+                        )
+                        if not data.empty and len(data) >= self._lookback:
+                            break
+
+                    if data.empty or len(data) < self._lookback:
+                        return 0.20  # 默认20%波动率
+
+                    close = data.iloc[:, 0].dropna().tail(self._lookback)
+                    if len(close) < 5:
+                        return 0.20
+
+                    # 计算日收益率的标准差，年化
+                    returns = close.pct_change().dropna()
+                    daily_vol = returns.std()
+                    annual_vol = daily_vol * np.sqrt(252)
+
+                    self._cache[date_key] = annual_vol
+                    return annual_vol
+
+                except Exception:
+                    return 0.20
+
+            def _get_stock_return(self, code, trade_date):
+                """获取个股从买入到现在的收益率"""
+                if code not in self._cost_basis:
+                    return 0.0
+
+                try:
+                    current_price = D.features(
+                        [code], ["$close"],
+                        start_time=trade_date,
+                        end_time=trade_date
+                    )
+                    if current_price.empty:
+                        return 0.0
+
+                    price = current_price.iloc[-1, 0]
+                    cost = self._cost_basis[code]
+                    return (price - cost) / cost if cost > 0 else 0.0
+                except Exception:
+                    return 0.0
+
+            def _update_cost_basis(self, code, price, amount, direction):
+                """更新成本基础"""
+                if direction == Order.BUY:
+                    if code in self._cost_basis:
+                        # 简化：用新价格更新（实际应该加权平均）
+                        self._cost_basis[code] = price
+                    else:
+                        self._cost_basis[code] = price
+                elif direction == Order.SELL:
+                    # 如果全部卖出，移除成本记录
+                    pass  # 保留成本记录以备后用
+
+            def get_risk_degree(self, trade_step=None):
+                """根据波动率动态调整仓位"""
+                try:
+                    trade_date, _ = self.trade_calendar.get_step_time(trade_step)
+                    vol = self._get_market_volatility(trade_date)
+
+                    if vol > self._vol_threshold_high:
+                        risk_degree = self._risk_degree_high_vol
+                        vol_level = "HIGH"
+                    elif vol > self._vol_threshold_medium:
+                        risk_degree = self._risk_degree_medium_vol
+                        vol_level = "MEDIUM"
+                    else:
+                        risk_degree = self._risk_degree_normal
+                        vol_level = "LOW"
+
+                    print(f"[VolStopLoss] {str(trade_date)[:10]} | volatility={vol:.1%} ({vol_level}) | risk_degree={risk_degree:.0%}")
+                    return risk_degree
+
+                except Exception as e:
+                    print(f"[VolStopLoss] Error: {e}")
+                    return self._risk_degree_normal
+
+            def generate_trade_decision(self, execute_result=None):
+                """生成交易决策：波动率控制 + 个股止损"""
+                import copy
+
+                trade_step = self.trade_calendar.get_trade_step()
+                trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+
+                current_risk_degree = self.get_risk_degree(trade_step)
+
+                current_position = copy.deepcopy(self.trade_position)
+                current_stock_list = current_position.get_stock_list()
+                total_value = current_position.calculate_value()
+                cash = current_position.get_cash()
+                stock_value = total_value - cash
+                current_position_ratio = stock_value / total_value if total_value > 0 else 0
+
+                # 初始化成本基础（如果没有）
+                for code in current_stock_list:
+                    if code not in self._cost_basis:
+                        try:
+                            price_data = D.features(
+                                [code], ["$close"],
+                                start_time=trade_start_time,
+                                end_time=trade_end_time
+                            )
+                            if not price_data.empty:
+                                self._cost_basis[code] = price_data.iloc[-1, 0]
+                        except Exception:
+                            pass
+
+                # === 第1步：检查个股止损 ===
+                stop_loss_sells = []
+                for code in current_stock_list:
+                    stock_return = self._get_stock_return(code, trade_start_time)
+
+                    # 止损条件：亏损超过阈值，但没有跌太多（避免底部抛售）
+                    if stock_return < self._stop_loss_threshold and stock_return > self._no_sell_after_drop:
+                        if not self.trade_exchange.is_stock_tradable(
+                            stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                        ):
+                            continue
+
+                        sell_amount = current_position.get_stock_amount(code=code)
+                        factor = self.trade_exchange.get_factor(
+                            stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                        )
+                        sell_amount = self.trade_exchange.round_amount_by_trade_unit(sell_amount, factor)
+
+                        if sell_amount > 0:
+                            sell_order = Order(
+                                stock_id=code,
+                                amount=sell_amount,
+                                start_time=trade_start_time,
+                                end_time=trade_end_time,
+                                direction=Order.SELL,
+                            )
+                            if self.trade_exchange.check_order(sell_order):
+                                stop_loss_sells.append(sell_order)
+                                print(f"[VolStopLoss] STOP LOSS {code}: return={stock_return:.1%}, selling {sell_amount:.0f} shares")
+
+                if stop_loss_sells:
+                    return TradeDecisionWO(stop_loss_sells, self)
+
+                # === 第2步：波动率仓位控制 ===
+                target_position_ratio = current_risk_degree
+
+                print(f"[VolStopLoss] Position: current={current_position_ratio:.1%}, target={target_position_ratio:.1%}")
+
+                # 如果仓位过高，减仓
+                if current_position_ratio > target_position_ratio + 0.05:
+                    excess_ratio = current_position_ratio - target_position_ratio
+                    reduce_ratio = excess_ratio / current_position_ratio
+
+                    print(f"[VolStopLoss] REDUCING: {excess_ratio:.1%} of portfolio")
+
+                    sell_order_list = []
+                    for code in current_stock_list:
+                        # 检查该股票是否已经大跌（不卖）
+                        stock_return = self._get_stock_return(code, trade_start_time)
+                        if stock_return < self._no_sell_after_drop:
+                            print(f"[VolStopLoss] Skip {code}: already down {stock_return:.1%}, waiting for rebound")
+                            continue
+
+                        if not self.trade_exchange.is_stock_tradable(
+                            stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                        ):
+                            continue
+
+                        current_amount = current_position.get_stock_amount(code=code)
+                        sell_amount = current_amount * reduce_ratio
+
+                        factor = self.trade_exchange.get_factor(
+                            stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                        )
+                        sell_amount = self.trade_exchange.round_amount_by_trade_unit(sell_amount, factor)
+
+                        if sell_amount > 0:
+                            sell_order = Order(
+                                stock_id=code,
+                                amount=sell_amount,
+                                start_time=trade_start_time,
+                                end_time=trade_end_time,
+                                direction=Order.SELL,
+                            )
+                            if self.trade_exchange.check_order(sell_order):
+                                sell_order_list.append(sell_order)
+                                print(f"[VolStopLoss] Sell {code}: {sell_amount:.0f} shares")
+
+                    if sell_order_list:
+                        return TradeDecisionWO(sell_order_list, self)
+
+                # 如果仓位过低且波动率已降，加仓
+                elif current_position_ratio < target_position_ratio - 0.05 and len(current_stock_list) > 0:
+                    deficit_ratio = target_position_ratio - current_position_ratio
+                    add_value = min(total_value * deficit_ratio, cash * 0.95)
+
+                    if add_value > 100:
+                        print(f"[VolStopLoss] INCREASING: ${add_value:,.0f}")
+
+                        buy_order_list = []
+                        value_per_stock = add_value / len(current_stock_list)
+
+                        for code in current_stock_list:
+                            if not self.trade_exchange.is_stock_tradable(
+                                stock_id=code, start_time=trade_start_time, end_time=trade_end_time,
+                                direction=OrderDir.BUY
+                            ):
+                                continue
+
+                            buy_price = self.trade_exchange.get_deal_price(
+                                stock_id=code, start_time=trade_start_time, end_time=trade_end_time,
+                                direction=OrderDir.BUY
+                            )
+                            if buy_price is None or buy_price <= 0:
+                                continue
+
+                            buy_amount = value_per_stock / buy_price
+                            factor = self.trade_exchange.get_factor(
+                                stock_id=code, start_time=trade_start_time, end_time=trade_end_time
+                            )
+                            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+
+                            if buy_amount > 0:
+                                buy_order = Order(
+                                    stock_id=code,
+                                    amount=buy_amount,
+                                    start_time=trade_start_time,
+                                    end_time=trade_end_time,
+                                    direction=Order.BUY,
+                                )
+                                buy_order_list.append(buy_order)
+                                self._cost_basis[code] = buy_price
+                                print(f"[VolStopLoss] Buy {code}: {buy_amount:.0f} @ ${buy_price:.2f}")
+
+                        if buy_order_list:
+                            return TradeDecisionWO(buy_order_list, self)
+
+                # 检查是否为换仓日
+                if self._rebalance_freq > 1:
+                    if trade_step % self._rebalance_freq != 0:
+                        return TradeDecisionWO([], self)
+
+                self.risk_degree = current_risk_degree
+                return super().generate_trade_decision(execute_result)
+
+        return VolatilityStopLossTopkStrategy
+
+
 class MomentumVolatilityRiskStrategy:
     """
-    动量+波动率动态风险控制策略
+    动量+波动率动态风险控制策略（旧版本，保留兼容）
 
     根据市场趋势和回撤情况动态调整仓位：
     - 下跌趋势 + 大回撤 → 大幅降仓
@@ -403,24 +729,41 @@ def get_strategy_config(
     rebalance_freq : int
         Rebalance frequency in days (default: 1)
     strategy_type : str
-        Strategy type: "topk" (default) or "dynamic_risk"
+        Strategy type: "topk", "dynamic_risk", or "vol_stoploss"
     dynamic_risk_params : dict, optional
-        Parameters for dynamic risk strategy:
-        - lookback: int, lookback days for momentum/drawdown calculation (default: 20)
-        - drawdown_threshold: float, drawdown threshold for high risk (default: -0.10)
-        - momentum_threshold: float, momentum threshold for trend (default: 0.03)
-        - risk_degree_high: float, position ratio at high risk (default: 0.50)
-        - risk_degree_medium: float, position ratio at medium risk (default: 0.75)
-        - risk_degree_normal: float, normal position ratio (default: 0.95)
-        - market_proxy: str, market proxy symbol (default: "SPY")
+        Parameters for risk strategies
 
     Returns
     -------
     dict
         Strategy configuration for qlib backtest
     """
-    if strategy_type == "dynamic_risk":
-        # 使用动态风险控制策略
+    if strategy_type == "vol_stoploss":
+        # 使用波动率预警+止损策略（推荐）
+        params = dynamic_risk_params or {}
+        VolStrategy = VolatilityStopLossStrategy.create_strategy_class(
+            rebalance_freq=rebalance_freq,
+            lookback=params.get("lookback", 20),
+            vol_threshold_high=params.get("vol_threshold_high", 0.35),
+            vol_threshold_medium=params.get("vol_threshold_medium", 0.25),
+            stop_loss_threshold=params.get("stop_loss_threshold", -0.15),
+            no_sell_after_drop=params.get("no_sell_after_drop", -0.20),
+            risk_degree_high_vol=params.get("risk_degree_high", 0.60),
+            risk_degree_medium_vol=params.get("risk_degree_medium", 0.80),
+            risk_degree_normal=params.get("risk_degree_normal", 0.95),
+            market_proxy=params.get("market_proxy", "SPY"),
+        )
+        return {
+            "class": VolStrategy,
+            "kwargs": {
+                "signal": pred_df,
+                "topk": topk,
+                "n_drop": n_drop,
+                "rebalance_freq": rebalance_freq,
+            },
+        }
+    elif strategy_type == "dynamic_risk":
+        # 使用动量+回撤策略（旧版）
         params = dynamic_risk_params or {}
         DynamicStrategy = MomentumVolatilityRiskStrategy.create_strategy_class(
             rebalance_freq=rebalance_freq,

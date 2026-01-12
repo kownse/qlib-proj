@@ -228,11 +228,55 @@ class TCN(Model):
         x_train, y_train = df_train["feature"], df_train["label"]
         x_valid, y_valid = df_valid["feature"], df_valid["label"]
 
+        # Handle NaN values
+        x_train_nan_count = x_train.isna().sum().sum()
+        x_valid_nan_count = x_valid.isna().sum().sum()
+        y_train_nan_count = y_train.isna().sum().sum()
+        y_valid_nan_count = y_valid.isna().sum().sum()
+
+        self.logger.info(f"x_train NaN: {x_train_nan_count}, x_valid NaN: {x_valid_nan_count}")
+        self.logger.info(f"y_train NaN: {y_train_nan_count}, y_valid NaN: {y_valid_nan_count}")
+
+        if x_train_nan_count > 0 or x_valid_nan_count > 0:
+            self.logger.warning("Filling NaN values in features with 0...")
+            x_train = x_train.fillna(0)
+            x_valid = x_valid.fillna(0)
+
+        if y_train_nan_count > 0 or y_valid_nan_count > 0:
+            self.logger.warning("Dropping samples with NaN labels...")
+            train_valid_mask = ~y_train.isna().any(axis=1)
+            x_train = x_train[train_valid_mask]
+            y_train = y_train[train_valid_mask]
+
+            valid_valid_mask = ~y_valid.isna().any(axis=1)
+            x_valid = x_valid[valid_valid_mask]
+            y_valid = y_valid[valid_valid_mask]
+            self.logger.info(f"After dropping: x_train {x_train.shape}, x_valid {x_valid.shape}")
+
+        # Check for extreme values and normalize if needed
+        x_train_max = np.abs(x_train.values).max()
+        if x_train_max > 1e6:
+            self.logger.warning(f"Extreme values detected (max={x_train_max:.2e})! Applying robust normalization...")
+            for col in x_train.columns:
+                col_mean = x_train[col].mean()
+                col_std = x_train[col].std()
+                if col_std > 0:
+                    lower = col_mean - 3 * col_std
+                    upper = col_mean + 3 * col_std
+                    x_train[col] = x_train[col].clip(lower, upper)
+                    x_valid[col] = x_valid[col].clip(lower, upper)
+                    x_train[col] = (x_train[col] - col_mean) / col_std
+                    x_valid[col] = (x_valid[col] - col_mean) / col_std
+            x_train = x_train.replace([np.inf, -np.inf], 0).fillna(0)
+            x_valid = x_valid.replace([np.inf, -np.inf], 0).fillna(0)
+            self.logger.info(f"After normalization - min/max: {x_train.values.min():.4f} / {x_train.values.max():.4f}")
+
         save_path = get_or_create_path(save_path)
         stop_steps = 0
         train_loss = 0
         best_score = -np.inf
         best_epoch = 0
+        best_param = copy.deepcopy(self.tcn_model.state_dict())  # Initialize to avoid UnboundLocalError
         evals_result["train"] = []
         evals_result["valid"] = []
 
