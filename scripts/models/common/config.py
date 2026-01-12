@@ -13,7 +13,8 @@ from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatil
 
 
 # ========== 路径配置 ==========
-PROJECT_ROOT = Path(__file__).parent.parent.parent  # 项目根目录
+# scripts/models/common/config.py -> scripts/models/common -> scripts/models -> scripts -> qlib-proj
+PROJECT_ROOT = Path(__file__).parent.parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.parquet"
 MODEL_SAVE_PATH = PROJECT_ROOT / "my_models"
