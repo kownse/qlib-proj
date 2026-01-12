@@ -176,7 +176,7 @@ def main():
         pred_df = test_pred.to_frame("score")
 
         def load_model(path):
-            return torch.load(path)
+            return torch.load(path, weights_only=False)
 
         def get_feature_count(m):
             return total_features

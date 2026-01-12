@@ -124,71 +124,144 @@ def main():
     print(f"    Total features: {total_features}")
     print(f"    d_feat (per timestep): {d_feat}")
     print(f"    Sequence length: {seq_len}")
-    print(f"    Model dimension: {args.d_model}")
-    print(f"    Attention heads: {args.nhead}")
-    print(f"    Num layers: {args.num_layers}")
-    print(f"    Dropout: {args.dropout}")
-    print(f"    Learning rate: {args.lr}")
-    print(f"    L2 regularization: {args.reg}")
-    print(f"    Batch size: {args.batch_size}")
-    print(f"    Epochs: {args.n_epochs}")
-    print(f"    Early stop: {args.early_stop}")
-    print(f"    GPU: {args.gpu}")
 
-    # 创建模型
-    print("\n[7] Training Transformer model...")
-    model = TransformerModel(
-        d_feat=d_feat,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        n_epochs=args.n_epochs,
-        lr=args.lr,
-        reg=args.reg,
-        early_stop=args.early_stop,
-        batch_size=args.batch_size,
-        metric="loss",
-        loss="mse",
-        GPU=args.gpu if torch.cuda.is_available() else -1,
-    )
+    # 定义模型加载函数
+    def load_model(path):
+        return torch.load(path, weights_only=False)
 
-    # 训练
-    model.fit(dataset)
-    print("    Model training completed")
+    def get_feature_count(m):
+        return total_features
+
+    # 检查是否提供了预训练模型路径
+    if args.model_path:
+        # 加载预训练模型，跳过训练
+        model_path = Path(args.model_path)
+        print(f"\n[7] Loading pre-trained model from: {model_path}")
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        model = load_model(model_path)
+        print("    Model loaded successfully")
+    else:
+        # 正常训练流程
+        print(f"    Model dimension: {args.d_model}")
+        print(f"    Attention heads: {args.nhead}")
+        print(f"    Num layers: {args.num_layers}")
+        print(f"    Dropout: {args.dropout}")
+        print(f"    Learning rate: {args.lr}")
+        print(f"    L2 regularization: {args.reg}")
+        print(f"    Batch size: {args.batch_size}")
+        print(f"    Epochs: {args.n_epochs}")
+        print(f"    Early stop: {args.early_stop}")
+        print(f"    GPU: {args.gpu}")
+
+        # 创建模型
+        print("\n[7] Training Transformer model...")
+        model = TransformerModel(
+            d_feat=d_feat,
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            n_epochs=args.n_epochs,
+            lr=args.lr,
+            reg=args.reg,
+            early_stop=args.early_stop,
+            batch_size=args.batch_size,
+            metric="loss",
+            loss="mse",
+            GPU=args.gpu if torch.cuda.is_available() else -1,
+        )
+
+        # 训练
+        model.fit(dataset)
+        print("    Model training completed")
+
+        # 保存模型
+        print("\n[10] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_path = MODEL_SAVE_PATH / f"transformer_{args.handler}_{args.stock_pool}_{args.nday}d.pt"
+        torch.save(model, model_path)
+        print(f"    Model saved to: {model_path}")
 
     # 预测
     print("\n[8] Generating predictions...")
-    pred = model.predict(dataset)
 
-    if isinstance(pred, pd.DataFrame):
-        test_pred = pred.iloc[:, 0]
+    # Debug: 检查测试数据
+    test_data = dataset.prepare("test", col_set="feature")
+    test_label = dataset.prepare("test", col_set="label")
+    print(f"    Test data shape: {test_data.shape}")
+
+    test_nan_count = test_data.isna().sum().sum()
+    test_nan_pct = test_nan_count / test_data.size * 100
+    print(f"    Test data NaN count: {test_nan_count} ({test_nan_pct:.2f}%)")
+
+    # 先处理 NaN，再计算 min/max
+    test_data_clean = test_data.fillna(0)
+    test_min = test_data_clean.values.min()
+    test_max = test_data_clean.values.max()
+    test_abs_max = np.abs(test_data_clean.values).max()
+    print(f"    Test data min/max (after fillna): {test_min:.4f} / {test_max:.4f}")
+
+    # 检查是否需要归一化（有 NaN 或有极端值）
+    need_normalize = test_nan_count > 0 or test_abs_max > 1e6
+    if need_normalize:
+        if test_abs_max > 1e6:
+            print(f"    WARNING: Test data has extreme values (max abs: {test_abs_max:.2e})")
+        print(f"    Applying normalization to test data...")
+
+        # 对测试数据应用相同的归一化
+        test_data_normalized = test_data.fillna(0)
+        for col in test_data_normalized.columns:
+            col_mean = test_data_normalized[col].mean()
+            col_std = test_data_normalized[col].std()
+            if col_std > 0:
+                lower = col_mean - 3 * col_std
+                upper = col_mean + 3 * col_std
+                test_data_normalized[col] = test_data_normalized[col].clip(lower, upper)
+                test_data_normalized[col] = (test_data_normalized[col] - col_mean) / col_std
+        test_data_normalized = test_data_normalized.replace([np.inf, -np.inf], 0).fillna(0)
+        print(f"    After normalization - min/max: {test_data_normalized.values.min():.4f} / {test_data_normalized.values.max():.4f}")
+
+        # 使用归一化后的数据进行预测
+        print("    Generating predictions with normalized test data...")
+        model.model.eval()
+        test_values = test_data_normalized.values
+        preds = []
+        batch_size = getattr(model, 'batch_size', 2048)
+
+        with torch.no_grad():
+            for i in range(0, len(test_values), batch_size):
+                batch = test_values[i:i+batch_size]
+                batch_tensor = torch.from_numpy(batch).float().to(model.device)
+                batch_pred = model.model(batch_tensor)
+                preds.append(batch_pred.cpu().numpy())
+
+        pred_values = np.concatenate(preds)
+        test_pred = pd.Series(pred_values, index=test_data.index, name='score')
     else:
-        test_pred = pred
+        # 正常预测流程
+        pred = model.predict(dataset)
 
-    test_pred.name = 'score'
+        if isinstance(pred, pd.DataFrame):
+            test_pred = pred.iloc[:, 0]
+        else:
+            test_pred = pred
+
+        test_pred.name = 'score'
+
+    # Debug: 检查预测结果
+    print(f"    Predictions NaN count: {test_pred.isna().sum()} ({test_pred.isna().sum() / len(test_pred) * 100:.2f}%)")
+    if not test_pred.isna().all():
+        print(f"    Predictions min/max: {test_pred.min():.4f} / {test_pred.max():.4f}")
     print_prediction_stats(test_pred)
 
     # 评估
     print("\n[9] Evaluation...")
     evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
 
-    # 保存模型
-    print("\n[10] Saving model...")
-    MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-    model_path = MODEL_SAVE_PATH / f"transformer_{args.handler}_{args.stock_pool}_{args.nday}d.pt"
-    torch.save(model, model_path)
-    print(f"    Model saved to: {model_path}")
-
     # 回测
     if args.backtest:
         pred_df = test_pred.to_frame("score")
-
-        def load_model(path):
-            return torch.load(path)
-
-        def get_feature_count(m):
-            return total_features
 
         run_backtest(
             model_path, dataset, pred_df, args, time_splits,
