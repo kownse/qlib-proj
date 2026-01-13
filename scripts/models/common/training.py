@@ -4,6 +4,14 @@
 包含命令行参数解析、Qlib 初始化、数据准备、特征验证等共用逻辑
 """
 
+import os
+
+# 关键: 在导入其他库之前设置环境变量，限制线程数避免 TA-Lib 内存冲突
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
 import argparse
 import pickle
 from pathlib import Path
@@ -181,13 +189,30 @@ def init_qlib(use_talib: bool):
     ----------
     use_talib : bool
         是否使用 TA-Lib 自定义算子
+
+    Note
+    ----
+    当使用 TA-Lib 时，需要设置 kernels=1 和 joblib_backend=None 来避免内存冲突。
+    - kernels=1: 禁用多进程数据加载
+    - joblib_backend=None: 使用 loky 而非 multiprocessing，loky 使用 spawn 而非 fork
+    否则会出现 "free(): invalid pointer" 和 "corrupted size vs. prev_size" 错误。
     """
     print("\n[1] Initializing Qlib...")
     if use_talib:
-        qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US, custom_ops=TALIB_OPS)
-        print("    ✓ Qlib initialized with TA-Lib custom operators")
+        # kernels=1 避免多进程数据加载
+        # joblib_backend=None 使用 loky (spawn) 而非 multiprocessing (fork)
+        # skip_if_reg=True 避免重复初始化
+        qlib.init(
+            provider_uri=str(QLIB_DATA_PATH),
+            region=REG_US,
+            custom_ops=TALIB_OPS,
+            kernels=1,
+            joblib_backend=None,  # 使用 loky 避免 fork 与 TA-Lib C库冲突
+            skip_if_reg=True
+        )
+        print("    ✓ Qlib initialized with TA-Lib (kernels=1, loky backend)")
     else:
-        qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US)
+        qlib.init(provider_uri=str(QLIB_DATA_PATH), region=REG_US, skip_if_reg=True)
         print("    ✓ Qlib initialized")
 
 

@@ -164,18 +164,27 @@ class Alpha158_Volatility_TALib(DataHandlerLP):
         """
         获取特征配置，包含 Alpha158 + TA-Lib 指标
 
+        排除的问题特征：
+        - VWAP0: US 股票数据中 VWAP 经常缺失 (100% NaN)
+        - VMA5/10/20/30/60: 成交量移动平均，除以当前成交量会产生极端值
+        - VSTD5/10/20/30/60: 成交量标准差，同样会产生极端值
+
         Returns:
             fields: 特征表达式列表
             names: 特征名称列表
         """
-        # 获取 Alpha158 原始特征
+        # 获取 Alpha158 原始特征，排除问题特征
         conf = {
             "kbar": {},
             "price": {
                 "windows": [0],
-                "feature": ["OPEN", "HIGH", "LOW", "VWAP"],
+                # 排除 VWAP，因为 US 股票数据中经常缺失
+                "feature": ["OPEN", "HIGH", "LOW"],
             },
-            "rolling": {},
+            "rolling": {
+                # 排除 VMA 和 VSTD，因为它们会产生极端异常值
+                "exclude": ["VMA", "VSTD"],
+            },
         }
         fields, names = Alpha158.get_feature_config(conf)
 
@@ -407,6 +416,188 @@ class Alpha158_Volatility_TALib(DataHandlerLP):
             fields: 标签表达式列表
             names: 标签名称列表
         """
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]
+
+
+class Alpha158_Volatility_TALib_Lite(DataHandlerLP):
+    """
+    Alpha158 特征 + 精选 TA-Lib 技术指标（Lite版本）+ N天价格波动率标签
+
+    Lite版本使用较少的TA-Lib指标，避免大规模股票池时的内存问题。
+    保留最重要的技术指标类别，每类只选择1-2个代表性指标。
+
+    已排除的问题特征：
+    - VWAP0: US 股票数据中 VWAP 经常缺失 (100% NaN)
+    - VMA5/10/20/30/60: 成交量移动平均，除以当前成交量会产生极端值
+    - VSTD5/10/20/30/60: 成交量标准差，同样会产生极端值
+
+    总共约20个TA-Lib指标（vs 完整版的100+）：
+    - 动量: RSI(14), MOM(10), ROC(10), CMO(14)
+    - MACD: MACD, Signal, Hist
+    - 移动平均: EMA(20), SMA(20)
+    - 布林带: Upper, Lower, Width
+    - 波动率: ATR(14), NATR(14)
+    - 趋势: ADX(14), PLUS_DI(14), MINUS_DI(14)
+    - 随机: STOCH_K, STOCH_D
+    - 统计: STDDEV(20)
+    """
+
+    # 需要排除的 rolling 特征（会产生极端异常值）
+    EXCLUDED_ROLLING_FEATURES = ['VMA', 'VSTD']
+
+    def __init__(
+        self,
+        volatility_window=2,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=[],
+        learn_processors=None,
+        fit_start_time=None,
+        fit_end_time=None,
+        process_type=DataHandlerLP.PTYPE_A,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        """
+        初始化包含精选 TA-Lib 指标的波动率预测 DataHandler
+
+        Args:
+            volatility_window: 波动率预测窗口（天数）
+            **kwargs: 传递给父类的其他参数
+        """
+        self.volatility_window = volatility_window
+
+        from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
+
+        if learn_processors is None:
+            learn_processors = _DEFAULT_LEARN_PROCESSORS
+
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": self.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            infer_processors=infer_processors,
+            learn_processors=learn_processors,
+            process_type=process_type,
+            **kwargs,
+        )
+
+    def get_feature_config(self):
+        """
+        获取特征配置，包含 Alpha158（排除问题特征）+ 精选 TA-Lib 指标
+
+        排除的特征：
+        - VWAP0: US 股票 VWAP 数据缺失
+        - VMA*: 成交量移动平均除以当前成交量会产生极端值
+        - VSTD*: 成交量标准差除以当前成交量会产生极端值
+        """
+        # 自定义 Alpha158 配置，排除 VWAP 和问题 rolling 特征
+        conf = {
+            "kbar": {},
+            "price": {
+                "windows": [0],
+                # 排除 VWAP，因为 US 股票数据中经常缺失
+                "feature": ["OPEN", "HIGH", "LOW"],
+            },
+            "rolling": {
+                # 排除 VMA 和 VSTD，因为它们会产生极端异常值
+                "exclude": ["VMA", "VSTD"],
+            },
+        }
+        fields, names = Alpha158.get_feature_config(conf)
+
+        # 添加精选 TA-Lib 指标
+        talib_fields, talib_names = self._get_talib_features()
+        fields.extend(talib_fields)
+        names.extend(talib_names)
+
+        return fields, names
+
+    def _get_talib_features(self):
+        """获取精选 TA-Lib 技术指标"""
+        fields = []
+        names = []
+
+        # 动量指标 (4个)
+        fields.append("TALIB_RSI($close, 14)")
+        names.append("TALIB_RSI14")
+        fields.append("TALIB_MOM($close, 10)/$close")
+        names.append("TALIB_MOM10")
+        fields.append("TALIB_ROC($close, 10)")
+        names.append("TALIB_ROC10")
+        fields.append("TALIB_CMO($close, 14)")
+        names.append("TALIB_CMO14")
+
+        # MACD (3个)
+        fields.append("TALIB_MACD_MACD($close, 12, 26, 9)/$close")
+        names.append("TALIB_MACD")
+        fields.append("TALIB_MACD_SIGNAL($close, 12, 26, 9)/$close")
+        names.append("TALIB_MACD_SIGNAL")
+        fields.append("TALIB_MACD_HIST($close, 12, 26, 9)/$close")
+        names.append("TALIB_MACD_HIST")
+
+        # 移动平均 (2个)
+        fields.append("TALIB_EMA($close, 20)/$close")
+        names.append("TALIB_EMA20")
+        fields.append("TALIB_SMA($close, 20)/$close")
+        names.append("TALIB_SMA20")
+
+        # 布林带 (3个)
+        fields.append("(TALIB_BBANDS_UPPER($close, 20, 2) - $close)/$close")
+        names.append("TALIB_BB_UPPER_DIST")
+        fields.append("($close - TALIB_BBANDS_LOWER($close, 20, 2))/$close")
+        names.append("TALIB_BB_LOWER_DIST")
+        fields.append("(TALIB_BBANDS_UPPER($close, 20, 2) - TALIB_BBANDS_LOWER($close, 20, 2))/$close")
+        names.append("TALIB_BB_WIDTH")
+
+        # 波动率 (2个)
+        fields.append("TALIB_ATR($high, $low, $close, 14)/$close")
+        names.append("TALIB_ATR14")
+        fields.append("TALIB_NATR($high, $low, $close, 14)")
+        names.append("TALIB_NATR14")
+
+        # 趋势指标 (3个)
+        fields.append("TALIB_ADX($high, $low, $close, 14)")
+        names.append("TALIB_ADX14")
+        fields.append("TALIB_PLUS_DI($high, $low, $close, 14)")
+        names.append("TALIB_PLUS_DI14")
+        fields.append("TALIB_MINUS_DI($high, $low, $close, 14)")
+        names.append("TALIB_MINUS_DI14")
+
+        # 随机指标 (2个)
+        fields.append("TALIB_STOCH_K($high, $low, $close, 5, 3, 3)")
+        names.append("TALIB_STOCH_K")
+        fields.append("TALIB_STOCH_D($high, $low, $close, 5, 3, 3)")
+        names.append("TALIB_STOCH_D")
+
+        # 统计 (1个)
+        fields.append("TALIB_STDDEV($close, 20, 1)/$close")
+        names.append("TALIB_STDDEV20")
+
+        return fields, names
+
+    def get_label_config(self):
+        """返回N天波动率标签"""
         volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [volatility_expr], ["LABEL0"]
 

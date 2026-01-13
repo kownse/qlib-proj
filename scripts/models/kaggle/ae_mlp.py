@@ -1,9 +1,4 @@
-# 为了支持时序信息，可以：
-#   # 方案1: 先用1D-CNN提取时序特征，再接AE-MLP
-#   Input(360) → Reshape(60, 6) → Conv1D → Flatten → AE-MLP
 
-#   # 方案2: 用时序自编码器
-#   Input(60, 6) → LSTM Encoder → LSTM Decoder → MLP
 def create_ae_mlp(num_columns, num_labels, hidden_units, dropout_rates, ls = 1e-2, lr = 1e-3):
     
     inp = tf.keras.layers.Input(shape = (num_columns, ))

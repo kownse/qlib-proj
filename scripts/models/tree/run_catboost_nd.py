@@ -6,17 +6,62 @@
 扩展特征：包含 Alpha158 默认指标 + TA-Lib 技术指标
 """
 
+# ============================================================================
+# 重要: 以下代码必须在任何其他导入之前执行
+# 解决 TA-Lib 与 qlib 多进程的内存冲突问题
+# ============================================================================
+
+import os
+
+# 关键: 在导入任何库之前设置环境变量，限制线程数避免内存冲突
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMBA_NUM_THREADS'] = '1'
+
 import sys
 from pathlib import Path
+import multiprocessing
 
-# Add scripts directory to path for imports
+# 强制使用 spawn 方法来创建子进程，避免 fork 导致的内存冲突
+# 必须在导入任何使用 multiprocessing 的模块之前设置
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # 已经设置过了
+
+# 设置 scripts 目录到 path (用于导入 utils, data 等模块)
 script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
+project_root = script_dir.parent
+
+# 预初始化 qlib (kernels=1, loky backend)
+# 必须在其他 qlib 相关导入之前执行
+import qlib
+from qlib.constant import REG_US
+from utils.talib_ops import TALIB_OPS
+
+qlib_data_path = project_root / "my_data" / "qlib_us"
+qlib.init(
+    provider_uri=str(qlib_data_path),
+    region=REG_US,
+    custom_ops=TALIB_OPS,
+    kernels=1,  # 关键: 避免多进程与 TA-Lib 冲突
+    joblib_backend=None,  # 使用 loky 而不是 multiprocessing，避免 fork 与 TA-Lib 冲突
+)
+
+# ============================================================================
+# 现在可以安全地导入其他模块
+# ============================================================================
 
 import numpy as np
 import pandas as pd
+print("[DEBUG] 导入 catboost...")
 from catboost import CatBoostRegressor, Pool
 
+print("[DEBUG] 导入 CatBoostModel...")
 from qlib.contrib.model.catboost_model import CatBoostModel
 from qlib.data.dataset.handler import DataHandlerLP
 

@@ -1,0 +1,285 @@
+"""
+运行 CNN-AE-MLP (1D-CNN + Autoencoder-enhanced MLP) 模型
+
+在 AE-MLP 基础上增加 1D-CNN 前置特征提取器，用于捕获时序依赖关系。
+架构: Input(360) → Reshape(60, 6) → Conv1D → Flatten → AE-MLP
+
+使用方法:
+    # Alpha360 默认配置 (推荐)
+    python scripts/models/deep/run_cnn_ae_mlp.py --stock-pool sp500 --handler alpha360 --backtest
+
+    # 自定义 CNN 配置
+    python scripts/models/deep/run_cnn_ae_mlp.py --stock-pool sp100 --handler alpha360 \
+        --cnn-filters "32,64,128" --cnn-kernels "3,3,3" --cnn-pooling flatten
+
+    # 使用 Global Average Pooling
+    python scripts/models/deep/run_cnn_ae_mlp.py --stock-pool sp500 --handler alpha360 --cnn-pooling global_avg
+
+    # 加载预训练模型
+    python scripts/models/deep/run_cnn_ae_mlp.py --model-path ./my_models/cnn_ae_mlp.keras --backtest
+"""
+
+import sys
+from pathlib import Path
+
+script_dir = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(script_dir))
+
+import numpy as np
+import pandas as pd
+
+from utils.utils import evaluate_model
+from data.stock_pools import STOCK_POOLS
+
+from models.common import (
+    HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
+    create_argument_parser,
+    get_time_splits,
+    print_training_header,
+    init_qlib,
+    check_data_availability,
+    create_data_handler,
+    create_dataset,
+    analyze_features,
+    analyze_label_distribution,
+    print_prediction_stats,
+    run_backtest,
+)
+
+from models.deep.cnn_ae_mlp_model import CNNAEMLP, create_cnn_ae_mlp_for_handler
+
+
+def add_cnn_ae_mlp_args(parser):
+    """添加 CNN-AE-MLP 特定参数"""
+    # CNN 参数
+    parser.add_argument('--time-steps', type=int, default=60,
+                        help='Number of time steps for reshape (default: 60)')
+    parser.add_argument('--features-per-step', type=int, default=6,
+                        help='Features per time step (default: 6)')
+    parser.add_argument('--cnn-filters', type=str, default=None,
+                        help='CNN filter sizes per layer, comma-separated (e.g., "32,64,128")')
+    parser.add_argument('--cnn-kernels', type=str, default=None,
+                        help='CNN kernel sizes per layer, comma-separated (e.g., "3,3,3")')
+    parser.add_argument('--cnn-pooling', type=str, default='global_avg',
+                        choices=['flatten', 'global_avg', 'global_max'],
+                        help='CNN pooling method (default: global_avg)')
+
+    # AE-MLP 参数
+    parser.add_argument('--hidden-units', type=str, default=None,
+                        help='Hidden units per layer, comma-separated (e.g., "96,96,512,256,128")')
+    parser.add_argument('--dropout-rates', type=str, default=None,
+                        help='Dropout rates per layer, comma-separated (e.g., "0.03,0.03,0.03,0.03,0.03")')
+    parser.add_argument('--n-epochs', type=int, default=100,
+                        help='Number of training epochs (default: 100)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate (default: 0.001)')
+    parser.add_argument('--batch-size', type=int, default=2048,
+                        help='Batch size (default: 2048)')
+    parser.add_argument('--early-stop', type=int, default=10,
+                        help='Early stopping patience (default: 10)')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device ID (-1 for CPU)')
+    parser.add_argument('--loss-decoder', type=float, default=0.1,
+                        help='Loss weight for decoder (default: 0.1)')
+    parser.add_argument('--loss-ae', type=float, default=0.1,
+                        help='Loss weight for ae_action (default: 0.1)')
+    parser.add_argument('--loss-main', type=float, default=1.0,
+                        help='Loss weight for main action (default: 1.0)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed (default: 42)')
+    return parser
+
+
+def parse_list_arg(arg_str, dtype=float):
+    """解析逗号分隔的列表参数"""
+    if arg_str is None:
+        return None
+    return [dtype(x.strip()) for x in arg_str.split(',')]
+
+
+def main():
+    # 解析命令行参数
+    parser = create_argument_parser("CNN-AE-MLP", "run_cnn_ae_mlp.py")
+    parser = add_cnn_ae_mlp_args(parser)
+    args = parser.parse_args()
+
+    # 解析列表参数
+    cnn_filters = parse_list_arg(args.cnn_filters, int)
+    cnn_kernels = parse_list_arg(args.cnn_kernels, int)
+    hidden_units = parse_list_arg(args.hidden_units, int)
+    dropout_rates = parse_list_arg(args.dropout_rates, float)
+
+    # 获取配置
+    handler_config = HANDLER_CONFIG[args.handler]
+    symbols = STOCK_POOLS[args.stock_pool]
+    time_splits = get_time_splits(args.max_train)
+
+    # 打印头部信息
+    print_training_header("CNN-AE-MLP", args, symbols, handler_config, time_splits)
+
+    # 初始化和数据准备
+    init_qlib(handler_config['use_talib'])
+    check_data_availability(time_splits)
+    handler = create_data_handler(args, handler_config, symbols, time_splits)
+    dataset = create_dataset(handler, time_splits)
+    train_data, valid_cols, dropped_cols = analyze_features(dataset)
+    analyze_label_distribution(dataset)
+
+    # 获取实际的特征数量
+    actual_train_data = dataset.prepare("train", col_set="feature")
+    total_features = actual_train_data.shape[1]
+    print(f"\n    Actual training data shape: {actual_train_data.shape}")
+
+    # 计算 reshape 维度
+    time_steps = args.time_steps
+    features_per_step = args.features_per_step
+    expected_features = time_steps * features_per_step
+
+    if total_features != expected_features:
+        print(f"\n    Feature count: {total_features}, expected: {expected_features}")
+        # 自动调整
+        if total_features % features_per_step == 0:
+            time_steps = total_features // features_per_step
+            print(f"    Auto-adjusted time_steps to: {time_steps}")
+        elif total_features % time_steps == 0:
+            features_per_step = total_features // time_steps
+            print(f"    Auto-adjusted features_per_step to: {features_per_step}")
+        else:
+            # 找最佳因子分解
+            for ts in [60, 30, 20, 15, 12, 10, 6, 5, 4, 3, 2]:
+                if total_features % ts == 0:
+                    time_steps = ts
+                    features_per_step = total_features // ts
+                    print(f"    Auto-adjusted to: time_steps={time_steps}, features_per_step={features_per_step}")
+                    break
+
+    print(f"\n[6] Model Configuration:")
+    print(f"    Total features: {total_features}")
+    print(f"    Reshape: ({total_features},) → ({time_steps}, {features_per_step})")
+    print(f"    CNN filters: {cnn_filters or 'auto (based on handler)'}")
+    print(f"    CNN kernels: {cnn_kernels or 'auto'}")
+    print(f"    CNN pooling: {args.cnn_pooling}")
+    print(f"    Hidden units: {hidden_units or 'auto (based on handler)'}")
+    print(f"    Dropout rates: {dropout_rates or 'auto'}")
+    print(f"    Learning rate: {args.lr}")
+    print(f"    Batch size: {args.batch_size}")
+    print(f"    Epochs: {args.n_epochs}")
+    print(f"    Early stop: {args.early_stop}")
+    print(f"    GPU: {args.gpu}")
+    print(f"    Loss weights: decoder={args.loss_decoder}, ae={args.loss_ae}, main={args.loss_main}")
+
+    # 定义模型加载函数
+    def load_model(path):
+        return CNNAEMLP.load(str(path))
+
+    def get_feature_count(m):
+        return m.num_columns
+
+    # 检查是否提供了预训练模型路径
+    if args.model_path:
+        # 加载预训练模型，跳过训练
+        model_path = Path(args.model_path)
+        print(f"\n[7] Loading pre-trained model from: {model_path}")
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        model = load_model(model_path)
+        print("    Model loaded successfully")
+    else:
+        # 正常训练流程
+        print("\n[7] Training CNN-AE-MLP model...")
+
+        # 损失权重
+        loss_weights = {
+            'decoder': args.loss_decoder,
+            'ae_action': args.loss_ae,
+            'action': args.loss_main,
+        }
+
+        # 创建模型
+        model_kwargs = {
+            'lr': args.lr,
+            'n_epochs': args.n_epochs,
+            'batch_size': args.batch_size,
+            'early_stop': args.early_stop,
+            'loss_weights': loss_weights,
+            'GPU': args.gpu,
+            'seed': args.seed,
+            'time_steps': time_steps,
+            'features_per_step': features_per_step,
+            'cnn_pooling': args.cnn_pooling,
+        }
+
+        if cnn_filters is not None:
+            model_kwargs['cnn_filters'] = cnn_filters
+        if cnn_kernels is not None:
+            model_kwargs['cnn_kernels'] = cnn_kernels
+        if hidden_units is not None:
+            model_kwargs['hidden_units'] = hidden_units
+        if dropout_rates is not None:
+            model_kwargs['dropout_rates'] = dropout_rates
+
+        # 使用 handler 配置或自定义参数
+        if any([cnn_filters, cnn_kernels, hidden_units, dropout_rates]):
+            model = CNNAEMLP(
+                num_columns=total_features,
+                **model_kwargs
+            )
+        else:
+            model = create_cnn_ae_mlp_for_handler(
+                args.handler,
+                **model_kwargs
+            )
+            # 更新实际特征数
+            model.num_columns = total_features
+            model.time_steps = time_steps
+            model.features_per_step = features_per_step
+
+        # 训练
+        model.fit(dataset)
+        print("    ✓ Model training completed")
+
+        # 保存模型
+        print("\n[10] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_path = MODEL_SAVE_PATH / f"cnn_ae_mlp_{args.handler}_{args.stock_pool}_{args.nday}d.keras"
+        model.save(str(model_path))
+
+    # 预测
+    print("\n[8] Generating predictions...")
+
+    # Debug: 检查测试数据
+    test_data = dataset.prepare("test", col_set="feature")
+    test_label = dataset.prepare("test", col_set="label")
+    print(f"    Test data shape: {test_data.shape}")
+
+    test_nan_count = test_data.isna().sum().sum()
+    test_nan_pct = test_nan_count / test_data.size * 100
+    print(f"    Test data NaN count: {test_nan_count} ({test_nan_pct:.2f}%)")
+
+    # 预测
+    test_pred = model.predict(dataset, segment="test")
+
+    # Debug: 检查预测结果
+    print(f"    Predictions NaN count: {test_pred.isna().sum()} ({test_pred.isna().sum() / len(test_pred) * 100:.2f}%)")
+    if not test_pred.isna().all():
+        print(f"    Predictions min/max: {test_pred.min():.4f} / {test_pred.max():.4f}")
+    print_prediction_stats(test_pred)
+
+    # 评估
+    print("\n[9] Evaluation...")
+    evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+
+    # 回测
+    if args.backtest:
+        pred_df = test_pred.to_frame("score")
+
+        run_backtest(
+            model_path, dataset, pred_df, args, time_splits,
+            model_name="CNN-AE-MLP",
+            load_model_func=load_model,
+            get_feature_count_func=get_feature_count
+        )
+
+
+if __name__ == "__main__":
+    main()

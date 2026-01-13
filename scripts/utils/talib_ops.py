@@ -12,7 +12,22 @@ Usage:
 Then use in expressions like:
     "TALIB_RSI($close, 14)"
     "TALIB_MACD_MACD($close, 12, 26, 9)"
+
+Note:
+    TA-Lib C library has known memory safety issues when used with multiprocessing.
+    This module includes thread safety measures to mitigate these issues.
 """
+
+import os
+import threading
+
+# ============================================================================
+# 关键: 在导入 TA-Lib 之前设置环境变量，避免多线程内存冲突
+# ============================================================================
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 
 import numpy as np
 import pandas as pd
@@ -22,7 +37,21 @@ try:
 except ImportError:
     raise ImportError("TA-Lib is required. Install with: pip install TA-Lib")
 
+# 全局锁，用于保护 TA-Lib 调用的线程安全
+_talib_lock = threading.Lock()
+
 from qlib.data.base import Expression, ExpressionOps
+
+
+def _safe_talib_call(func, *args, **kwargs):
+    """
+    线程安全的 TA-Lib 调用包装器
+
+    TA-Lib C 库在多线程环境下可能存在内存安全问题，
+    使用全局锁确保同一时间只有一个线程调用 TA-Lib 函数。
+    """
+    with _talib_lock:
+        return func(*args, **kwargs)
 
 
 class TALibOperator(ExpressionOps):
@@ -101,7 +130,7 @@ class TALIB_RSI(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.RSI(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.RSI, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -120,7 +149,7 @@ class TALIB_MOM(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.MOM(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.MOM, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -139,7 +168,7 @@ class TALIB_ROC(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.ROC(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.ROC, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -158,7 +187,7 @@ class TALIB_ROCP(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.ROCP(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.ROCP, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -187,7 +216,7 @@ class TALIB_WILLR(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.WILLR(
+        result = _safe_talib_call(talib.WILLR,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -221,7 +250,7 @@ class TALIB_CCI(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.CCI(
+        result = _safe_talib_call(talib.CCI,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -245,7 +274,7 @@ class TALIB_TRIX(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.TRIX(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.TRIX, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -265,7 +294,7 @@ class TALIB_PPO(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.PPO(
+        result = _safe_talib_call(talib.PPO,
             series.values.astype(np.float64),
             fastperiod=self.fastperiod,
             slowperiod=self.slowperiod
@@ -288,7 +317,7 @@ class TALIB_CMO(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.CMO(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.CMO, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -311,7 +340,7 @@ class TALIB_MACD_MACD(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        macd, signal, hist = talib.MACD(
+        macd, signal, hist = _safe_talib_call(talib.MACD,
             series.values.astype(np.float64),
             fastperiod=self.fastperiod,
             slowperiod=self.slowperiod,
@@ -337,7 +366,7 @@ class TALIB_MACD_SIGNAL(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        macd, signal, hist = talib.MACD(
+        macd, signal, hist = _safe_talib_call(talib.MACD,
             series.values.astype(np.float64),
             fastperiod=self.fastperiod,
             slowperiod=self.slowperiod,
@@ -363,7 +392,7 @@ class TALIB_MACD_HIST(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        macd, signal, hist = talib.MACD(
+        macd, signal, hist = _safe_talib_call(talib.MACD,
             series.values.astype(np.float64),
             fastperiod=self.fastperiod,
             slowperiod=self.slowperiod,
@@ -389,7 +418,7 @@ class TALIB_EMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.EMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.EMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -408,7 +437,7 @@ class TALIB_SMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.SMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.SMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -427,7 +456,7 @@ class TALIB_WMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.WMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.WMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -446,7 +475,7 @@ class TALIB_DEMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.DEMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.DEMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -465,7 +494,7 @@ class TALIB_TEMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.TEMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.TEMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -484,7 +513,7 @@ class TALIB_KAMA(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.KAMA(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.KAMA, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -506,7 +535,7 @@ class TALIB_BBANDS_UPPER(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        upper, middle, lower = talib.BBANDS(
+        upper, middle, lower = _safe_talib_call(talib.BBANDS,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             nbdevup=self.nbdevup,
@@ -530,7 +559,7 @@ class TALIB_BBANDS_MIDDLE(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        upper, middle, lower = talib.BBANDS(
+        upper, middle, lower = _safe_talib_call(talib.BBANDS,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod
         )
@@ -553,7 +582,7 @@ class TALIB_BBANDS_LOWER(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        upper, middle, lower = talib.BBANDS(
+        upper, middle, lower = _safe_talib_call(talib.BBANDS,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             nbdevup=self.nbdevdn,
@@ -589,7 +618,7 @@ class TALIB_ATR(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.ATR(
+        result = _safe_talib_call(talib.ATR,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -623,7 +652,7 @@ class TALIB_NATR(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.NATR(
+        result = _safe_talib_call(talib.NATR,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -656,7 +685,7 @@ class TALIB_TRANGE(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.TRANGE(
+        result = _safe_talib_call(talib.TRANGE,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64)
@@ -691,7 +720,7 @@ class TALIB_ADX(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.ADX(
+        result = _safe_talib_call(talib.ADX,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -725,7 +754,7 @@ class TALIB_ADXR(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.ADXR(
+        result = _safe_talib_call(talib.ADXR,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -759,7 +788,7 @@ class TALIB_PLUS_DI(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.PLUS_DI(
+        result = _safe_talib_call(talib.PLUS_DI,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -793,7 +822,7 @@ class TALIB_MINUS_DI(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        result = talib.MINUS_DI(
+        result = _safe_talib_call(talib.MINUS_DI,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -825,7 +854,7 @@ class TALIB_AROON_UP(TALibMultiInputOperator):
     def _load_internal(self, instrument, start_index, end_index, *args):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
-        aroon_down, aroon_up = talib.AROON(
+        aroon_down, aroon_up = _safe_talib_call(talib.AROON,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             timeperiod=self.timeperiod
@@ -856,7 +885,7 @@ class TALIB_AROON_DOWN(TALibMultiInputOperator):
     def _load_internal(self, instrument, start_index, end_index, *args):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
-        aroon_down, aroon_up = talib.AROON(
+        aroon_down, aroon_up = _safe_talib_call(talib.AROON,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             timeperiod=self.timeperiod
@@ -887,7 +916,7 @@ class TALIB_AROONOSC(TALibMultiInputOperator):
     def _load_internal(self, instrument, start_index, end_index, *args):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
-        result = talib.AROONOSC(
+        result = _safe_talib_call(talib.AROONOSC,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             timeperiod=self.timeperiod
@@ -919,7 +948,7 @@ class TALIB_OBV(TALibMultiInputOperator):
     def _load_internal(self, instrument, start_index, end_index, *args):
         close = self.close.load(instrument, start_index, end_index, *args)
         volume = self.volume.load(instrument, start_index, end_index, *args)
-        result = talib.OBV(
+        result = _safe_talib_call(talib.OBV,
             close.values.astype(np.float64),
             volume.values.astype(np.float64)
         )
@@ -952,7 +981,7 @@ class TALIB_AD(TALibMultiInputOperator):
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
         volume = self.volume.load(instrument, start_index, end_index, *args)
-        result = talib.AD(
+        result = _safe_talib_call(talib.AD,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -989,7 +1018,7 @@ class TALIB_ADOSC(TALibMultiInputOperator):
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
         volume = self.volume.load(instrument, start_index, end_index, *args)
-        result = talib.ADOSC(
+        result = _safe_talib_call(talib.ADOSC,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -1027,7 +1056,7 @@ class TALIB_MFI(TALibMultiInputOperator):
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
         volume = self.volume.load(instrument, start_index, end_index, *args)
-        result = talib.MFI(
+        result = _safe_talib_call(talib.MFI,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -1066,7 +1095,7 @@ class TALIB_STOCH_K(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        slowk, slowd = talib.STOCH(
+        slowk, slowd = _safe_talib_call(talib.STOCH,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -1104,7 +1133,7 @@ class TALIB_STOCH_D(TALibMultiInputOperator):
         high = self.high.load(instrument, start_index, end_index, *args)
         low = self.low.load(instrument, start_index, end_index, *args)
         close = self.close.load(instrument, start_index, end_index, *args)
-        slowk, slowd = talib.STOCH(
+        slowk, slowd = _safe_talib_call(talib.STOCH,
             high.values.astype(np.float64),
             low.values.astype(np.float64),
             close.values.astype(np.float64),
@@ -1132,7 +1161,7 @@ class TALIB_STOCHRSI_K(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        fastk, fastd = talib.STOCHRSI(
+        fastk, fastd = _safe_talib_call(talib.STOCHRSI,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             fastk_period=self.fastk_period,
@@ -1158,7 +1187,7 @@ class TALIB_STOCHRSI_D(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        fastk, fastd = talib.STOCHRSI(
+        fastk, fastd = _safe_talib_call(talib.STOCHRSI,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             fastk_period=self.fastk_period,
@@ -1185,7 +1214,7 @@ class TALIB_STDDEV(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.STDDEV(
+        result = _safe_talib_call(talib.STDDEV,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             nbdev=self.nbdev
@@ -1209,7 +1238,7 @@ class TALIB_VAR(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.VAR(
+        result = _safe_talib_call(talib.VAR,
             series.values.astype(np.float64),
             timeperiod=self.timeperiod,
             nbdev=self.nbdev
@@ -1232,7 +1261,7 @@ class TALIB_LINEARREG(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.LINEARREG(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.LINEARREG, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -1251,7 +1280,7 @@ class TALIB_LINEARREG_SLOPE(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.LINEARREG_SLOPE(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.LINEARREG_SLOPE, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -1270,7 +1299,7 @@ class TALIB_LINEARREG_ANGLE(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.LINEARREG_ANGLE(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.LINEARREG_ANGLE, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 
@@ -1289,7 +1318,7 @@ class TALIB_TSF(TALibOperator):
 
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
-        result = talib.TSF(series.values.astype(np.float64), timeperiod=self.timeperiod)
+        result = _safe_talib_call(talib.TSF, series.values.astype(np.float64), timeperiod=self.timeperiod)
         return pd.Series(result, index=series.index)
 
 

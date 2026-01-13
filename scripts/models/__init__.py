@@ -10,5 +10,7 @@ Directory structure:
 - analysis/   : Analysis and diagnostic scripts
 """
 
-# Re-export common module for backward compatibility
-from . import common
+# 注意: 不自动导入 common，避免过早触发 qlib 初始化
+# 这会导致 TA-Lib 与 qlib 多进程的内存冲突
+# 请使用: from models.common import ...
+# 而不是: from models import common

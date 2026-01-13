@@ -1,0 +1,7 @@
+# Qlib configuration
+# 设置 kernels=1 避免多进程与 TA-Lib 冲突
+# 使用 loky (joblib_backend=null) 避免 fork 与 TA-Lib C库冲突
+kernels: 1
+joblib_backend: null
+provider_uri: "./my_data/qlib_us"
+region: us

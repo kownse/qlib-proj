@@ -2,14 +2,18 @@
 回测共用逻辑
 
 包含回测配置、执行和结果分析的共用函数
+
+注意: qlib 相关导入使用延迟导入（在函数内部导入），
+避免在模块加载时触发 qlib 的自动初始化，这会导致与 TA-Lib 的冲突。
 """
 
 import pickle
 from pathlib import Path
 import pandas as pd
 
-from qlib.backtest import backtest as qlib_backtest
-from qlib.contrib.evaluate import risk_analysis
+# 延迟导入 qlib 模块，避免触发自动初始化
+# from qlib.backtest import backtest as qlib_backtest
+# from qlib.contrib.evaluate import risk_analysis
 
 from data.stock_pools import STOCK_POOLS
 from utils.strategy import get_strategy_config
@@ -165,6 +169,9 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
 
     print(f"\n[BT-2] Running backtest...")
     try:
+        # 延迟导入 qlib.backtest，确保 qlib 已正确初始化
+        from qlib.backtest import backtest as qlib_backtest
+
         portfolio_metric_dict, indicator_dict = qlib_backtest(
             executor=executor_config,
             strategy=strategy_config,
@@ -227,6 +234,9 @@ def _analyze_backtest_results(report_df: pd.DataFrame, positions, freq: str, arg
 
     # 计算关键指标
     total_return = (report_df["return"] + 1).prod() - 1
+
+    # 延迟导入 risk_analysis
+    from qlib.contrib.evaluate import risk_analysis
 
     # 检查是否有 benchmark
     has_bench = "bench" in report_df.columns and not report_df["bench"].isna().all()
