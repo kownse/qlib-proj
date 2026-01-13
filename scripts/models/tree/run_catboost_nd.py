@@ -56,6 +56,7 @@ qlib.init(
 # 现在可以安全地导入其他模块
 # ============================================================================
 
+import json
 import numpy as np
 import pandas as pd
 print("[DEBUG] 导入 catboost...")
@@ -64,6 +65,60 @@ from catboost import CatBoostRegressor, Pool
 print("[DEBUG] 导入 CatBoostModel...")
 from qlib.contrib.model.catboost_model import CatBoostModel
 from qlib.data.dataset.handler import DataHandlerLP
+
+
+# ============================================================================
+# 默认 CatBoost 参数
+# ============================================================================
+
+DEFAULT_CATBOOST_PARAMS = {
+    'loss_function': 'RMSE',
+    'learning_rate': 0.05,
+    'max_depth': 6,
+    'l2_leaf_reg': 3,
+    'random_strength': 1,
+    'thread_count': 16,
+    'verbose': False,
+}
+
+
+def load_params_from_file(params_file: str) -> dict:
+    """
+    从 JSON 文件加载 CatBoost 参数
+
+    Parameters
+    ----------
+    params_file : str
+        参数文件路径 (hyperopt CV 输出的 JSON 文件)
+
+    Returns
+    -------
+    dict
+        CatBoost 参数字典
+    """
+    with open(params_file, 'r') as f:
+        data = json.load(f)
+
+    # 支持两种格式:
+    # 1. hyperopt CV 格式: {"params": {...}, "cv_results": {...}}
+    # 2. 直接参数格式: {"learning_rate": ..., "max_depth": ...}
+    if 'params' in data:
+        params = data['params']
+        print(f"    Loaded params from CV hyperopt file")
+        if 'cv_results' in data:
+            cv = data['cv_results']
+            print(f"    CV Mean IC: {cv.get('mean_ic', 'N/A'):.4f} (±{cv.get('std_ic', 'N/A'):.4f})")
+    else:
+        params = data
+
+    # 确保必要的参数存在
+    final_params = DEFAULT_CATBOOST_PARAMS.copy()
+    for key in ['learning_rate', 'max_depth', 'l2_leaf_reg', 'random_strength',
+                'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf']:
+        if key in params:
+            final_params[key] = params[key]
+
+    return final_params
 
 from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
@@ -89,7 +144,7 @@ from models.common import (
 )
 
 
-def train_catboost(dataset, valid_cols):
+def train_catboost(dataset, valid_cols, cb_params=None):
     """
     训练 CatBoost 模型
 
@@ -99,6 +154,8 @@ def train_catboost(dataset, valid_cols):
         数据集
     valid_cols : list
         有效特征列
+    cb_params : dict, optional
+        CatBoost 参数，如果为 None 则使用默认参数
 
     Returns
     -------
@@ -106,14 +163,38 @@ def train_catboost(dataset, valid_cols):
         (model, feature_names, importance_df, num_model_features)
     """
     print("\n[6] Training CatBoost model...")
-    model = CatBoostModel(
-        loss="RMSE",
-        learning_rate=0.05,
-        max_depth=6,
-        l2_leaf_reg=3,
-        random_strength=1,
-        thread_count=16,
-    )
+
+    # 使用传入的参数或默认参数
+    if cb_params is None:
+        cb_params = DEFAULT_CATBOOST_PARAMS.copy()
+
+    # 打印使用的参数
+    print("    Parameters:")
+    for key in ['learning_rate', 'max_depth', 'l2_leaf_reg', 'random_strength',
+                'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf']:
+        if key in cb_params and cb_params[key] is not None:
+            print(f"      {key}: {cb_params[key]}")
+
+    # CatBoostModel 需要特定的参数格式，只传递非 None 的参数
+    model_kwargs = {
+        'loss': cb_params.get('loss_function', 'RMSE'),
+        'learning_rate': cb_params.get('learning_rate', 0.05),
+        'max_depth': int(cb_params.get('max_depth', 6)),
+        'l2_leaf_reg': cb_params.get('l2_leaf_reg', 3),
+        'random_strength': cb_params.get('random_strength', 1),
+        'thread_count': cb_params.get('thread_count', 16),
+    }
+
+    # 只添加非 None 的可选参数
+    optional_params = ['bagging_temperature', 'subsample', 'colsample_bylevel']
+    for key in optional_params:
+        if key in cb_params and cb_params[key] is not None:
+            model_kwargs[key] = cb_params[key]
+
+    if 'min_data_in_leaf' in cb_params and cb_params['min_data_in_leaf'] is not None:
+        model_kwargs['min_data_in_leaf'] = int(cb_params['min_data_in_leaf'])
+
+    model = CatBoostModel(**model_kwargs)
 
     print("\n    Training progress:")
     model.fit(
@@ -152,7 +233,7 @@ def train_catboost(dataset, valid_cols):
     return model, feature_names, importance_df, num_model_features
 
 
-def retrain_with_top_features(dataset, importance_df, args):
+def retrain_with_top_features(dataset, importance_df, args, cb_params=None):
     """
     使用 top-k 特征重新训练
 
@@ -164,6 +245,8 @@ def retrain_with_top_features(dataset, importance_df, args):
         特征重要性 DataFrame
     args : argparse.Namespace
         命令行参数
+    cb_params : dict, optional
+        CatBoost 参数，如果为 None 则使用默认参数
 
     Returns
     -------
@@ -189,15 +272,31 @@ def retrain_with_top_features(dataset, importance_df, args):
     train_pool = Pool(train_data_selected, label=train_label.values.ravel())
     valid_pool = Pool(valid_data_selected, label=valid_label.values.ravel())
 
-    cb_model = CatBoostRegressor(
-        loss_function='RMSE',
-        learning_rate=0.05,
-        max_depth=6,
-        l2_leaf_reg=3,
-        random_strength=1,
-        thread_count=16,
-        verbose=False,
-    )
+    # 使用传入的参数或默认参数
+    if cb_params is None:
+        cb_params = DEFAULT_CATBOOST_PARAMS.copy()
+
+    # 构建 CatBoostRegressor 参数，只传递非 None 的参数
+    model_kwargs = {
+        'loss_function': cb_params.get('loss_function', 'RMSE'),
+        'learning_rate': cb_params.get('learning_rate', 0.05),
+        'max_depth': int(cb_params.get('max_depth', 6)),
+        'l2_leaf_reg': cb_params.get('l2_leaf_reg', 3),
+        'random_strength': cb_params.get('random_strength', 1),
+        'thread_count': cb_params.get('thread_count', 16),
+        'verbose': False,
+    }
+
+    # 只添加非 None 的可选参数
+    optional_params = ['bagging_temperature', 'subsample', 'colsample_bylevel']
+    for key in optional_params:
+        if key in cb_params and cb_params[key] is not None:
+            model_kwargs[key] = cb_params[key]
+
+    if 'min_data_in_leaf' in cb_params and cb_params['min_data_in_leaf'] is not None:
+        model_kwargs['min_data_in_leaf'] = int(cb_params['min_data_in_leaf'])
+
+    cb_model = CatBoostRegressor(**model_kwargs)
 
     cb_model.fit(
         train_pool,
@@ -232,6 +331,11 @@ def retrain_with_top_features(dataset, importance_df, args):
 def main_train_impl():
     # 解析命令行参数
     parser = create_argument_parser("CatBoost", "run_catboost_nd.py")
+
+    # 添加 CatBoost 特定参数
+    parser.add_argument('--params-file', type=str, default=None,
+                        help='Path to JSON file with CatBoost params (from hyperopt CV search)')
+
     args = parser.parse_args()
 
     # 获取配置
@@ -239,8 +343,16 @@ def main_train_impl():
     symbols = STOCK_POOLS[args.stock_pool]
     time_splits = get_time_splits(args.max_train)
 
+    # 加载 CatBoost 参数
+    cb_params = None
+    if args.params_file:
+        print(f"\n[*] Loading CatBoost params from: {args.params_file}")
+        cb_params = load_params_from_file(args.params_file)
+
     # 打印头部信息
     print_training_header("CatBoost", args, symbols, handler_config, time_splits)
+    if args.params_file:
+        print(f"Params File: {args.params_file}")
 
     # 初始化和数据准备
     init_qlib(handler_config['use_talib'])
@@ -251,11 +363,11 @@ def main_train_impl():
     analyze_label_distribution(dataset)
 
     # 训练模型
-    model, feature_names, importance_df, num_model_features = train_catboost(dataset, valid_cols)
+    model, feature_names, importance_df, num_model_features = train_catboost(dataset, valid_cols, cb_params)
 
     # 特征选择和重新训练
     if args.top_k > 0 and args.top_k < len(feature_names):
-        cb_model, top_features, test_pred = retrain_with_top_features(dataset, importance_df, args)
+        cb_model, top_features, test_pred = retrain_with_top_features(dataset, importance_df, args, cb_params)
 
         # 评估
         print("\n[10] Evaluation with selected features...")
