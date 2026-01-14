@@ -145,6 +145,7 @@ def create_catboost_params(hyperparams: dict) -> dict:
     """将 hyperopt 参数转换为 CatBoost 参数"""
     return {
         'loss_function': 'RMSE',
+        'iterations': 1000,
         'learning_rate': hyperparams['learning_rate'],
         'max_depth': int(hyperparams['max_depth']),
         'l2_leaf_reg': hyperparams['l2_leaf_reg'],
@@ -166,6 +167,7 @@ def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
         Alpha158_Volatility_TALib, Alpha158_Volatility_TALib_Lite
     )
     from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatility_Pandas
+    from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
 
     handler_map = {
         'alpha158': Alpha158_Volatility,
@@ -174,6 +176,7 @@ def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
         'alpha158-talib-lite': Alpha158_Volatility_TALib_Lite,
         'alpha158-pandas': Alpha158_Volatility_Pandas,
         'alpha360-pandas': Alpha360_Volatility_Pandas,
+        'alpha158-talib-macro': Alpha158_Volatility_TALib_Macro,
     }
 
     HandlerClass = handler_map.get(args.handler)
@@ -212,13 +215,40 @@ def create_dataset_for_fold(handler, fold_config):
     return DatasetH(handler=handler, segments=segments)
 
 
-def compute_ic(pred, label, index):
+def compute_ic(pred, label, index, debug=False):
     """计算 IC (按日期分组的相关系数平均值)"""
     df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
+
+    if debug:
+        print(f"\n      [DEBUG compute_ic]")
+        print(f"        df shape: {df.shape}")
+        print(f"        df index names: {df.index.names}")
+        print(f"        pred: min={pred.min():.6f}, max={pred.max():.6f}, mean={pred.mean():.6f}, std={pred.std():.6f}")
+        print(f"        label: min={label.min():.6f}, max={label.max():.6f}, mean={label.mean():.6f}, std={label.std():.6f}")
+
+        # Check unique dates
+        unique_dates = df.index.get_level_values('datetime').unique()
+        print(f"        unique dates: {len(unique_dates)}")
+
+        # Check per-day statistics
+        pred_std_by_date = df.groupby(level='datetime')['pred'].std()
+        label_std_by_date = df.groupby(level='datetime')['label'].std()
+        stocks_per_date = df.groupby(level='datetime').size()
+
+        print(f"        stocks per date: min={stocks_per_date.min()}, max={stocks_per_date.max()}, mean={stocks_per_date.mean():.1f}")
+        print(f"        pred std per date: min={pred_std_by_date.min():.6f}, max={pred_std_by_date.max():.6f}, mean={pred_std_by_date.mean():.6f}")
+        print(f"        label std per date: min={label_std_by_date.min():.6f}, max={label_std_by_date.max():.6f}, mean={label_std_by_date.mean():.6f}")
+
     ic_by_date = df.groupby(level='datetime').apply(
         lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
     )
     ic_by_date = ic_by_date.dropna()
+
+    if debug:
+        print(f"        IC values: count={len(ic_by_date)}, min={ic_by_date.min():.4f}, max={ic_by_date.max():.4f}")
+        print(f"        IC sample (first 5): {ic_by_date.head().values}")
+        print(f"        IC sample (last 5): {ic_by_date.tail().values}")
+
     if len(ic_by_date) == 0:
         return 0.0, 0.0, 0.0
     mean_ic = ic_by_date.mean()
@@ -257,6 +287,19 @@ class CVHyperoptObjective:
             train_label = dataset.prepare("train", col_set="label").values.ravel()
             valid_label = dataset.prepare("valid", col_set="label").values.ravel()
 
+            # Debug: Print data statistics for first fold
+            if len(self.fold_data) == 0:
+                print(f"\n      [DEBUG Data Prep - {fold['name']}]")
+                print(f"        train_data columns ({len(train_data.columns)}): {train_data.columns.tolist()[:10]}...")
+                print(f"        train_data NaN%: {train_data.isna().mean().mean()*100:.2f}%")
+                print(f"        valid_data NaN%: {valid_data.isna().mean().mean()*100:.2f}%")
+                print(f"        train_label: mean={train_label.mean():.6f}, std={train_label.std():.6f}, NaN={np.isnan(train_label).sum()}")
+                print(f"        valid_label: mean={valid_label.mean():.6f}, std={valid_label.std():.6f}, NaN={np.isnan(valid_label).sum()}")
+                # Check label distribution per date
+                valid_label_df = pd.DataFrame({'label': valid_label}, index=valid_data.index)
+                label_std_per_date = valid_label_df.groupby(level='datetime')['label'].std()
+                print(f"        valid_label std per date: min={label_std_per_date.min():.6f}, max={label_std_per_date.max():.6f}, mean={label_std_per_date.mean():.6f}")
+
             self.fold_data.append({
                 'name': fold['name'],
                 'train_data': train_data,
@@ -293,9 +336,29 @@ class CVHyperoptObjective:
                 # 验证集预测
                 valid_pred = model.predict(fold['valid_data'])
 
+                # Debug: Print diagnostics for first trial
+                is_first_trial = self.trial_count == 1
+                if is_first_trial:
+                    print(f"\n    [DEBUG] {fold['name']}:")
+                    print(f"      best_iteration: {model.best_iteration_}")
+                    print(f"      valid_pred type: {type(valid_pred)}, shape: {valid_pred.shape}")
+                    print(f"      valid_pred: mean={valid_pred.mean():.6f}, std={valid_pred.std():.6f}")
+                    print(f"      valid_label type: {type(fold['valid_label'])}, shape: {fold['valid_label'].shape}")
+                    print(f"      valid_label: mean={fold['valid_label'].mean():.6f}, std={fold['valid_label'].std():.6f}")
+                    print(f"      valid_data shape: {fold['valid_data'].shape}")
+                    print(f"      valid_data index: {fold['valid_data'].index.names}")
+                    # Check feature importance
+                    importance = model.get_feature_importance()
+                    feature_names = fold['valid_data'].columns.tolist()
+                    top_5_idx = np.argsort(importance)[-5:][::-1]
+                    print(f"      Top 5 features by importance:")
+                    for idx in top_5_idx:
+                        print(f"        {feature_names[idx]}: {importance[idx]:.2f}")
+
                 # 计算 IC
                 mean_ic, ic_std, icir = compute_ic(
-                    valid_pred, fold['valid_label'], fold['valid_data'].index
+                    valid_pred, fold['valid_label'], fold['valid_data'].index,
+                    debug=is_first_trial
                 )
 
                 fold_ics.append(mean_ic)
@@ -510,14 +573,14 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
-    parser.add_argument('--handler', type=str, default='alpha158-talib-lite',
+    parser.add_argument('--handler', type=str, default='alpha158-talib-macro',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
-    parser.add_argument('--top-k', type=int, default=10)
+    parser.add_argument('--top-k', type=int, default=0)
 
     # Hyperopt 参数
-    parser.add_argument('--max-evals', type=int, default=30)
+    parser.add_argument('--max-evals', type=int, default=50)
 
     # 回测参数
     parser.add_argument('--backtest', action='store_true')

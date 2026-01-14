@@ -190,6 +190,7 @@ def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
         Alpha158_Volatility_TALib, Alpha158_Volatility_TALib_Lite
     )
     from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatility_Pandas
+    from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
 
     handler_map = {
         'alpha158': Alpha158_Volatility,
@@ -198,6 +199,7 @@ def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
         'alpha158-talib-lite': Alpha158_Volatility_TALib_Lite,
         'alpha158-pandas': Alpha158_Volatility_Pandas,
         'alpha360-pandas': Alpha360_Volatility_Pandas,
+        'alpha158-talib-macro': Alpha158_Volatility_TALib_Macro,
     }
 
     HandlerClass = handler_map.get(args.handler)
@@ -661,17 +663,17 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
-    parser.add_argument('--handler', type=str, default='alpha158',
+    parser.add_argument('--handler', type=str, default='alpha158-talib-macro',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
 
     # Hyperopt 参数
-    parser.add_argument('--max-evals', type=int, default=30,
+    parser.add_argument('--max-evals', type=int, default=50,
                         help='Maximum number of hyperopt evaluations')
-    parser.add_argument('--cv-epochs', type=int, default=30,
+    parser.add_argument('--cv-epochs', type=int, default=50,
                         help='Epochs per CV trial (smaller for faster search)')
-    parser.add_argument('--cv-early-stop', type=int, default=5,
+    parser.add_argument('--cv-early-stop', type=int, default=10,
                         help='Early stopping patience for CV trials')
 
     # 最终训练参数
