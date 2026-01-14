@@ -33,14 +33,18 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
     Alpha158 features + TA-Lib indicators + Macro features + N-day volatility label
 
     Extends Alpha158_Volatility_TALib_Lite with macro market regime features:
-    - VIX features: level, zscore, changes, regime
+    - VIX features: level, zscore, changes, regime, term structure
     - Gold features: changes, volatility
     - Bond features: changes, yield curve proxy
     - Dollar features: changes, strength
     - Oil features: changes, volatility
+    - Sector features: momentum, relative strength vs SPY
+    - Credit features: spreads, stress indicators
+    - Global features: EM momentum, global risk
+    - Treasury yield features: levels, curve slope, changes
     - Cross-asset features: risk indicators, correlations
 
-    Total features: ~170 (Alpha158+TA-Lib) + ~35 (Macro) = ~205
+    Total features: ~170 (Alpha158+TA-Lib) + ~105 (Macro) = ~275
 
     Usage:
         handler = Alpha158_Volatility_TALib_Macro(
@@ -52,12 +56,18 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         )
     """
 
-    # Macro feature column names
+    # Sector symbols for dynamic feature generation
+    SECTOR_SYMBOLS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLRE", "XLB", "XLC"]
+
+    # Macro feature column names (~105 total)
     ALL_MACRO_FEATURES = [
         # VIX (8)
         "macro_vix_level", "macro_vix_zscore20",
         "macro_vix_pct_1d", "macro_vix_pct_5d", "macro_vix_pct_10d",
         "macro_vix_ma5_ratio", "macro_vix_ma20_ratio", "macro_vix_regime",
+        # VIX Term Structure (5)
+        "macro_vix_term_structure", "macro_vix_contango", "macro_vix_term_zscore",
+        "macro_uvxy_pct_5d", "macro_svxy_pct_5d",
         # Gold (5)
         "macro_gld_pct_1d", "macro_gld_pct_5d", "macro_gld_pct_20d",
         "macro_gld_ma20_ratio", "macro_gld_vol20",
@@ -71,22 +81,71 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         # Oil (4)
         "macro_uso_pct_1d", "macro_uso_pct_5d", "macro_uso_pct_20d",
         "macro_uso_vol20",
+        # Sector ETFs (33 = 11 sectors x 3 features)
+        "macro_xlk_pct_5d", "macro_xlk_pct_20d", "macro_xlk_vs_spy",
+        "macro_xlf_pct_5d", "macro_xlf_pct_20d", "macro_xlf_vs_spy",
+        "macro_xle_pct_5d", "macro_xle_pct_20d", "macro_xle_vs_spy",
+        "macro_xlv_pct_5d", "macro_xlv_pct_20d", "macro_xlv_vs_spy",
+        "macro_xli_pct_5d", "macro_xli_pct_20d", "macro_xli_vs_spy",
+        "macro_xlp_pct_5d", "macro_xlp_pct_20d", "macro_xlp_vs_spy",
+        "macro_xly_pct_5d", "macro_xly_pct_20d", "macro_xly_vs_spy",
+        "macro_xlu_pct_5d", "macro_xlu_pct_20d", "macro_xlu_vs_spy",
+        "macro_xlre_pct_5d", "macro_xlre_pct_20d", "macro_xlre_vs_spy",
+        "macro_xlb_pct_5d", "macro_xlb_pct_20d", "macro_xlb_vs_spy",
+        "macro_xlc_pct_5d", "macro_xlc_pct_20d", "macro_xlc_vs_spy",
+        # Credit/Risk (8)
+        "macro_hyg_pct_5d", "macro_hyg_pct_20d", "macro_hyg_vs_lqd",
+        "macro_hyg_lqd_chg5", "macro_jnk_vol20", "macro_credit_stress",
+        "macro_hyg_tlt_ratio", "macro_hyg_tlt_chg5",
+        # Global (8)
+        "macro_eem_pct_5d", "macro_eem_pct_20d", "macro_eem_vs_spy",
+        "macro_efa_pct_5d", "macro_efa_vs_spy",
+        "macro_fxi_pct_5d", "macro_ewj_pct_5d", "macro_global_risk",
+        # Benchmark (6)
+        "macro_spy_pct_1d", "macro_spy_pct_5d", "macro_spy_pct_20d",
+        "macro_spy_vol20", "macro_qqq_vs_spy", "macro_spy_ma20_ratio",
+        # Treasury Yields (10)
+        "macro_yield_2y", "macro_yield_10y", "macro_yield_30y",
+        "macro_yield_2s10s", "macro_yield_3m10y",
+        "macro_yield_10y_chg5", "macro_yield_10y_chg20",
+        "macro_yield_curve_slope", "macro_yield_curve_zscore", "macro_yield_inversion",
+        # FRED Credit Spreads (5)
+        "macro_hy_spread", "macro_hy_spread_zscore", "macro_hy_spread_chg5",
+        "macro_ig_spread", "macro_credit_risk",
         # Cross-asset (5)
         "macro_risk_on_off", "macro_gold_oil_ratio", "macro_gold_oil_ratio_chg",
         "macro_stock_bond_corr", "macro_market_stress",
     ]
 
+    # Core features subset for lightweight usage (~25)
     CORE_MACRO_FEATURES = [
+        # VIX
         "macro_vix_level", "macro_vix_zscore20", "macro_vix_pct_5d", "macro_vix_regime",
+        "macro_vix_term_structure",
+        # Macro
         "macro_gld_pct_5d", "macro_tlt_pct_5d", "macro_yield_curve",
         "macro_uup_pct_5d", "macro_uso_pct_5d",
+        # Benchmark
+        "macro_spy_pct_5d", "macro_spy_vol20",
+        # Credit
+        "macro_hyg_vs_lqd", "macro_credit_stress",
+        # Global
+        "macro_eem_vs_spy", "macro_global_risk",
+        # Treasury
+        "macro_yield_10y", "macro_yield_2s10s", "macro_yield_inversion",
+        # FRED Credit
+        "macro_hy_spread", "macro_hy_spread_zscore",
+        # Cross-asset
         "macro_risk_on_off", "macro_market_stress",
     ]
 
+    # VIX only features (~13)
     VIX_ONLY_FEATURES = [
         "macro_vix_level", "macro_vix_zscore20",
         "macro_vix_pct_1d", "macro_vix_pct_5d", "macro_vix_pct_10d",
         "macro_vix_ma5_ratio", "macro_vix_ma20_ratio", "macro_vix_regime",
+        "macro_vix_term_structure", "macro_vix_contango", "macro_vix_term_zscore",
+        "macro_uvxy_pct_5d", "macro_svxy_pct_5d",
     ]
 
     def __init__(
@@ -115,9 +174,9 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
             volatility_window: Prediction window (days)
             macro_data_path: Path to macro features parquet file
             macro_features: Macro feature set to use
-                - "all": All macro features (~35)
-                - "core": Core features (~11)
-                - "vix_only": VIX features only (~8)
+                - "all": All macro features (~105)
+                - "core": Core features (~25)
+                - "vix_only": VIX features only (~13)
                 - "none": No macro features (same as TALib_Lite)
             **kwargs: Additional arguments for parent class
         """
@@ -345,7 +404,7 @@ class Alpha158_Macro(DataHandlerLP):
 
     Lighter version for larger stock pools where TA-Lib may cause memory issues.
 
-    Total features: ~158 (Alpha158) + ~35 (Macro) = ~193
+    Total features: ~158 (Alpha158) + ~105 (Macro) = ~263
     """
 
     # Reuse macro feature definitions from parent

@@ -215,40 +215,13 @@ def create_dataset_for_fold(handler, fold_config):
     return DatasetH(handler=handler, segments=segments)
 
 
-def compute_ic(pred, label, index, debug=False):
+def compute_ic(pred, label, index):
     """计算 IC (按日期分组的相关系数平均值)"""
     df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
-
-    if debug:
-        print(f"\n      [DEBUG compute_ic]")
-        print(f"        df shape: {df.shape}")
-        print(f"        df index names: {df.index.names}")
-        print(f"        pred: min={pred.min():.6f}, max={pred.max():.6f}, mean={pred.mean():.6f}, std={pred.std():.6f}")
-        print(f"        label: min={label.min():.6f}, max={label.max():.6f}, mean={label.mean():.6f}, std={label.std():.6f}")
-
-        # Check unique dates
-        unique_dates = df.index.get_level_values('datetime').unique()
-        print(f"        unique dates: {len(unique_dates)}")
-
-        # Check per-day statistics
-        pred_std_by_date = df.groupby(level='datetime')['pred'].std()
-        label_std_by_date = df.groupby(level='datetime')['label'].std()
-        stocks_per_date = df.groupby(level='datetime').size()
-
-        print(f"        stocks per date: min={stocks_per_date.min()}, max={stocks_per_date.max()}, mean={stocks_per_date.mean():.1f}")
-        print(f"        pred std per date: min={pred_std_by_date.min():.6f}, max={pred_std_by_date.max():.6f}, mean={pred_std_by_date.mean():.6f}")
-        print(f"        label std per date: min={label_std_by_date.min():.6f}, max={label_std_by_date.max():.6f}, mean={label_std_by_date.mean():.6f}")
-
     ic_by_date = df.groupby(level='datetime').apply(
         lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
     )
     ic_by_date = ic_by_date.dropna()
-
-    if debug:
-        print(f"        IC values: count={len(ic_by_date)}, min={ic_by_date.min():.4f}, max={ic_by_date.max():.4f}")
-        print(f"        IC sample (first 5): {ic_by_date.head().values}")
-        print(f"        IC sample (last 5): {ic_by_date.tail().values}")
-
     if len(ic_by_date) == 0:
         return 0.0, 0.0, 0.0
     mean_ic = ic_by_date.mean()
@@ -336,29 +309,9 @@ class CVHyperoptObjective:
                 # 验证集预测
                 valid_pred = model.predict(fold['valid_data'])
 
-                # Debug: Print diagnostics for first trial
-                is_first_trial = self.trial_count == 1
-                if is_first_trial:
-                    print(f"\n    [DEBUG] {fold['name']}:")
-                    print(f"      best_iteration: {model.best_iteration_}")
-                    print(f"      valid_pred type: {type(valid_pred)}, shape: {valid_pred.shape}")
-                    print(f"      valid_pred: mean={valid_pred.mean():.6f}, std={valid_pred.std():.6f}")
-                    print(f"      valid_label type: {type(fold['valid_label'])}, shape: {fold['valid_label'].shape}")
-                    print(f"      valid_label: mean={fold['valid_label'].mean():.6f}, std={fold['valid_label'].std():.6f}")
-                    print(f"      valid_data shape: {fold['valid_data'].shape}")
-                    print(f"      valid_data index: {fold['valid_data'].index.names}")
-                    # Check feature importance
-                    importance = model.get_feature_importance()
-                    feature_names = fold['valid_data'].columns.tolist()
-                    top_5_idx = np.argsort(importance)[-5:][::-1]
-                    print(f"      Top 5 features by importance:")
-                    for idx in top_5_idx:
-                        print(f"        {feature_names[idx]}: {importance[idx]:.2f}")
-
                 # 计算 IC
                 mean_ic, ic_std, icir = compute_ic(
-                    valid_pred, fold['valid_label'], fold['valid_data'].index,
-                    debug=is_first_trial
+                    valid_pred, fold['valid_label'], fold['valid_data'].index
                 )
 
                 fold_ics.append(mean_ic)
