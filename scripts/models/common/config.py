@@ -15,6 +15,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent  # 项目根目录
 QLIB_DATA_PATH = PROJECT_ROOT / "my_data" / "qlib_us"
 NEWS_DATA_PATH = PROJECT_ROOT / "my_data" / "news_processed" / "news_features.parquet"
+MACRO_DATA_PATH = PROJECT_ROOT / "my_data" / "macro_processed" / "macro_features.parquet"
 MODEL_SAVE_PATH = PROJECT_ROOT / "my_models"
 
 
@@ -73,6 +74,12 @@ def _get_handler_class(handler_name: str):
     elif handler_name == 'alpha158-news':
         from data.datahandler_news import Alpha158_Volatility_TALib_News
         return Alpha158_Volatility_TALib_News
+    elif handler_name == 'alpha158-talib-macro':
+        from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
+        return Alpha158_Volatility_TALib_Macro
+    elif handler_name == 'alpha158-macro':
+        from data.datahandler_macro import Alpha158_Macro
+        return Alpha158_Macro
     else:
         raise ValueError(f"Unknown handler: {handler_name}")
 
@@ -108,6 +115,14 @@ _HANDLER_CONFIG_META = {
         'description': 'Alpha158 + TA-Lib + News features',
         'use_talib': True,
     },
+    'alpha158-talib-macro': {
+        'description': 'Alpha158 + TA-Lib Lite + Macro features (~205 features)',
+        'use_talib': True,
+    },
+    'alpha158-macro': {
+        'description': 'Alpha158 + Macro features (no TA-Lib, ~193 features)',
+        'use_talib': False,
+    },
 }
 
 
@@ -139,10 +154,13 @@ def get_handler_epilog():
     """返回命令行帮助的 handler 说明"""
     return """
 Handler choices:
-  alpha158        Alpha158 features (158 technical indicators) [default]
-  alpha360        Alpha360 features (60 days of OHLCV = 360 features)
-  alpha158-talib  Alpha158 + TA-Lib indicators (~300+ features, requires TA-Lib)
-  alpha158-pandas Alpha158 + Pandas indicators (no TA-Lib, for large datasets)
-  alpha360-pandas Alpha360 features via Pandas (no TA-Lib)
-  alpha158-news   Alpha158 + TA-Lib + News sentiment features
+  alpha158             Alpha158 features (158 technical indicators) [default]
+  alpha360             Alpha360 features (60 days of OHLCV = 360 features)
+  alpha158-talib       Alpha158 + TA-Lib indicators (~300+ features, requires TA-Lib)
+  alpha158-talib-lite  Alpha158 + TA-Lib Lite (~170 features, works with sp500)
+  alpha158-pandas      Alpha158 + Pandas indicators (no TA-Lib, for large datasets)
+  alpha360-pandas      Alpha360 features via Pandas (no TA-Lib)
+  alpha158-news        Alpha158 + TA-Lib + News sentiment features
+  alpha158-talib-macro Alpha158 + TA-Lib Lite + Macro features (~205 features)
+  alpha158-macro       Alpha158 + Macro features (no TA-Lib, ~193 features)
 """

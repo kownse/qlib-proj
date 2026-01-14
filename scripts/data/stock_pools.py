@@ -128,6 +128,18 @@ SP500_SYMBOLS = [
     "XEL", "XOM", "XYL", "YUM", "ZBH", "ZBRA", "ZTS",
 ]
 
+# 宏观/ETF 指标（用于市场状态特征）
+# 注意: VIX 在 Yahoo Finance 中的 ticker 是 ^VIX，下载脚本需要特殊处理
+MACRO_SYMBOLS = {
+    "VIX": "^VIX",    # 恐慌指数（无 volume 数据）
+    "GLD": "GLD",     # 黄金 ETF
+    "TLT": "TLT",     # 长期美债 ETF (20+ 年)
+    "UUP": "UUP",     # 美元指数 ETF
+    "USO": "USO",     # 原油 ETF
+    "SHY": "SHY",     # 短期国债 ETF (1-3 年)
+    "IEF": "IEF",     # 中期国债 ETF (7-10 年)
+}
+
 # 股票池字典
 STOCK_POOLS = {
     "test": TEST_SYMBOLS,          # 10 只测试股票
