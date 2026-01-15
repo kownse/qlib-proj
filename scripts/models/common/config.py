@@ -80,6 +80,21 @@ def _get_handler_class(handler_name: str):
     elif handler_name == 'alpha158-macro':
         from data.datahandler_macro import Alpha158_Macro
         return Alpha158_Macro
+    elif handler_name == 'alpha360-macro':
+        from data.datahandler_macro import Alpha360_Macro
+        return Alpha360_Macro
+    elif handler_name == 'alpha158-enhanced':
+        from data.datahandler_enhanced import Alpha158_Enhanced
+        return Alpha158_Enhanced
+    elif handler_name == 'alpha158-enhanced-v2':
+        from data.datahandler_enhanced_v2 import Alpha158_Enhanced_V2
+        return Alpha158_Enhanced_V2
+    elif handler_name == 'alpha158-enhanced-v3':
+        from data.datahandler_enhanced_v3 import Alpha158_Enhanced_V3
+        return Alpha158_Enhanced_V3
+    elif handler_name == 'alpha158-enhanced-v4':
+        from data.datahandler_enhanced_v4 import Alpha158_Enhanced_V4
+        return Alpha158_Enhanced_V4
     else:
         raise ValueError(f"Unknown handler: {handler_name}")
 
@@ -123,6 +138,26 @@ _HANDLER_CONFIG_META = {
         'description': 'Alpha158 + Macro features (no TA-Lib, ~193 features)',
         'use_talib': False,
     },
+    'alpha360-macro': {
+        'description': 'Alpha360 + Macro features (60 timesteps × (6+M) features)',
+        'use_talib': False,
+    },
+    'alpha158-enhanced': {
+        'description': 'Alpha158 Enhanced (~130 refined features based on importance)',
+        'use_talib': True,
+    },
+    'alpha158-enhanced-v2': {
+        'description': 'Alpha158 Enhanced V2 (~140 features, extended 52w features)',
+        'use_talib': True,
+    },
+    'alpha158-enhanced-v3': {
+        'description': 'Alpha158 Enhanced V3 (~130 streamlined features)',
+        'use_talib': True,
+    },
+    'alpha158-enhanced-v4': {
+        'description': 'Alpha158 Enhanced V4 (~83 minimized features)',
+        'use_talib': True,
+    },
 }
 
 
@@ -163,4 +198,9 @@ Handler choices:
   alpha158-news        Alpha158 + TA-Lib + News sentiment features
   alpha158-talib-macro Alpha158 + TA-Lib Lite + Macro features (~205 features)
   alpha158-macro       Alpha158 + Macro features (no TA-Lib, ~193 features)
+  alpha360-macro       Alpha360 + Macro features (60 timesteps, for ALSTM/TCN)
+  alpha158-enhanced    Alpha158 Enhanced (~130 refined features based on importance)
+  alpha158-enhanced-v2 Alpha158 Enhanced V2 (~140 features, extended 52w features)
+  alpha158-enhanced-v3 Alpha158 Enhanced V3 (~130 streamlined features)
+  alpha158-enhanced-v4 Alpha158 Enhanced V4 (~83 minimized features)
 """

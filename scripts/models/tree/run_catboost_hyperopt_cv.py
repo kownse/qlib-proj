@@ -162,26 +162,9 @@ def create_catboost_params(hyperparams: dict) -> dict:
 
 def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
     """为特定 fold 创建 DataHandler"""
-    from data.datahandler_ext import (
-        Alpha158_Volatility, Alpha360_Volatility,
-        Alpha158_Volatility_TALib, Alpha158_Volatility_TALib_Lite
-    )
-    from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatility_Pandas
-    from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
+    from models.common.handlers import get_handler_class
 
-    handler_map = {
-        'alpha158': Alpha158_Volatility,
-        'alpha360': Alpha360_Volatility,
-        'alpha158-talib': Alpha158_Volatility_TALib,
-        'alpha158-talib-lite': Alpha158_Volatility_TALib_Lite,
-        'alpha158-pandas': Alpha158_Volatility_Pandas,
-        'alpha360-pandas': Alpha360_Volatility_Pandas,
-        'alpha158-talib-macro': Alpha158_Volatility_TALib_Macro,
-    }
-
-    HandlerClass = handler_map.get(args.handler)
-    if HandlerClass is None:
-        raise ValueError(f"Unknown handler: {args.handler}")
+    HandlerClass = get_handler_class(args.handler)
 
     # 确定数据的结束时间
     if 'test_end' in fold_config:
@@ -292,18 +275,37 @@ class CVHyperoptObjective:
         self.trial_count += 1
         cb_params = create_catboost_params(hyperparams)
 
+        # 打印 Trial 开始信息
+        print(f"\n{'='*60}")
+        print(f"Trial {self.trial_count}/{self.args.max_evals} | Best IC so far: {self.best_mean_ic:.4f}")
+        print(f"{'='*60}")
+        print(f"  Params: lr={hyperparams['learning_rate']:.4f}, depth={int(hyperparams['max_depth'])}, "
+              f"l2={hyperparams['l2_leaf_reg']:.2f}, subsample={hyperparams['subsample']:.2f}")
+        sys.stdout.flush()
+
         fold_ics = []
         fold_results = []
 
         try:
-            for fold in self.fold_data:
-                # 训练模型
+            for fold_idx, fold in enumerate(self.fold_data):
+                print(f"\n  [{fold_idx+1}/{len(self.fold_data)}] {fold['name']}...")
+                sys.stdout.flush()
+
+                # 训练模型 - 添加 verbose 输出
                 model = CatBoostRegressor(**cb_params)
+
+                # 使用 verbose 参数每 100 轮输出一次
                 model.fit(
                     fold['train_pool'],
                     eval_set=fold['valid_pool'],
                     early_stopping_rounds=50,
-                    verbose_eval=False,
+                    verbose=100,  # 每 100 轮输出一次
+                )
+
+                # 训练集预测和 IC
+                train_pred = model.predict(fold['train_data'])
+                train_ic, train_ic_std, train_icir = compute_ic(
+                    train_pred, fold['train_label'], fold['train_data'].index
                 )
 
                 # 验证集预测
@@ -322,6 +324,12 @@ class CVHyperoptObjective:
                     'best_iter': model.best_iteration_,
                 })
 
+                # 打印 Fold 结果
+                print(f"      Best iter: {model.best_iteration_}")
+                print(f"      Train IC: {train_ic:.4f} (ICIR: {train_icir:.4f})")
+                print(f"      Valid IC: {mean_ic:.4f} (ICIR: {icir:.4f})")
+                sys.stdout.flush()
+
             # 计算平均 IC
             mean_ic_all = np.mean(fold_ics)
             std_ic_all = np.std(fold_ics)
@@ -329,14 +337,19 @@ class CVHyperoptObjective:
             # 更新最佳
             if mean_ic_all > self.best_mean_ic:
                 self.best_mean_ic = mean_ic_all
-                is_best = " ★ NEW BEST"
+                is_best = " ★ NEW BEST ★"
             else:
                 is_best = ""
 
-            # 打印进度
+            # 打印 Trial 汇总
+            print(f"\n  {'─'*50}")
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
-            print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
-                  f"[{fold_ic_str}] lr={hyperparams['learning_rate']:.4f}{is_best}")
+            print(f"  Trial {self.trial_count} Summary:")
+            print(f"    Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+            print(f"    Folds:   [{fold_ic_str}]")
+            print(f"    Best Trial IC: {self.best_mean_ic:.4f}{is_best}")
+            print(f"  {'─'*50}")
+            sys.stdout.flush()
 
             return {
                 'loss': -mean_ic_all,
@@ -348,7 +361,11 @@ class CVHyperoptObjective:
             }
 
         except Exception as e:
-            print(f"  Trial {self.trial_count:3d}: FAILED - {str(e)}")
+            import traceback
+            print(f"\n  Trial {self.trial_count} FAILED!")
+            print(f"    Error: {str(e)}")
+            traceback.print_exc()
+            sys.stdout.flush()
             return {
                 'loss': float('inf'),
                 'status': STATUS_FAIL,

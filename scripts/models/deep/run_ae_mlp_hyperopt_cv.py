@@ -185,26 +185,9 @@ def create_ae_mlp_params(hyperparams: dict, num_columns: int) -> dict:
 
 def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
     """为特定 fold 创建 DataHandler"""
-    from data.datahandler_ext import (
-        Alpha158_Volatility, Alpha360_Volatility,
-        Alpha158_Volatility_TALib, Alpha158_Volatility_TALib_Lite
-    )
-    from data.datahandler_pandas import Alpha158_Volatility_Pandas, Alpha360_Volatility_Pandas
-    from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
+    from models.common.handlers import get_handler_class
 
-    handler_map = {
-        'alpha158': Alpha158_Volatility,
-        'alpha360': Alpha360_Volatility,
-        'alpha158-talib': Alpha158_Volatility_TALib,
-        'alpha158-talib-lite': Alpha158_Volatility_TALib_Lite,
-        'alpha158-pandas': Alpha158_Volatility_Pandas,
-        'alpha360-pandas': Alpha360_Volatility_Pandas,
-        'alpha158-talib-macro': Alpha158_Volatility_TALib_Macro,
-    }
-
-    HandlerClass = handler_map.get(args.handler)
-    if HandlerClass is None:
-        raise ValueError(f"Unknown handler: {args.handler}")
+    HandlerClass = get_handler_class(args.handler)
 
     # 确定数据的结束时间
     if 'test_end' in fold_config:
