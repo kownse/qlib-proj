@@ -117,8 +117,8 @@ CV_FOLDS = [
 # 最终测试集 (完全独立)
 FINAL_TEST = {
     'train_start': '2000-01-01',
-    'train_end': '2024-12-31',
-    'valid_start': '2024-10-01',  # 用最近3个月做早停
+    'train_end': '2024-09-30',    # 修复：避免与验证集重叠
+    'valid_start': '2024-10-01',  # 验证集（无重叠）
     'valid_end': '2024-12-31',
     'test_start': '2025-01-01',
     'test_end': '2025-12-31',
@@ -130,14 +130,14 @@ FINAL_TEST = {
 # ============================================================================
 
 SEARCH_SPACE = {
-    'learning_rate': hp.loguniform('learning_rate', np.log(0.01), np.log(0.3)),
-    'max_depth': scope.int(hp.quniform('max_depth', 4, 10, 1)),
-    'l2_leaf_reg': hp.uniform('l2_leaf_reg', 1, 10),
+    'learning_rate': hp.loguniform('learning_rate', np.log(0.01), np.log(0.15)),  # 平衡: 0.01-0.15
+    'max_depth': scope.int(hp.quniform('max_depth', 4, 8, 1)),  # 平衡: 4-8
+    'l2_leaf_reg': hp.uniform('l2_leaf_reg', 1, 15),  # 平衡: 1-15
     'random_strength': hp.uniform('random_strength', 0.1, 2),
     'bagging_temperature': hp.uniform('bagging_temperature', 0, 1),
-    'subsample': hp.uniform('subsample', 0.6, 1.0),
-    'colsample_bylevel': hp.uniform('colsample_bylevel', 0.6, 1.0),
-    'min_data_in_leaf': scope.int(hp.quniform('min_data_in_leaf', 1, 100, 1)),
+    'subsample': hp.uniform('subsample', 0.6, 0.95),
+    'colsample_bylevel': hp.uniform('colsample_bylevel', 0.6, 0.95),
+    'min_data_in_leaf': scope.int(hp.quniform('min_data_in_leaf', 5, 100, 1)),
 }
 
 
@@ -216,11 +216,12 @@ def compute_ic(pred, label, index):
 class CVHyperoptObjective:
     """时间序列交叉验证的 Hyperopt 目标函数"""
 
-    def __init__(self, args, handler_config, symbols, top_features=None):
+    def __init__(self, args, handler_config, symbols, top_features=None, verbose=False):
         self.args = args
         self.handler_config = handler_config
         self.symbols = symbols
         self.top_features = top_features
+        self.verbose = verbose
         self.trial_count = 0
         self.best_mean_ic = -float('inf')
 
@@ -276,30 +277,32 @@ class CVHyperoptObjective:
         cb_params = create_catboost_params(hyperparams)
 
         # 打印 Trial 开始信息
-        print(f"\n{'='*60}")
-        print(f"Trial {self.trial_count}/{self.args.max_evals} | Best IC so far: {self.best_mean_ic:.4f}")
-        print(f"{'='*60}")
-        print(f"  Params: lr={hyperparams['learning_rate']:.4f}, depth={int(hyperparams['max_depth'])}, "
-              f"l2={hyperparams['l2_leaf_reg']:.2f}, subsample={hyperparams['subsample']:.2f}")
-        sys.stdout.flush()
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"Trial {self.trial_count}/{self.args.max_evals} | Best IC so far: {self.best_mean_ic:.4f}")
+            print(f"{'='*60}")
+            print(f"  Params: lr={hyperparams['learning_rate']:.4f}, depth={int(hyperparams['max_depth'])}, "
+                  f"l2={hyperparams['l2_leaf_reg']:.2f}, subsample={hyperparams['subsample']:.2f}")
+            sys.stdout.flush()
 
         fold_ics = []
         fold_results = []
 
         try:
             for fold_idx, fold in enumerate(self.fold_data):
-                print(f"\n  [{fold_idx+1}/{len(self.fold_data)}] {fold['name']}...")
-                sys.stdout.flush()
+                if self.verbose:
+                    print(f"\n  [{fold_idx+1}/{len(self.fold_data)}] {fold['name']}...")
+                    sys.stdout.flush()
 
-                # 训练模型 - 添加 verbose 输出
+                # 训练模型
                 model = CatBoostRegressor(**cb_params)
 
-                # 使用 verbose 参数每 100 轮输出一次
+                # verbose 控制训练日志输出
                 model.fit(
                     fold['train_pool'],
                     eval_set=fold['valid_pool'],
                     early_stopping_rounds=50,
-                    verbose=100,  # 每 100 轮输出一次
+                    verbose=100 if self.verbose else False,
                 )
 
                 # 训练集预测和 IC
@@ -324,11 +327,12 @@ class CVHyperoptObjective:
                     'best_iter': model.best_iteration_,
                 })
 
-                # 打印 Fold 结果
-                print(f"      Best iter: {model.best_iteration_}")
-                print(f"      Train IC: {train_ic:.4f} (ICIR: {train_icir:.4f})")
-                print(f"      Valid IC: {mean_ic:.4f} (ICIR: {icir:.4f})")
-                sys.stdout.flush()
+                # 打印 Fold 结果 (仅 verbose 模式)
+                if self.verbose:
+                    print(f"      Best iter: {model.best_iteration_}")
+                    print(f"      Train IC: {train_ic:.4f} (ICIR: {train_icir:.4f})")
+                    print(f"      Valid IC: {mean_ic:.4f} (ICIR: {icir:.4f})")
+                    sys.stdout.flush()
 
             # 计算平均 IC
             mean_ic_all = np.mean(fold_ics)
@@ -337,18 +341,22 @@ class CVHyperoptObjective:
             # 更新最佳
             if mean_ic_all > self.best_mean_ic:
                 self.best_mean_ic = mean_ic_all
-                is_best = " ★ NEW BEST ★"
+                is_best = " ★ NEW BEST"
             else:
                 is_best = ""
 
-            # 打印 Trial 汇总
-            print(f"\n  {'─'*50}")
+            # 打印 Trial 汇总 (始终输出，但格式不同)
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
-            print(f"  Trial {self.trial_count} Summary:")
-            print(f"    Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
-            print(f"    Folds:   [{fold_ic_str}]")
-            print(f"    Best Trial IC: {self.best_mean_ic:.4f}{is_best}")
-            print(f"  {'─'*50}")
+            if self.verbose:
+                print(f"\n  {'─'*50}")
+                print(f"  Trial {self.trial_count} Summary:")
+                print(f"    Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+                print(f"    Folds:   [{fold_ic_str}]")
+                print(f"    Best Trial IC: {self.best_mean_ic:.4f}{is_best}")
+                print(f"  {'─'*50}")
+            else:
+                # 简洁输出: 一行显示 trial 结果
+                print(f"Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) [{fold_ic_str}] lr={hyperparams['learning_rate']:.4f}{is_best}")
             sys.stdout.flush()
 
             return {
@@ -437,7 +445,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
     print("=" * 70)
 
     # 创建目标函数
-    objective = CVHyperoptObjective(args, handler_config, symbols, top_features)
+    objective = CVHyperoptObjective(args, handler_config, symbols, top_features, verbose=args.verbose)
 
     # 运行搜索
     trials = Trials()
@@ -573,6 +581,10 @@ def main():
     parser.add_argument('--vol-medium', type=float, default=0.25)
     parser.add_argument('--stop-loss', type=float, default=-0.15)
     parser.add_argument('--no-sell-after-drop', type=float, default=-0.20)
+
+    # 输出控制
+    parser.add_argument('--verbose', action='store_true',
+                        help='Show detailed training logs for each trial')
 
     args = parser.parse_args()
 

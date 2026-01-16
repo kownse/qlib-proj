@@ -89,8 +89,8 @@ CV_FOLDS = [
 # 最终测试集
 FINAL_TEST = {
     'train_start': '2018-01-01',
-    'train_end': '2024-12-31',
-    'valid_start': '2024-10-01',
+    'train_end': '2024-09-30',    # 修复：避免与验证集重叠
+    'valid_start': '2024-10-01',  # 验证集（无重叠）
     'valid_end': '2024-12-31',
     'test_start': '2025-01-01',
     'test_end': '2025-12-31',

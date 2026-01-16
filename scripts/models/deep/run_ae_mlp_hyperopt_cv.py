@@ -111,8 +111,8 @@ CV_FOLDS = [
 # 最终测试集 (完全独立)
 FINAL_TEST = {
     'train_start': '2000-01-01',
-    'train_end': '2024-12-31',
-    'valid_start': '2024-10-01',  # 用最近3个月做早停
+    'train_end': '2024-09-30',    # 修复：训练到 2024-09-30
+    'valid_start': '2024-10-01',  # 验证从 2024-10-01 开始（无重叠）
     'valid_end': '2024-12-31',
     'test_start': '2025-01-01',
     'test_end': '2025-12-31',
@@ -412,6 +412,7 @@ class CVHyperoptObjective:
                     callbacks.EarlyStopping(
                         monitor='val_action_loss',
                         patience=self.early_stop,
+                        min_delta=1e-5,
                         restore_best_weights=True,
                         verbose=0,
                         mode='min'
@@ -580,6 +581,7 @@ def train_final_model(args, handler_config, symbols, best_params):
         callbacks.EarlyStopping(
             monitor='val_action_loss',
             patience=args.early_stop,
+            min_delta=1e-5,  # 最小改善阈值，避免微小改善导致训练过长
             restore_best_weights=True,
             verbose=1,
             mode='min'
