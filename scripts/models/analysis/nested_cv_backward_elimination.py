@@ -520,6 +520,23 @@ def validate_v7_features(symbols) -> Tuple[Dict[str, str], List[str]]:
     return valid_stock, valid_macro
 
 
+def _save_checkpoint(output_dir: Path, round_num: int, current_ic: float,
+                     current_stock: Dict, current_macro: List,
+                     protected_features: set, history: List):
+    """保存 checkpoint 到文件"""
+    checkpoint = {
+        'round': round_num,
+        'current_ic': current_ic,
+        'current_stock_features': current_stock,
+        'current_macro_features': current_macro,
+        'protected_features': list(protected_features),
+        'history': history,
+    }
+    checkpoint_file = output_dir / "backward_elimination_checkpoint.json"
+    with open(checkpoint_file, 'w') as f:
+        json.dump(checkpoint, f, indent=2)
+
+
 def run_backward_elimination(
     symbols,
     stock_features: Dict[str, str],
@@ -640,6 +657,12 @@ def run_backward_elimination(
                         protected_features.add(name)
                         newly_protected.append(name)
                         symbol = "🛡️"  # 标记为受保护
+
+                        # 立即保存受保护特征到 checkpoint
+                        if output_dir:
+                            _save_checkpoint(output_dir, round_num, current_ic,
+                                           current_stock, current_macro,
+                                           protected_features, history)
                     else:
                         symbol = "+" if ic_change >= 0 else ""
 
@@ -685,6 +708,12 @@ def run_backward_elimination(
                         protected_features.add(name)
                         newly_protected.append(name)
                         symbol = "🛡️"  # 标记为受保护
+
+                        # 立即保存受保护特征到 checkpoint
+                        if output_dir:
+                            _save_checkpoint(output_dir, round_num, current_ic,
+                                           current_stock, current_macro,
+                                           protected_features, history)
                     else:
                         symbol = "+" if ic_change >= 0 else ""
 
