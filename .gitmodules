@@ -1,3 +1,6 @@
 [submodule "autogluon"]
 	path = autogluon
 	url = https://github.com/autogluon/autogluon.git
+[submodule "qlib-src"]
+	path = qlib-src
+	url = https://github.com/microsoft/qlib.git
