@@ -16,7 +16,7 @@ from datetime import datetime
 
 # 确保项目路径正确
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
-sys.path.insert(0, str(PROJECT_ROOT / "qlib"))  # 添加 qlib 源码路径
+sys.path.insert(0, str(PROJECT_ROOT / "qlib-src"))  # 添加 qlib 源码路径
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))  # 添加 scripts 路径
 
 import pandas as pd
@@ -99,7 +99,7 @@ def convert_to_qlib_bin(csv_dir: Path, qlib_dir: Path):
     import sys
 
     # 把 scripts 目录加到 path
-    scripts_path = str(PROJECT_ROOT / "qlib" / "scripts")
+    scripts_path = str(PROJECT_ROOT / "qlib-src" / "scripts")
     if scripts_path not in sys.path:
         sys.path.insert(0, scripts_path)
 
