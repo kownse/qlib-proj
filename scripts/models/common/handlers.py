@@ -141,6 +141,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V8 (~22 features: AE-MLP permutation importance)',
         'use_talib': True,
     },
+    'alpha158-enhanced-v9': {
+        'module': 'data.datahandler_enhanced_v9',
+        'class_name': 'Alpha158_Enhanced_V9',
+        'description': 'Alpha158 Enhanced V9 (~11 features: AE-MLP forward selection optimal)',
+        'use_talib': True,
+    },
 }
 
 
