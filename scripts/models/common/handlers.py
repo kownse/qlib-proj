@@ -147,6 +147,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V9 (~11 features: AE-MLP forward selection optimal)',
         'use_talib': True,
     },
+    'alpha158-enhanced-v10': {
+        'module': 'data.datahandler_enhanced_v10',
+        'class_name': 'Alpha158_Enhanced_V10',
+        'description': 'Alpha158 Enhanced V10 (~37 features: nested CV backward elimination protected)',
+        'use_talib': True,
+    },
 }
 
 
