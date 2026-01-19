@@ -70,6 +70,7 @@ def add_tcn_args(parser):
 HANDLER_D_FEAT = {
     'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
     'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
+    'alpha300-ts': 5,        # 5 features × 60 timesteps (time-series norm for TCN/LSTM)
     'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
     'alpha158': 158,         # No temporal structure
     'alpha158_vol': 158,

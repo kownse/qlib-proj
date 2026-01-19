@@ -49,6 +49,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha300 (300 features - 60 days OHLC+V, no VWAP, for US data)',
         'use_talib': False,
     },
+    'alpha300-ts': {
+        'module': 'data.datahandler_ext',
+        'class_name': 'Alpha300_TS_Volatility',
+        'description': 'Alpha300 for TCN/LSTM/Transformer (time-series normalization)',
+        'use_talib': False,
+    },
     'alpha158-talib': {
         'module': 'data.datahandler_ext',
         'class_name': 'Alpha158_Volatility_TALib',

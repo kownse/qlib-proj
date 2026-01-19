@@ -270,6 +270,21 @@ _ALPHA300_LEARN_PROCESSORS = [
 ]
 
 
+# Alpha300 时序模型专用的 learn_processors（适用于 TCN/LSTM/Transformer）
+# 关键区别：使用 RobustZScoreNorm（时序标准化）而非 CSZScoreNorm（横截面标准化）
+# CSZScoreNorm 会破坏时序模式，因为它在每个时间点跨所有股票标准化
+# RobustZScoreNorm 在整个训练期间对每个特征全局标准化，保留时序模式
+_ALPHA300_TS_LEARN_PROCESSORS = [
+    {"class": "DropnaLabel"},
+    {"class": "ProcessInf", "kwargs": {}},
+    {"class": "Fillna", "kwargs": {}},
+    {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature"}},
+    {"class": "ProcessInf", "kwargs": {}},
+    {"class": "Fillna", "kwargs": {}},
+    {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},  # 标签仍用横截面，便于排序
+]
+
+
 class Alpha300(DataHandlerLP):
     """
     Alpha300 数据处理器（不含 VWAP）。
@@ -373,6 +388,75 @@ class Alpha300_Volatility(Alpha300):
             fields: 标签表达式列表
             names: 标签名称列表
         """
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]
+
+
+class Alpha300_TS_Volatility(DataHandlerLP):
+    """
+    Alpha300 时序模型专用版本 + N天价格波动率标签（适用于 TCN/LSTM/Transformer）。
+
+    与 Alpha300_Volatility 的关键区别：
+    - 使用 RobustZScoreNorm（时序标准化）而非 CSZScoreNorm（横截面标准化）
+    - CSZScoreNorm 在每个时间点跨所有股票标准化，会破坏单只股票的时序模式
+    - RobustZScoreNorm 对每个特征在整个训练期间全局标准化，保留时序模式
+
+    特征说明：
+    - 使用最近 60 天的价格和成交量数据
+    - 包含 CLOSE, OPEN, HIGH, LOW, VOLUME 各 60 天历史（不含 VWAP）
+    - 总共 300 个特征 (5 × 60)
+    - d_feat = 5，适用于 TCN/LSTM/Transformer
+    """
+
+    def __init__(
+        self,
+        volatility_window=2,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        learn_processors=None,
+        fit_start_time=None,
+        fit_end_time=None,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        self.volatility_window = volatility_window
+
+        # 使用时序模型专用的处理器
+        if learn_processors is None:
+            learn_processors = _ALPHA300_TS_LEARN_PROCESSORS
+
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": Alpha300DL.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            learn_processors=learn_processors,
+            infer_processors=infer_processors,
+            **kwargs,
+        )
+
+    def get_label_config(self):
+        """返回N天波动率标签"""
         volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [volatility_expr], ["LABEL0"]
 
