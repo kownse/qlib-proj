@@ -75,11 +75,72 @@ from models.common import (
 HANDLER_D_FEAT = {
     'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
     'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
+    'alpha300-ts': 5,        # 5 features × 60 timesteps (time-series norm for TCN/LSTM)
     'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
     'alpha158': 158,
     'alpha158-talib': 158,
     'alpha158-talib-lite': 158,
 }
+
+
+def normalize_data(X, fit_stats=None):
+    """
+    对数据进行归一化处理：3σ clip + zscore
+
+    借鉴自 run_tcn.py 的数据处理方式。
+
+    Args:
+        X: numpy array 或 DataFrame
+        fit_stats: 训练集统计量 (mean, std)，如果为 None 则从 X 计算
+
+    Returns:
+        normalized_X: 归一化后的数据 (numpy array)
+        stats: 统计量 (mean, std)，可用于测试数据
+    """
+    if isinstance(X, pd.DataFrame):
+        X_df = X.copy()
+    else:
+        X_df = pd.DataFrame(X)
+
+    # 处理 NaN 和 inf
+    X_df = X_df.fillna(0)
+    X_df = X_df.replace([np.inf, -np.inf], 0)
+
+    if fit_stats is None:
+        # 计算统计量
+        means = X_df.mean().values
+        stds = X_df.std().values
+        stds = np.where(stds == 0, 1, stds)  # 避免除以0
+    else:
+        means, stds = fit_stats
+
+    # 按列进行 3σ clip + zscore 归一化
+    X_values = X_df.values.copy()
+    for i in range(X_values.shape[1]):
+        col_mean = means[i]
+        col_std = stds[i]
+        if col_std > 0:
+            lower = col_mean - 3 * col_std
+            upper = col_mean + 3 * col_std
+            X_values[:, i] = np.clip(X_values[:, i], lower, upper)
+            X_values[:, i] = (X_values[:, i] - col_mean) / col_std
+
+    # 最终处理
+    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return X_values, (means, stds)
+
+
+def print_data_quality(X, name="Data"):
+    """打印数据质量诊断信息"""
+    nan_count = np.isnan(X).sum()
+    inf_count = np.isinf(X).sum()
+    print(f"    {name} shape: {X.shape}")
+    print(f"    {name} NaN count: {nan_count} ({nan_count / X.size * 100:.2f}%)")
+    print(f"    {name} Inf count: {inf_count}")
+    valid_values = X[~np.isnan(X) & ~np.isinf(X)]
+    if len(valid_values) > 0:
+        print(f"    {name} value range: [{valid_values.min():.4f}, {valid_values.max():.4e}]")
 
 
 def create_tcn_model(d_feat, n_chans, num_layers, kernel_size, dropout, device):
@@ -140,14 +201,28 @@ class OptunaObjective:
             handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
             dataset = create_dataset_for_fold(handler, fold)
 
-            X_train, y_train, _ = prepare_data_from_dataset(dataset, "train")
-            X_valid, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
+            X_train_raw, y_train, _ = prepare_data_from_dataset(dataset, "train")
+            X_valid_raw, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
 
             if self.total_features is None:
-                self.total_features = X_train.shape[1]
+                self.total_features = X_train_raw.shape[1]
                 self.d_feat = HANDLER_D_FEAT.get(args.handler, self.total_features)
                 if self.total_features % self.d_feat != 0:
                     self.d_feat = self.total_features
+
+            # 数据质量诊断（首次）
+            if len(self.fold_data) == 0:
+                print(f"\n    [*] Data Quality Diagnostic (before normalization):")
+                print_data_quality(X_train_raw, "Train")
+
+            # 对数据进行归一化处理（借鉴 run_tcn.py）
+            X_train, train_stats = normalize_data(X_train_raw)
+            X_valid, _ = normalize_data(X_valid_raw, fit_stats=train_stats)
+
+            # 归一化后的数据诊断（首次）
+            if len(self.fold_data) == 0:
+                print(f"\n    [*] Data Quality Diagnostic (after normalization):")
+                print_data_quality(X_train, "Train (normalized)")
 
             self.fold_data.append({
                 'name': fold['name'],
@@ -156,6 +231,7 @@ class OptunaObjective:
                 'X_valid': X_valid,
                 'y_valid': y_valid,
                 'valid_index': valid_index,
+                'train_stats': train_stats,  # 保存统计量
             })
 
             print(f"      Train: {X_train.shape}, Valid: {X_valid.shape}")
@@ -426,11 +502,27 @@ def train_final_model(args, handler_config, symbols, best_params, d_feat, total_
     handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
-    X_train, y_train, _ = prepare_data_from_dataset(dataset, "train")
-    X_valid, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
-    X_test, y_test, test_index = prepare_data_from_dataset(dataset, "test")
+    X_train_raw, y_train, _ = prepare_data_from_dataset(dataset, "train")
+    X_valid_raw, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
+    X_test_raw, y_test, test_index = prepare_data_from_dataset(dataset, "test")
 
-    print(f"    Train: {X_train.shape}, Valid: {X_valid.shape}, Test: {X_test.shape}")
+    print(f"    Raw data - Train: {X_train_raw.shape}, Valid: {X_valid_raw.shape}, Test: {X_test_raw.shape}")
+
+    # 数据质量诊断（归一化前）
+    print("\n    [*] Data Quality Diagnostic (before normalization):")
+    print_data_quality(X_train_raw, "Train")
+
+    # 对数据进行归一化处理（借鉴 run_tcn.py）
+    X_train, train_stats = normalize_data(X_train_raw)
+    X_valid, _ = normalize_data(X_valid_raw, fit_stats=train_stats)
+    X_test, _ = normalize_data(X_test_raw, fit_stats=train_stats)
+
+    # 数据质量诊断（归一化后）
+    print("\n    [*] Data Quality Diagnostic (after normalization):")
+    print_data_quality(X_train, "Train (normalized)")
+    print_data_quality(X_test, "Test (normalized)")
+
+    print(f"\n    Normalized data - Train: {X_train.shape}, Valid: {X_valid.shape}, Test: {X_test.shape}")
 
     # 设置设备
     if args.gpu >= 0 and torch.cuda.is_available():
