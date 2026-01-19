@@ -25,9 +25,6 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 抑制 TensorFlow 日志
 os.environ['OMP_NUM_THREADS'] = '4'
 os.environ['MKL_NUM_THREADS'] = '4'
-os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # 优化 GPU 线程
-# 注意: XLA 和混合精度可能导致数值不稳定，默认禁用
-# os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'  # 启用 XLA JIT 编译
 
 import sys
 from pathlib import Path
@@ -62,8 +59,8 @@ from hyperopt.pyll import scope
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, Model, callbacks
-from tensorflow.keras import mixed_precision
 
+from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 from utils.utils import evaluate_model
@@ -78,15 +75,48 @@ from models.common import (
     create_meta_data,
     generate_model_filename,
     run_backtest,
-    CV_FOLDS,
-    FINAL_TEST,
-    create_data_handler_for_fold,
-    create_dataset_for_fold,
-    prepare_data_from_dataset,
-    compute_ic,
 )
 
 from models.deep.ae_mlp_model import AEMLP
+
+
+# ============================================================================
+# 时间序列交叉验证的 Fold 配置
+# ============================================================================
+
+CV_FOLDS = [
+    {
+        'name': 'Fold 1 (valid 2022)',
+        'train_start': '2000-01-01',
+        'train_end': '2021-12-31',
+        'valid_start': '2022-01-01',
+        'valid_end': '2022-12-31',
+    },
+    {
+        'name': 'Fold 2 (valid 2023)',
+        'train_start': '2000-01-01',
+        'train_end': '2022-12-31',
+        'valid_start': '2023-01-01',
+        'valid_end': '2023-12-31',
+    },
+    {
+        'name': 'Fold 3 (valid 2024)',
+        'train_start': '2000-01-01',
+        'train_end': '2023-12-31',
+        'valid_start': '2024-01-01',
+        'valid_end': '2024-12-31',
+    },
+]
+
+# 最终测试集 (完全独立)
+FINAL_TEST = {
+    'train_start': '2000-01-01',
+    'train_end': '2024-09-30',    # 修复：训练到 2024-09-30
+    'valid_start': '2024-10-01',  # 验证从 2024-10-01 开始（无重叠）
+    'valid_end': '2024-12-31',
+    'test_start': '2025-01-01',
+    'test_end': '2025-12-31',
+}
 
 
 # ============================================================================
@@ -108,8 +138,8 @@ SEARCH_SPACE = {
     # 学习率
     'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-2)),
 
-    # Batch size - 默认保守值，可通过 --max-batch-size 调整
-    'batch_size': hp.choice('batch_size', [1024, 2048, 4096]),
+    # Batch size
+    'batch_size': hp.choice('batch_size', [1024, 2048, 4096, 8192]),
 
     # 损失权重
     'loss_decoder': hp.uniform('loss_decoder', 0.01, 0.3),
@@ -153,33 +183,76 @@ def create_ae_mlp_params(hyperparams: dict, num_columns: int) -> dict:
     }
 
 
-def create_tf_dataset(X, y, batch_size, shuffle=True, prefetch=True):
-    """
-    创建优化的 tf.data.Dataset。
+def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
+    """为特定 fold 创建 DataHandler"""
+    from models.common.handlers import get_handler_class
 
-    使用 prefetch 提升数据加载效率，减少 CPU-GPU 数据传输瓶颈。
-    注意: 不使用 cache() 以避免大数据集时的内存问题。
-    """
-    # 创建多输出的目标字典
-    outputs = {
-        'decoder': X,
-        'ae_action': y,
-        'action': y,
+    HandlerClass = get_handler_class(args.handler)
+
+    # 确定数据的结束时间
+    if 'test_end' in fold_config:
+        end_time = fold_config['test_end']
+    else:
+        end_time = fold_config['valid_end']
+
+    handler = HandlerClass(
+        volatility_window=args.nday,
+        instruments=symbols,
+        start_time=fold_config['train_start'],
+        end_time=end_time,
+        fit_start_time=fold_config['train_start'],
+        fit_end_time=fold_config['train_end'],
+        infer_processors=[],
+    )
+
+    return handler
+
+
+def create_dataset_for_fold(handler, fold_config):
+    """为特定 fold 创建 Dataset"""
+    segments = {
+        "train": (fold_config['train_start'], fold_config['train_end']),
+        "valid": (fold_config['valid_start'], fold_config['valid_end']),
     }
 
-    dataset = tf.data.Dataset.from_tensor_slices((X, outputs))
+    if 'test_start' in fold_config:
+        segments["test"] = (fold_config['test_start'], fold_config['test_end'])
 
-    if shuffle:
-        # 使用较小的 buffer_size 以减少内存占用
-        dataset = dataset.shuffle(buffer_size=min(len(X), 50000))
+    return DatasetH(handler=handler, segments=segments)
 
-    dataset = dataset.batch(batch_size)
 
-    if prefetch:
-        # prefetch(tf.data.AUTOTUNE) 让 TensorFlow 自动决定预取数量
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+def prepare_data_from_dataset(dataset: DatasetH, segment: str):
+    """从 Dataset 准备数据"""
+    features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
 
-    return dataset
+    # 处理 NaN 和异常值
+    features = features.fillna(0)
+    features = features.replace([np.inf, -np.inf], 0)
+    features = features.clip(-10, 10)
+
+    try:
+        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
+        if isinstance(labels, pd.DataFrame):
+            labels = labels.iloc[:, 0]
+        labels = labels.fillna(0).values
+        return features.values, labels, features.index
+    except Exception:
+        return features.values, None, features.index
+
+
+def compute_ic(pred, label, index):
+    """计算 IC (按日期分组的相关系数平均值)"""
+    df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
+    ic_by_date = df.groupby(level='datetime').apply(
+        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+    )
+    ic_by_date = ic_by_date.dropna()
+    if len(ic_by_date) == 0:
+        return 0.0, 0.0, 0.0
+    mean_ic = ic_by_date.mean()
+    ic_std = ic_by_date.std()
+    icir = mean_ic / ic_std if ic_std > 0 else 0
+    return mean_ic, ic_std, icir
 
 
 def build_ae_mlp_model(params: dict) -> Model:
@@ -203,14 +276,14 @@ def build_ae_mlp_model(params: dict) -> Model:
 
     # Decoder (重建原始输入)
     decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
+    decoder = layers.Dense(num_columns, name='decoder')(decoder)
 
     # 辅助预测分支 (基于 decoder 输出)
     x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
     x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
     x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
     x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, dtype='float32', name='ae_action')(x_ae)
+    out_ae = layers.Dense(1, name='ae_action')(x_ae)
 
     # 主分支: 原始特征 + encoder 特征
     x = layers.Concatenate(name='concat')([x0, encoder])
@@ -225,8 +298,8 @@ def build_ae_mlp_model(params: dict) -> Model:
         x = layers.Activation('swish', name=f'main_act{i-1}')(x)
         x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
 
-    # 主输出 (使用 float32 确保数值稳定性)
-    out = layers.Dense(1, dtype='float32', name='action')(x)
+    # 主输出
+    out = layers.Dense(1, name='action')(x)
 
     model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
 
@@ -246,27 +319,17 @@ def build_ae_mlp_model(params: dict) -> Model:
 class CVHyperoptObjective:
     """时间序列交叉验证的 Hyperopt 目标函数"""
 
-    def __init__(self, args, handler_config, symbols, n_epochs=30, early_stop=5, gpu=0,
-                 use_mixed_precision=False, prefetch_to_gpu=True, max_batch_size=4096):
+    def __init__(self, args, handler_config, symbols, n_epochs=30, early_stop=5, gpu=0):
         self.args = args
         self.handler_config = handler_config
         self.symbols = symbols
         self.n_epochs = n_epochs
         self.early_stop = early_stop
         self.gpu = gpu
-        self.use_mixed_precision = use_mixed_precision
-        self.prefetch_to_gpu = prefetch_to_gpu
         self.trial_count = 0
         self.best_mean_ic = -float('inf')
 
-        # 根据 max_batch_size 生成 batch size 选项
-        all_batch_sizes = [512, 1024, 2048, 4096, 8192, 16384]
-        self.batch_size_choices = [b for b in all_batch_sizes if b <= max_batch_size]
-        if not self.batch_size_choices:
-            self.batch_size_choices = [512]  # 最小值
-        print(f"    Batch size choices: {self.batch_size_choices}")
-
-        # 设置 GPU (在数据准备之前，以便正确配置混合精度)
+        # 设置 GPU
         self._setup_gpu()
 
         # 预先准备所有 fold 的数据
@@ -300,18 +363,13 @@ class CVHyperoptObjective:
         print(f"    Feature count: {self.num_columns}")
 
     def _setup_gpu(self):
-        """配置 GPU，支持混合精度"""
+        """配置 GPU"""
         gpus = tf.config.list_physical_devices('GPU')
         if self.gpu >= 0 and gpus:
             try:
                 tf.config.set_visible_devices(gpus[self.gpu], 'GPU')
                 tf.config.experimental.set_memory_growth(gpus[self.gpu], True)
                 print(f"    Using GPU: {gpus[self.gpu]}")
-
-                # 启用混合精度训练 (FP16) - 大幅提升 GPU 利用率
-                if self.use_mixed_precision:
-                    mixed_precision.set_global_policy('mixed_float16')
-                    print("    Mixed precision (FP16) enabled")
             except RuntimeError as e:
                 print(f"    GPU setup error: {e}")
         else:
@@ -324,10 +382,7 @@ class CVHyperoptObjective:
 
         # 转换参数
         model_params = create_ae_mlp_params(hyperparams, self.num_columns)
-        # 使用动态 batch_size_choices 替换静态值
-        batch_size_idx = hyperparams['batch_size']
-        batch_size = self.batch_size_choices[batch_size_idx % len(self.batch_size_choices)]
-        model_params['batch_size'] = batch_size
+        batch_size = model_params['batch_size']
 
         fold_ics = []
         fold_results = []
@@ -337,22 +392,20 @@ class CVHyperoptObjective:
                 # 清理之前的模型
                 tf.keras.backend.clear_session()
 
-                # 重新设置混合精度 (clear_session 会重置)
-                if self.use_mixed_precision:
-                    mixed_precision.set_global_policy('mixed_float16')
-
                 # 构建模型
                 model = build_ae_mlp_model(model_params)
 
-                # 使用 tf.data.Dataset 优化数据加载
-                train_dataset = create_tf_dataset(
-                    fold['X_train'], fold['y_train'],
-                    batch_size=batch_size, shuffle=True, prefetch=True
-                )
-                valid_dataset = create_tf_dataset(
-                    fold['X_valid'], fold['y_valid'],
-                    batch_size=batch_size, shuffle=False, prefetch=True
-                )
+                # 训练数据
+                train_outputs = {
+                    'decoder': fold['X_train'],
+                    'ae_action': fold['y_train'],
+                    'action': fold['y_train'],
+                }
+                valid_outputs = {
+                    'decoder': fold['X_valid'],
+                    'ae_action': fold['y_valid'],
+                    'action': fold['y_valid'],
+                }
 
                 # 回调
                 cb_list = [
@@ -366,11 +419,13 @@ class CVHyperoptObjective:
                     ),
                 ]
 
-                # 训练 (使用 Dataset API)
+                # 训练
                 history = model.fit(
-                    train_dataset,
-                    validation_data=valid_dataset,
+                    fold['X_train'],
+                    train_outputs,
+                    validation_data=(fold['X_valid'], valid_outputs),
                     epochs=self.n_epochs,
+                    batch_size=batch_size,
                     callbacks=cb_list,
                     verbose=0,
                 )
@@ -432,8 +487,7 @@ class CVHyperoptObjective:
             }
 
 
-def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=False,
-                           use_prefetch=True, max_batch_size=4096):
+def run_hyperopt_cv_search(args, handler_config, symbols):
     """运行时间序列交叉验证的超参数搜索"""
     print("\n" + "=" * 70)
     print("HYPEROPT SEARCH WITH TIME-SERIES CROSS-VALIDATION (AE-MLP)")
@@ -444,7 +498,6 @@ def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=Fa
               f"valid {fold['valid_start']}~{fold['valid_end']}")
     print(f"Max evaluations: {args.max_evals}")
     print(f"Epochs per trial: {args.cv_epochs}")
-    print(f"Max batch size: {max_batch_size}")
     print("=" * 70)
 
     # 创建目标函数
@@ -452,10 +505,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=Fa
         args, handler_config, symbols,
         n_epochs=args.cv_epochs,
         early_stop=args.cv_early_stop,
-        gpu=args.gpu,
-        use_mixed_precision=use_mixed_precision,
-        prefetch_to_gpu=use_prefetch,
-        max_batch_size=max_batch_size
+        gpu=args.gpu
     )
 
     # 运行搜索
@@ -474,8 +524,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=Fa
     # 获取最佳结果
     best_params = create_ae_mlp_params(best, objective.num_columns)
     # 需要处理 hp.choice 的 batch_size
-    batch_size_choices = objective.batch_size_choices
-    best_params['batch_size'] = batch_size_choices[best['batch_size']]
+    best_params['batch_size'] = [1024, 2048, 4096, 8192][best['batch_size']]
 
     best_trial_idx = np.argmin([t['result']['loss'] for t in trials.trials])
     best_trial = trials.trials[best_trial_idx]['result']
@@ -499,7 +548,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=Fa
     return best_params, trials, best_trial, objective.num_columns
 
 
-def train_final_model(args, handler_config, symbols, best_params, use_mixed_precision=False):
+def train_final_model(args, handler_config, symbols, best_params):
     """使用最优参数在完整数据上训练最终模型"""
     print("\n[*] Training final model on full data...")
     print("    Parameters:")
@@ -525,11 +574,6 @@ def train_final_model(args, handler_config, symbols, best_params, use_mixed_prec
 
     # 清理并构建模型
     tf.keras.backend.clear_session()
-
-    # 重新设置混合精度 (clear_session 会重置)
-    if use_mixed_precision:
-        mixed_precision.set_global_policy('mixed_float16')
-
     model = build_ae_mlp_model(best_params)
 
     # 回调
@@ -552,22 +596,26 @@ def train_final_model(args, handler_config, symbols, best_params, use_mixed_prec
         ),
     ]
 
-    # 使用 tf.data.Dataset 优化数据加载
-    train_dataset = create_tf_dataset(
-        X_train, y_train,
-        batch_size=best_params['batch_size'], shuffle=True, prefetch=True
-    )
-    valid_dataset = create_tf_dataset(
-        X_valid, y_valid,
-        batch_size=best_params['batch_size'], shuffle=False, prefetch=True
-    )
+    # 训练数据
+    train_outputs = {
+        'decoder': X_train,
+        'ae_action': y_train,
+        'action': y_train,
+    }
+    valid_outputs = {
+        'decoder': X_valid,
+        'ae_action': y_valid,
+        'action': y_valid,
+    }
 
     # 训练
     print("\n    Training progress:")
     model.fit(
-        train_dataset,
-        validation_data=valid_dataset,
+        X_train,
+        train_outputs,
+        validation_data=(X_valid, valid_outputs),
         epochs=args.n_epochs,
+        batch_size=best_params['batch_size'],
         callbacks=cb_list,
         verbose=1,
     )
@@ -621,14 +669,6 @@ def main():
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
 
-    # GPU 优化参数
-    parser.add_argument('--mixed-precision', action='store_true',
-                        help='Enable mixed precision (FP16) training (may cause numerical instability)')
-    parser.add_argument('--no-prefetch', action='store_true',
-                        help='Disable tf.data prefetching')
-    parser.add_argument('--max-batch-size', type=int, default=4096,
-                        help='Maximum batch size (reduce if OOM, default: 4096)')
-
     # 回测参数
     parser.add_argument('--backtest', action='store_true')
     parser.add_argument('--topk', type=int, default=10)
@@ -644,10 +684,6 @@ def main():
     handler_config = HANDLER_CONFIG[args.handler]
     symbols = STOCK_POOLS[args.stock_pool]
 
-    # GPU 优化设置
-    use_mixed_precision = args.mixed_precision and args.gpu >= 0
-    use_prefetch = not args.no_prefetch
-
     # 打印头部
     print("=" * 70)
     print("AE-MLP Hyperopt with Time-Series Cross-Validation")
@@ -659,11 +695,6 @@ def main():
     print(f"CV epochs: {args.cv_epochs}")
     print(f"CV Folds: {len(CV_FOLDS)}")
     print(f"GPU: {args.gpu}")
-    print(f"GPU Optimizations:")
-    print(f"  - Mixed precision (FP16): {'ON' if use_mixed_precision else 'OFF'}")
-    print(f"  - tf.data prefetch: {'ON' if use_prefetch else 'OFF'}")
-    print(f"  - XLA JIT compilation: OFF (disabled for numerical stability)")
-    print(f"  - Max batch size: {args.max_batch_size} (use --max-batch-size to adjust)")
     print("=" * 70)
 
     # 初始化
@@ -671,10 +702,7 @@ def main():
 
     # 运行 CV 超参数搜索
     best_params, trials, best_trial, num_columns = run_hyperopt_cv_search(
-        args, handler_config, symbols,
-        use_mixed_precision=use_mixed_precision,
-        use_prefetch=use_prefetch,
-        max_batch_size=args.max_batch_size
+        args, handler_config, symbols
     )
 
     # 保存搜索结果
@@ -721,8 +749,7 @@ def main():
 
     # 训练最终模型
     model, test_pred, dataset = train_final_model(
-        args, handler_config, symbols, best_params,
-        use_mixed_precision=use_mixed_precision
+        args, handler_config, symbols, best_params
     )
 
     # 评估

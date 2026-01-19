@@ -111,10 +111,6 @@ for i, arg in enumerate(sys.argv):
 
 setup_gpu_early(_gpu_id, _gpu_memory)
 
-# 启用混合精度训练，减少显存占用
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
-print("[GPU] Mixed precision (float16) enabled for memory optimization")
-
 from tensorflow import keras
 from tensorflow.keras import layers, Model, callbacks
 
@@ -809,7 +805,7 @@ def main():
         gpu_info += f" (memory limit: {args.gpu_memory}MB)"
     print(gpu_info)
     print(f"Max samples per fold: {args.max_samples:,}")
-    print("Memory optimization: ON (mixed_float16 + on-demand loading)")
+    print("Memory optimization: ON (on-demand loading)")
     print("=" * 70)
 
     # 初始化
