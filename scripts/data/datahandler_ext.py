@@ -253,11 +253,19 @@ class Alpha300DL:
 
 
 # Alpha300 专用的 learn_processors，包含 NaN 和极端值处理
+# 处理顺序：
+# 1. DropnaLabel: 删除标签为 NaN 的行（必须有有效标签才能训练）
+# 2. ProcessInf: 将 Inf/-Inf 转为 NaN
+# 3. Fillna: 填充 NaN 为 0（处理 60 天 lookback 导致的缺失值）
+# 4. CSZScoreNorm: 横截面 Z-score 标准化
+# 5. ProcessInf + Fillna: 再次处理，防止 CSZScoreNorm 因 std=0 产生 NaN/Inf
 _ALPHA300_LEARN_PROCESSORS = [
     {"class": "DropnaLabel"},
     {"class": "ProcessInf", "kwargs": {}},
     {"class": "Fillna", "kwargs": {}},
     {"class": "CSZScoreNorm", "kwargs": {"fields_group": "feature"}},
+    {"class": "ProcessInf", "kwargs": {}},
+    {"class": "Fillna", "kwargs": {}},
     {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
 ]
 

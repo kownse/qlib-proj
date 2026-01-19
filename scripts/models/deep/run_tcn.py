@@ -100,7 +100,9 @@ def main():
     analyze_label_distribution(dataset)
 
     # 获取实际的特征数量（从训练数据中）
-    actual_train_data = dataset.prepare("train", col_set="feature")
+    # 使用 DK_L 获取经过 learn_processors 处理后的数据
+    from qlib.data.dataset.handler import DataHandlerLP
+    actual_train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
     total_features = actual_train_data.shape[1]
     print(f"\n    Actual training data shape: {actual_train_data.shape}")
 
