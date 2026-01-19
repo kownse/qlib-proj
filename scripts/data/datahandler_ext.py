@@ -186,6 +186,173 @@ class Alpha180_Volatility(Alpha180):
         return [volatility_expr], ["LABEL0"]
 
 
+# ============================================================================
+# Alpha300: 60天 OHLCV 数据，不含 VWAP (5 × 60 = 300 特征)
+# 专为 US 股票数据设计，因为 VWAP 在 US 数据中通常缺失
+# ============================================================================
+
+class Alpha300DL:
+    """
+    Alpha300 数据加载器的特征配置。
+
+    类似于 Alpha360，但**不包含 VWAP**（US 股票数据中 VWAP 通常 100% 缺失）。
+    包含 CLOSE, OPEN, HIGH, LOW, VOLUME 各 60 天历史。
+    所有价格数据用当前 $close 标准化，成交量用当前 $volume 标准化。
+    总共 300 个特征 (5 × 60)。
+    """
+
+    @staticmethod
+    def get_feature_config():
+        """
+        获取 Alpha300 特征配置（不含 VWAP）。
+
+        Returns:
+            tuple: (fields, names) 特征表达式和名称列表
+        """
+        fields = []
+        names = []
+
+        # CLOSE: 60 天历史收盘价，用当前收盘价标准化
+        for i in range(59, 0, -1):
+            fields += ["Ref($close, %d)/$close" % i]
+            names += ["CLOSE%d" % i]
+        fields += ["$close/$close"]
+        names += ["CLOSE0"]
+
+        # OPEN: 60 天历史开盘价，用当前收盘价标准化
+        for i in range(59, 0, -1):
+            fields += ["Ref($open, %d)/$close" % i]
+            names += ["OPEN%d" % i]
+        fields += ["$open/$close"]
+        names += ["OPEN0"]
+
+        # HIGH: 60 天历史最高价，用当前收盘价标准化
+        for i in range(59, 0, -1):
+            fields += ["Ref($high, %d)/$close" % i]
+            names += ["HIGH%d" % i]
+        fields += ["$high/$close"]
+        names += ["HIGH0"]
+
+        # LOW: 60 天历史最低价，用当前收盘价标准化
+        for i in range(59, 0, -1):
+            fields += ["Ref($low, %d)/$close" % i]
+            names += ["LOW%d" % i]
+        fields += ["$low/$close"]
+        names += ["LOW0"]
+
+        # VOLUME: 60 天历史成交量，用当前成交量标准化
+        # 注意：不包含 VWAP，因为 US 数据中通常缺失
+        for i in range(59, 0, -1):
+            fields += ["Ref($volume, %d)/($volume+1e-12)" % i]
+            names += ["VOLUME%d" % i]
+        fields += ["$volume/($volume+1e-12)"]
+        names += ["VOLUME0"]
+
+        return fields, names
+
+
+class Alpha300(DataHandlerLP):
+    """
+    Alpha300 数据处理器（不含 VWAP）。
+
+    专为 US 股票数据设计，因为 VWAP 在 US 数据中通常 100% 缺失。
+    使用最近 60 天的价格和成交量数据，共 300 个特征。
+
+    特征说明：
+    - CLOSE0-CLOSE59: 收盘价（用当前收盘价标准化）
+    - OPEN0-OPEN59: 开盘价（用当前收盘价标准化）
+    - HIGH0-HIGH59: 最高价（用当前收盘价标准化）
+    - LOW0-LOW59: 最低价（用当前收盘价标准化）
+    - VOLUME0-VOLUME59: 成交量（用当前成交量标准化）
+
+    总共 300 个特征 (5 × 60)，适用于 TCN/LSTM/Transformer 等时序模型。
+    d_feat = 5，seq_len = 60。
+    """
+
+    def __init__(
+        self,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        learn_processors=_DEFAULT_LEARN_PROCESSORS,
+        fit_start_time=None,
+        fit_end_time=None,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": Alpha300DL.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            learn_processors=learn_processors,
+            infer_processors=infer_processors,
+            **kwargs,
+        )
+
+    def get_label_config(self):
+        """默认标签：2天收益率"""
+        return ["Ref($close, -2)/Ref($close, -1) - 1"], ["LABEL0"]
+
+
+class Alpha300_Volatility(Alpha300):
+    """
+    Alpha300 特征 + N天价格波动率标签（不含 VWAP）。
+
+    继承 Alpha300 的所有特征（60天的 OHLCV 数据，不含 VWAP），只修改标签为N天波动率。
+    专为 US 股票数据设计。
+
+    Alpha300 特征说明：
+    - 使用最近 60 天的价格和成交量数据
+    - 包含 CLOSE, OPEN, HIGH, LOW, VOLUME 各 60 天历史（不含 VWAP）
+    - 所有价格数据用当前 $close 标准化
+    - 成交量数据用当前 $volume 标准化
+    - 总共 300 个特征 (5 × 60)
+    - d_feat = 5，适用于 TCN/LSTM/Transformer
+    """
+
+    def __init__(self, volatility_window=2, **kwargs):
+        """
+        初始化波动率预测的 Alpha300 DataHandler。
+
+        Args:
+            volatility_window: 波动率预测窗口（天数）
+            **kwargs: 传递给父类的其他参数
+        """
+        self.volatility_window = volatility_window
+        super().__init__(**kwargs)
+
+    def get_label_config(self):
+        """
+        返回N天波动率标签。
+
+        Returns:
+            fields: 标签表达式列表
+            names: 标签名称列表
+        """
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]
+
+
 class Alpha360_Volatility(Alpha360):
     """
     Alpha360 特征 + N天价格波动率标签

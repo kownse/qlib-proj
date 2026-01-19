@@ -71,8 +71,10 @@ from models.common import (
 
 # Handler d_feat 配置
 # Alpha360-Macro has (6 + M) features × 60 timesteps where M = macro features
+# Alpha300 has 5 features × 60 timesteps (no VWAP, recommended for US data)
 HANDLER_D_FEAT = {
-    'alpha360': 6,
+    'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
+    'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
     'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
     'alpha158': 158,
     'alpha158-talib': 158,

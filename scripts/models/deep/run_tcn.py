@@ -64,10 +64,12 @@ def add_tcn_args(parser):
 
 
 # Alpha360 has 6 base features with 60 timesteps = 360 total
+# Alpha300 has 5 base features with 60 timesteps = 300 total (no VWAP, for US data)
 # Alpha158 has 158 features (no temporal structure, use all as d_feat)
 # Alpha360-Macro has (6 + M) features × 60 timesteps where M = macro features
 HANDLER_D_FEAT = {
-    'alpha360': 6,           # 6 features × 60 timesteps
+    'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
+    'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
     'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
     'alpha158': 158,         # No temporal structure
     'alpha158_vol': 158,

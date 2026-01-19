@@ -40,7 +40,13 @@ HANDLER_REGISTRY = {
     'alpha360': {
         'module': 'data.datahandler_ext',
         'class_name': 'Alpha360_Volatility',
-        'description': 'Alpha360 (360 features - 60 days OHLCV)',
+        'description': 'Alpha360 (360 features - 60 days OHLCV, includes VWAP)',
+        'use_talib': False,
+    },
+    'alpha300': {
+        'module': 'data.datahandler_ext',
+        'class_name': 'Alpha300_Volatility',
+        'description': 'Alpha300 (300 features - 60 days OHLC+V, no VWAP, for US data)',
         'use_talib': False,
     },
     'alpha158-talib': {
