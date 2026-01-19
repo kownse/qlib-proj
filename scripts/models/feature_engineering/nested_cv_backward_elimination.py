@@ -14,8 +14,8 @@
   Fold 4: train 2000-2023, valid 2024
 
 使用方法:
-    python scripts/models/analysis/nested_cv_backward_elimination.py
-    python scripts/models/analysis/nested_cv_backward_elimination.py --stock-pool sp500 --min-features 15
+    python scripts/models/feature_engineering/nested_cv_backward_elimination.py
+    python scripts/models/feature_engineering/nested_cv_backward_elimination.py --stock-pool sp500 --min-features 15
 """
 
 import os

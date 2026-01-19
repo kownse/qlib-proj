@@ -14,8 +14,8 @@
   Fold 4: train 2000-2023, valid 2024
 
 使用方法:
-    python scripts/models/analysis/nested_cv_feature_selection.py --baseline backward_elimination_20260118_224446.json
-    python scripts/models/analysis/nested_cv_feature_selection.py --resume
+    python scripts/models/feature_engineering/nested_cv_feature_selection.py --baseline backward_elimination_20260118_224446.json
+    python scripts/models/feature_engineering/nested_cv_feature_selection.py --resume
 """
 
 import os
@@ -52,7 +52,7 @@ from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
 
 # 导入共享工具
-from models.analysis.feature_selection_utils import (
+from models.feature_engineering.feature_selection_utils import (
     INNER_CV_FOLDS,
     ALL_STOCK_FEATURES,
     ALL_MACRO_FEATURES,

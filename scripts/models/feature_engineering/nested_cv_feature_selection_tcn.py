@@ -14,9 +14,9 @@ TCN 嵌套交叉验证 Forward Selection - 基于 Alpha180 逐步添加 Macro �
   Fold 4: train 2000-2023, valid 2024
 
 使用方法:
-    python scripts/models/analysis/nested_cv_feature_selection_tcn.py --stock-pool sp500
-    python scripts/models/analysis/nested_cv_feature_selection_tcn.py --resume
-    python scripts/models/analysis/nested_cv_feature_selection_tcn.py --resume-from forward_selection_tcn_xxx.json
+    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --stock-pool sp500
+    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --resume
+    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --resume-from forward_selection_tcn_xxx.json
 """
 
 import os
@@ -51,7 +51,7 @@ from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
 
 # 导入共享工具
-from models.analysis.feature_selection_utils import (
+from models.feature_engineering.feature_selection_utils import (
     INNER_CV_FOLDS,
     ALL_TALIB_FEATURES,
     ALL_MACRO_FEATURES,
