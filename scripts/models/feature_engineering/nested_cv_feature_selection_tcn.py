@@ -1,9 +1,9 @@
 """
-TCN 嵌套交叉验证 Forward Selection - 基于 Alpha180 逐步添加 Macro 和 TALib 特征
+TCN 嵌套交叉验证 Forward Selection - 基于 Alpha300 逐步添加 Macro 和 TALib 特征
 
 设计原理:
-- 从 Alpha180 (6 OHLCV × 30 days = 180 features) 作为基线
-- 逐个测试候选特征（macro 和 TALib），每个特征加入过去30天的值
+- 从 Alpha300 (5 OHLCV × 60 days = 300 features) 作为基线 (去掉了全是NaN的VWAP)
+- 逐个测试候选特征（macro 和 TALib），每个特征加入过去60天的值
 - 如果某特征加入后导致 IC 变差，则加入排除列表
 - 后续轮次跳过被排除的特征
 
@@ -45,7 +45,8 @@ from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 import torch
-import torch.nn as nn
+
+from qlib.contrib.model.pytorch_tcn import TCN
 
 from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
@@ -71,60 +72,96 @@ from models.feature_engineering.feature_selection_utils import (
 # TCN 模型配置
 # ============================================================================
 
+# TCN 默认参数（和 run_tcn.py 保持一致）
 DEFAULT_TCN_PARAMS = {
-    "n_chans": 64,
-    "num_layers": 3,
-    "kernel_size": 5,
-    "dropout": 0.3,
-    "lr": 0.001,
-    "batch_size": 2048,
+    "n_chans": 128,      # qlib TCN 默认值
+    "num_layers": 5,     # qlib TCN 默认值
+    "kernel_size": 5,    # qlib TCN 默认值
+    "dropout": 0.5,      # qlib TCN 默认值
+    "lr": 0.0001,        # qlib TCN 默认值
+    "batch_size": 2000,  # qlib TCN 默认值
 }
 
-
-# ============================================================================
-# TCN Model
-# ============================================================================
-
-def create_tcn_model(d_feat, n_chans, num_layers, kernel_size, dropout, device):
-    """创建 TCN 模型"""
-    from qlib.contrib.model.tcn import TemporalConvNet
-
-    class TCNModel(nn.Module):
-        def __init__(self, num_input, output_size, num_channels, kernel_size, dropout):
-            super().__init__()
-            self.num_input = num_input
-            self.tcn = TemporalConvNet(num_input, num_channels, kernel_size, dropout=dropout)
-            self.linear = nn.Linear(num_channels[-1], output_size)
-
-        def forward(self, x):
-            batch_size = x.size(0)
-            seq_len = x.size(1) // self.num_input
-            x = x.view(batch_size, seq_len, self.num_input)
-            x = x.permute(0, 2, 1)  # (batch, features, seq_len)
-            y = self.tcn(x)
-            return self.linear(y[:, :, -1])
-
-    model = TCNModel(
-        num_input=d_feat,
-        output_size=1,
-        num_channels=[n_chans] * num_layers,
-        kernel_size=kernel_size,
-        dropout=dropout,
-    )
-    model.to(device)
-    return model
+# Alpha300 配置: 5 features × 60 timesteps = 300 (去掉了全是NaN的VWAP)
+ALPHA300_SEQ_LEN = 60
+ALPHA300_BASE_FEATURES = 5  # CLOSE, OPEN, HIGH, LOW, VOLUME (no VWAP)
 
 
 # ============================================================================
-# Dynamic Alpha180 Handler with Incremental Features
+# 数据归一化 (借鉴 run_tcn.py)
 # ============================================================================
 
-class DynamicAlpha180Handler(DataHandlerLP):
+def normalize_data(X, fit_stats=None):
     """
-    动态 Alpha180 Handler，支持增量添加 Macro 和 TALib 特征。
+    对数据进行归一化处理：3σ clip + zscore
 
-    基线: Alpha180 (6 OHLCV × 30 days = 180 features)
-    增量特征: 每个 macro/talib 特征扩展为 30 天的历史
+    借鉴自 run_tcn.py 的数据处理方式。
+
+    Args:
+        X: numpy array 或 DataFrame
+        fit_stats: 训练集统计量 (mean, std)，如果为 None 则从 X 计算
+
+    Returns:
+        normalized_X: 归一化后的数据 (numpy array)
+        stats: 统计量 (mean, std)，可用于测试数据
+    """
+    if isinstance(X, pd.DataFrame):
+        X_df = X.copy()
+    else:
+        X_df = pd.DataFrame(X)
+
+    # 处理 NaN 和 inf
+    X_df = X_df.fillna(0)
+    X_df = X_df.replace([np.inf, -np.inf], 0)
+
+    if fit_stats is None:
+        # 计算统计量
+        means = X_df.mean().values
+        stds = X_df.std().values
+        stds = np.where(stds == 0, 1, stds)  # 避免除以0
+    else:
+        means, stds = fit_stats
+
+    # 按列进行 3σ clip + zscore 归一化
+    X_values = X_df.values.copy()
+    for i in range(X_values.shape[1]):
+        col_mean = means[i]
+        col_std = stds[i]
+        if col_std > 0:
+            lower = col_mean - 3 * col_std
+            upper = col_mean + 3 * col_std
+            X_values[:, i] = np.clip(X_values[:, i], lower, upper)
+            X_values[:, i] = (X_values[:, i] - col_mean) / col_std
+
+    # 最终处理
+    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return X_values, (means, stds)
+
+
+def print_data_quality(X, name="Data"):
+    """打印数据质量诊断信息"""
+    nan_count = np.isnan(X).sum()
+    inf_count = np.isinf(X).sum()
+    print(f"      {name} shape: {X.shape}")
+    print(f"      {name} NaN: {nan_count} ({nan_count / X.size * 100:.2f}%)")
+    valid_values = X[~np.isnan(X) & ~np.isinf(X)]
+    if len(valid_values) > 0:
+        print(f"      {name} range: [{valid_values.min():.4f}, {valid_values.max():.4e}]")
+
+
+# ============================================================================
+# Dynamic Alpha300 Handler with Incremental Features
+# ============================================================================
+
+class DynamicAlpha300Handler(DataHandlerLP):
+    """
+    动态 Alpha300 Handler，支持增量添加 Macro 和 TALib 特征。
+
+    基线: Alpha300 (5 OHLCV × 60 days = 300 features)
+    - 去掉了全是 NaN 的 VWAP (US data 没有 VWAP)
+    - 使用 60 天历史而不是 30 天
+    增量特征: 每个 macro/talib 特征扩展为 60 天的历史
     """
 
     def __init__(
@@ -148,6 +185,7 @@ class DynamicAlpha180Handler(DataHandlerLP):
         self.talib_features = talib_features or {}
         self.macro_features = macro_features or []
         self.volatility_window = volatility_window
+        self.seq_len = ALPHA300_SEQ_LEN  # 60 天
 
         self._macro_df = load_macro_data() if self.macro_features else None
 
@@ -183,48 +221,43 @@ class DynamicAlpha180Handler(DataHandlerLP):
             **kwargs,
         )
 
-    def _get_alpha180_features(self):
-        """获取 Alpha180 基线特征 (6 OHLCV × 30 days)"""
+    def _get_alpha300_features(self):
+        """获取 Alpha300 基线特征 (5 OHLCV × 60 days, 去掉 VWAP)"""
         fields = []
         names = []
 
-        # CLOSE: 30 天历史收盘价
-        for i in range(29, 0, -1):
+        # CLOSE: 60 天历史收盘价
+        for i in range(self.seq_len - 1, 0, -1):
             fields.append(f"Ref($close, {i})/$close")
             names.append(f"CLOSE{i}")
         fields.append("$close/$close")
         names.append("CLOSE0")
 
-        # OPEN: 30 天历史开盘价
-        for i in range(29, 0, -1):
+        # OPEN: 60 天历史开盘价
+        for i in range(self.seq_len - 1, 0, -1):
             fields.append(f"Ref($open, {i})/$close")
             names.append(f"OPEN{i}")
         fields.append("$open/$close")
         names.append("OPEN0")
 
-        # HIGH: 30 天历史最高价
-        for i in range(29, 0, -1):
+        # HIGH: 60 天历史最高价
+        for i in range(self.seq_len - 1, 0, -1):
             fields.append(f"Ref($high, {i})/$close")
             names.append(f"HIGH{i}")
         fields.append("$high/$close")
         names.append("HIGH0")
 
-        # LOW: 30 天历史最低价
-        for i in range(29, 0, -1):
+        # LOW: 60 天历史最低价
+        for i in range(self.seq_len - 1, 0, -1):
             fields.append(f"Ref($low, {i})/$close")
             names.append(f"LOW{i}")
         fields.append("$low/$close")
         names.append("LOW0")
 
-        # VWAP: 30 天历史成交均价
-        for i in range(29, 0, -1):
-            fields.append(f"Ref($vwap, {i})/$close")
-            names.append(f"VWAP{i}")
-        fields.append("$vwap/$close")
-        names.append("VWAP0")
+        # 注意: 去掉 VWAP (US data 中全是 NaN)
 
-        # VOLUME: 30 天历史成交量
-        for i in range(29, 0, -1):
+        # VOLUME: 60 天历史成交量
+        for i in range(self.seq_len - 1, 0, -1):
             fields.append(f"Ref($volume, {i})/($volume+1e-12)")
             names.append(f"VOLUME{i}")
         fields.append("$volume/($volume+1e-12)")
@@ -233,13 +266,13 @@ class DynamicAlpha180Handler(DataHandlerLP):
         return fields, names
 
     def _get_talib_features_config(self):
-        """获取 TALib 特征配置 (每个特征扩展为30天)"""
+        """获取 TALib 特征配置 (每个特征扩展为60天)"""
         fields = []
         names = []
 
         for feat_name, expr in self.talib_features.items():
-            # 扩展为30天历史
-            for i in range(29, 0, -1):
+            # 扩展为60天历史
+            for i in range(self.seq_len - 1, 0, -1):
                 ref_expr = f"Ref({expr}, {i})"
                 fields.append(ref_expr)
                 names.append(f"{feat_name}_{i}")
@@ -251,8 +284,8 @@ class DynamicAlpha180Handler(DataHandlerLP):
 
     def _get_feature_config(self):
         """获取完整特征配置"""
-        # Alpha180 基线
-        fields, names = self._get_alpha180_features()
+        # Alpha300 基线
+        fields, names = self._get_alpha300_features()
 
         # TALib 特征
         talib_fields, talib_names = self._get_talib_features_config()
@@ -273,7 +306,7 @@ class DynamicAlpha180Handler(DataHandlerLP):
             self._add_macro_features()
 
     def _add_macro_features(self):
-        """添加时间对齐的 macro 特征 (每个扩展为30天)"""
+        """添加时间对齐的 macro 特征 (每个扩展为60天)"""
         available_cols = [c for c in self.macro_features if c in self._macro_df.columns]
         if not available_cols:
             return
@@ -290,8 +323,8 @@ class DynamicAlpha180Handler(DataHandlerLP):
             macro_data = {}
             for col in available_cols:
                 base_series = self._macro_df[col]
-                # 扩展为30天历史
-                for i in range(29, -1, -1):
+                # 扩展为60天历史
+                for i in range(self.seq_len - 1, -1, -1):
                     col_name = f"{col}_{i}"
                     shifted = base_series.shift(i + 1)  # +1 for look-ahead prevention
                     aligned_values = shifted.reindex(main_datetimes).values
@@ -326,7 +359,7 @@ class TCNForwardSelection(ForwardSelectionBase):
         early_stop: int = 8,
         params: dict = None,
         output_dir: Path = None,
-        device=None,
+        gpu: int = 0,
     ):
         super().__init__(
             symbols=symbols,
@@ -346,11 +379,11 @@ class TCNForwardSelection(ForwardSelectionBase):
         self.epochs = epochs
         self.early_stop = early_stop
         self.params = params or DEFAULT_TCN_PARAMS
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.gpu = gpu  # GPU ID for qlib TCN
 
     def prepare_fold_data(self, fold_config: Dict) -> Tuple:
         """准备单个fold的数据"""
-        handler = DynamicAlpha180Handler(
+        handler = DynamicAlpha300Handler(
             talib_features=self.current_talib,
             macro_features=self.current_macro,
             volatility_window=self.nday,
@@ -369,24 +402,27 @@ class TCNForwardSelection(ForwardSelectionBase):
 
         dataset = DatasetH(handler=handler, segments=segments)
 
-        X_train = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-        X_train = X_train.fillna(0).replace([np.inf, -np.inf], 0).clip(-10, 10)
+        # 获取原始数据
+        X_train_raw = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
 
         y_train = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
         if isinstance(y_train, pd.DataFrame):
             y_train = y_train.iloc[:, 0]
         y_train = y_train.fillna(0).values
 
-        X_valid = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-        X_valid = X_valid.fillna(0).replace([np.inf, -np.inf], 0).clip(-10, 10)
-        valid_index = X_valid.index
+        X_valid_raw = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
+        valid_index = X_valid_raw.index
 
         y_valid = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
         if isinstance(y_valid, pd.DataFrame):
             y_valid = y_valid.iloc[:, 0]
         y_valid = y_valid.fillna(0).values
 
-        return X_train.values, y_train, X_valid.values, y_valid, valid_index
+        # 使用 3σ clip + zscore 归一化 (借鉴 run_tcn.py)
+        X_train, train_stats = normalize_data(X_train_raw)
+        X_valid, _ = normalize_data(X_valid_raw, fit_stats=train_stats)
+
+        return X_train, y_train, X_valid, y_valid, valid_index
 
     def evaluate_feature_set(self) -> Tuple[float, List[float]]:
         """在内层CV上评估特征集"""
@@ -397,7 +433,7 @@ class TCNForwardSelection(ForwardSelectionBase):
         talib_features: Dict[str, str],
         macro_features: List[str],
     ) -> Tuple[float, List[float]]:
-        """使用指定特征集评估"""
+        """使用指定特征集评估（使用 qlib TCN 实现）"""
         fold_ics = []
 
         # 临时保存当前特征
@@ -415,27 +451,38 @@ class TCNForwardSelection(ForwardSelectionBase):
                 X_train, y_train, X_valid, y_valid, valid_index = self.prepare_fold_data(fold)
 
                 total_features = X_train.shape[1]
-                # d_feat = number of features per timestep (total / 30 timesteps)
-                d_feat = total_features // 30
+                # d_feat = number of features per timestep (total / 60 timesteps)
+                d_feat = total_features // ALPHA300_SEQ_LEN
 
-                model = create_tcn_model(
+                # 使用 qlib 的 TCN 实现（和 run_tcn.py 一样）
+                gpu_id = self.gpu if torch.cuda.is_available() else -1
+                model = TCN(
                     d_feat=d_feat,
                     n_chans=self.params['n_chans'],
-                    num_layers=self.params['num_layers'],
                     kernel_size=self.params['kernel_size'],
+                    num_layers=self.params['num_layers'],
                     dropout=self.params['dropout'],
-                    device=self.device,
+                    n_epochs=self.epochs,
+                    lr=self.params['lr'],
+                    early_stop=self.early_stop,
+                    batch_size=self.params['batch_size'],
+                    metric="loss",
+                    loss="mse",
+                    GPU=gpu_id,
                 )
-                optimizer = torch.optim.Adam(model.parameters(), lr=self.params['lr'])
+
                 batch_size = self.params['batch_size']
 
-                # Training loop
+                # 使用 qlib TCN 内部模型进行训练（手动训练循环以使用归一化后的数据）
+                tcn_model = model.tcn_model
+                optimizer = model.train_optimizer
+
                 best_loss = float('inf')
                 best_state = None
                 stop_steps = 0
 
                 for epoch in range(self.epochs):
-                    model.train()
+                    tcn_model.train()
                     indices = np.arange(len(X_train))
                     np.random.shuffle(indices)
 
@@ -443,32 +490,32 @@ class TCNForwardSelection(ForwardSelectionBase):
                         if len(indices) - i < batch_size:
                             break
                         batch_idx = indices[i:i + batch_size]
-                        feature = torch.from_numpy(X_train[batch_idx]).float().to(self.device)
-                        label = torch.from_numpy(y_train[batch_idx]).float().to(self.device)
+                        feature = torch.from_numpy(X_train[batch_idx]).float().to(model.device)
+                        label = torch.from_numpy(y_train[batch_idx]).float().to(model.device)
 
-                        pred = model(feature).squeeze()
+                        pred = tcn_model(feature).squeeze()
                         loss = torch.mean((pred - label) ** 2)
 
                         optimizer.zero_grad()
                         loss.backward()
-                        torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
+                        torch.nn.utils.clip_grad_value_(tcn_model.parameters(), 3.0)
                         optimizer.step()
 
                     # Validation
-                    model.eval()
+                    tcn_model.eval()
                     with torch.no_grad():
                         val_preds = []
                         for i in range(0, len(X_valid), batch_size):
                             end = min(i + batch_size, len(X_valid))
-                            feature = torch.from_numpy(X_valid[i:end]).float().to(self.device)
-                            pred = model(feature).squeeze()
+                            feature = torch.from_numpy(X_valid[i:end]).float().to(model.device)
+                            pred = tcn_model(feature).squeeze()
                             val_preds.append(pred.cpu().numpy())
                         val_pred = np.concatenate(val_preds)
                         val_loss = np.mean((val_pred - y_valid) ** 2)
 
                     if val_loss < best_loss:
                         best_loss = val_loss
-                        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                        best_state = {k: v.cpu().clone() for k, v in tcn_model.state_dict().items()}
                         stop_steps = 0
                     else:
                         stop_steps += 1
@@ -477,22 +524,22 @@ class TCNForwardSelection(ForwardSelectionBase):
 
                 # Load best model and compute IC
                 if best_state is not None:
-                    model.load_state_dict(best_state)
+                    tcn_model.load_state_dict(best_state)
 
-                model.eval()
+                tcn_model.eval()
                 with torch.no_grad():
                     val_preds = []
                     for i in range(0, len(X_valid), batch_size):
                         end = min(i + batch_size, len(X_valid))
-                        feature = torch.from_numpy(X_valid[i:end]).float().to(self.device)
-                        pred = model(feature).squeeze()
+                        feature = torch.from_numpy(X_valid[i:end]).float().to(model.device)
+                        pred = tcn_model(feature).squeeze()
                         val_preds.append(pred.cpu().numpy())
                     val_pred = np.concatenate(val_preds)
 
                 ic = compute_ic(val_pred, y_valid, valid_index)
                 fold_ics.append(ic)
 
-                del X_train, y_train, X_valid, y_valid, valid_index, model
+                del X_train, y_train, X_valid, y_valid, valid_index, model, tcn_model
                 gc.collect()
 
         finally:
@@ -504,7 +551,7 @@ class TCNForwardSelection(ForwardSelectionBase):
 
     def get_feature_counts(self) -> Dict[str, int]:
         return {
-            'base': 6,  # Alpha180 OHLCV features
+            'base': ALPHA300_BASE_FEATURES,  # Alpha300: 5 OHLCV features (no VWAP)
             'talib': len(self.current_talib),
             'macro': len(self.current_macro),
         }
@@ -549,10 +596,12 @@ class TCNForwardSelection(ForwardSelectionBase):
         print("\n" + "=" * 70)
         print("TCN FORWARD SELECTION COMPLETE")
         print("=" * 70)
-        print(f"Baseline: Alpha180 (6 features × 30 days)")
-        print(f"Final: Alpha180 + {len(self.current_talib)} TALib + {len(self.current_macro)} macro")
-        print(f"Final d_feat: {6 + len(self.current_talib) + len(self.current_macro)}")
-        print(f"Total features: {(6 + len(self.current_talib) + len(self.current_macro)) * 30}")
+        d_feat = ALPHA300_BASE_FEATURES + len(self.current_talib) + len(self.current_macro)
+        total_features = d_feat * ALPHA300_SEQ_LEN
+        print(f"Baseline: Alpha300 ({ALPHA300_BASE_FEATURES} features × {ALPHA300_SEQ_LEN} days, no VWAP)")
+        print(f"Final: Alpha300 + {len(self.current_talib)} TALib + {len(self.current_macro)} macro")
+        print(f"Final d_feat: {d_feat}")
+        print(f"Total features: {total_features}")
         print(f"Baseline IC: {self.baseline_ic:.4f}")
         ic_diff = self.current_ic - self.baseline_ic
         print(f"Final IC:    {self.current_ic:.4f} ({'+' if ic_diff >= 0 else ''}{ic_diff:.4f})")
@@ -582,10 +631,9 @@ def main():
 
     # GPU 设置
     if args.gpu >= 0 and torch.cuda.is_available():
-        device = torch.device(f'cuda:{args.gpu}')
+        print(f"Using GPU: cuda:{args.gpu}")
     else:
-        device = torch.device('cpu')
-    print(f"Using device: {device}")
+        print("Using CPU")
 
     # Qlib 初始化
     qlib_data_path = PROJECT_ROOT / "my_data" / "qlib_us"
@@ -680,7 +728,7 @@ def main():
         early_stop=args.early_stop,
         params=params,
         output_dir=output_dir,
-        device=device,
+        gpu=args.gpu,
     )
 
     final_features, history, final_excluded = selector.run(
@@ -689,7 +737,9 @@ def main():
     )
 
     print(f"\n[+] Forward selection complete")
-    print(f"  Final d_feat: {6 + len(final_features.get('current_talib_features', {})) + len(final_features.get('current_macro_features', []))}")
+    d_feat = ALPHA300_BASE_FEATURES + len(final_features.get('current_talib_features', {})) + len(final_features.get('current_macro_features', []))
+    print(f"  Final d_feat: {d_feat}")
+    print(f"  Total features: {d_feat * ALPHA300_SEQ_LEN}")
     print(f"  Excluded features: {len(final_excluded)}")
 
 
