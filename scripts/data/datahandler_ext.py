@@ -252,6 +252,16 @@ class Alpha300DL:
         return fields, names
 
 
+# Alpha300 专用的 learn_processors，包含 NaN 和极端值处理
+_ALPHA300_LEARN_PROCESSORS = [
+    {"class": "DropnaLabel"},
+    {"class": "ProcessInf", "kwargs": {}},
+    {"class": "Fillna", "kwargs": {}},
+    {"class": "CSZScoreNorm", "kwargs": {"fields_group": "feature"}},
+    {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+]
+
+
 class Alpha300(DataHandlerLP):
     """
     Alpha300 数据处理器（不含 VWAP）。
@@ -264,10 +274,15 @@ class Alpha300(DataHandlerLP):
     - OPEN0-OPEN59: 开盘价（用当前收盘价标准化）
     - HIGH0-HIGH59: 最高价（用当前收盘价标准化）
     - LOW0-LOW59: 最低价（用当前收盘价标准化）
-    - VOLUME0-VOLUME59: 成交量（用当前成交量标准化）
+    - VOLUME0-VOLUME59: 成交量（log ratio 标准化）
 
     总共 300 个特征 (5 × 60)，适用于 TCN/LSTM/Transformer 等时序模型。
     d_feat = 5，seq_len = 60。
+
+    数据预处理：
+    - ProcessInf: 处理 Inf 值
+    - Fillna: 填充 NaN 为 0
+    - CSZScoreNorm: 横截面 Z-score 标准化
     """
 
     def __init__(
@@ -277,7 +292,7 @@ class Alpha300(DataHandlerLP):
         end_time=None,
         freq="day",
         infer_processors=_DEFAULT_INFER_PROCESSORS,
-        learn_processors=_DEFAULT_LEARN_PROCESSORS,
+        learn_processors=_ALPHA300_LEARN_PROCESSORS,
         fit_start_time=None,
         fit_end_time=None,
         filter_pipe=None,
