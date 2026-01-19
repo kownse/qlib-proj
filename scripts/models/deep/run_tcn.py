@@ -102,6 +102,26 @@ def main():
     total_features = actual_train_data.shape[1]
     print(f"\n    Actual training data shape: {actual_train_data.shape}")
 
+    # 数据质量诊断
+    print("\n[*] Data Quality Diagnostic:")
+    nan_count = actual_train_data.isna().sum().sum()
+    inf_count = np.isinf(actual_train_data.values).sum()
+    print(f"    NaN count: {nan_count} ({nan_count / actual_train_data.size * 100:.2f}%)")
+    print(f"    Inf count: {inf_count}")
+
+    # 检查极端值
+    valid_values = actual_train_data.values[~np.isnan(actual_train_data.values)]
+    print(f"    Value range: [{valid_values.min():.4f}, {valid_values.max():.4f}]")
+    print(f"    Mean: {valid_values.mean():.4f}, Std: {valid_values.std():.4f}")
+
+    # 检查 VWAP 列（US 数据常见问题）
+    vwap_cols = [c for c in actual_train_data.columns if 'VWAP' in str(c)]
+    if vwap_cols:
+        vwap_nan_pct = actual_train_data[vwap_cols].isna().mean().mean()
+        print(f"    VWAP columns NaN: {vwap_nan_pct*100:.1f}%")
+        if vwap_nan_pct > 0.5:
+            print("    >>> WARNING: VWAP data is mostly missing! This causes NaN in training.")
+
     # 对于 TCN，d_feat 是每个时间步的基础特征数
     # Alpha360: 6 features × 60 timesteps = 360
     if args.d_feat:
