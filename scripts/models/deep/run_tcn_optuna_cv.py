@@ -92,10 +92,10 @@ def create_tcn_model(d_feat, n_chans, num_layers, kernel_size, dropout, device):
             self.linear = nn.Linear(num_channels[-1], output_size)
 
         def forward(self, x):
-            batch_size = x.size(0)
-            seq_len = x.size(1) // self.num_input
-            x = x.view(batch_size, seq_len, self.num_input)
-            x = x.permute(0, 2, 1)
+            # 正确的 reshape：Alpha360 特征按类型分组 (CLOSE0-59, OPEN0-59, ...)
+            # 需要 reshape 为 (batch, num_input, seq_len) 即 (batch, 6, 60)
+            # 这样每个 channel 对应一种特征类型的完整时间序列
+            x = x.reshape(x.size(0), self.num_input, -1)
             y = self.tcn(x)
             return self.linear(y[:, :, -1])
 
