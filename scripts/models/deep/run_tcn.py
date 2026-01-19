@@ -113,16 +113,35 @@ def main():
 
     # 检查极端值
     valid_values = actual_train_data.values[~np.isnan(actual_train_data.values)]
-    print(f"    Value range: [{valid_values.min():.4f}, {valid_values.max():.4f}]")
-    print(f"    Mean: {valid_values.mean():.4f}, Std: {valid_values.std():.4f}")
+    print(f"    Value range: [{valid_values.min():.4f}, {valid_values.max():.4e}]")
 
-    # 检查 VWAP 列（US 数据常见问题）
-    vwap_cols = [c for c in actual_train_data.columns if 'VWAP' in str(c)]
-    if vwap_cols:
-        vwap_nan_pct = actual_train_data[vwap_cols].isna().mean().mean()
-        print(f"    VWAP columns NaN: {vwap_nan_pct*100:.1f}%")
-        if vwap_nan_pct > 0.5:
-            print("    >>> WARNING: VWAP data is mostly missing! This causes NaN in training.")
+    # 按特征类型分组统计
+    print("\n    --- Per Feature Type Statistics ---")
+    feature_types = ['CLOSE', 'OPEN', 'HIGH', 'LOW', 'VWAP', 'VOLUME']
+    for ftype in feature_types:
+        cols = [c for c in actual_train_data.columns if str(c).startswith(ftype)]
+        if cols:
+            fdata = actual_train_data[cols]
+            fvalid = fdata.values[~np.isnan(fdata.values)]
+            if len(fvalid) > 0:
+                nan_pct = fdata.isna().sum().sum() / fdata.size * 100
+                print(f"    {ftype:8s}: count={len(cols):3d}, NaN={nan_pct:5.1f}%, "
+                      f"min={fvalid.min():.4f}, max={fvalid.max():.4e}, "
+                      f"mean={fvalid.mean():.4f}, std={fvalid.std():.4e}")
+                # 找出有极端值的具体列
+                if fvalid.max() > 1e6:
+                    for col in cols:
+                        col_max = actual_train_data[col].abs().max()
+                        if col_max > 1e6:
+                            print(f"             >>> Extreme: {col} max={col_max:.4e}")
+            else:
+                print(f"    {ftype:8s}: count={len(cols):3d}, ALL NaN!")
+
+    # 找出所有极端值列
+    print("\n    --- Top 10 Columns with Largest Values ---")
+    col_max = actual_train_data.abs().max().sort_values(ascending=False)
+    for col, val in col_max.head(10).items():
+        print(f"    {str(col):20s}: max abs = {val:.4e}")
 
     # 对于 TCN，d_feat 是每个时间步的基础特征数
     # Alpha360: 6 features × 60 timesteps = 360
