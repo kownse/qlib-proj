@@ -240,12 +240,13 @@ class Alpha300DL:
         fields += ["$low/$close"]
         names += ["LOW0"]
 
-        # VOLUME: 60 天历史成交量，用当前成交量标准化
-        # 注意：不包含 VWAP，因为 US 数据中通常缺失
+        # VOLUME: 60 天历史成交量
+        # 使用 log ratio 避免除法产生的极端值（当 $volume 接近 0 时）
+        # Log(Ref($volume, i) + 1) - Log($volume + 1) 更加稳定
         for i in range(59, 0, -1):
-            fields += ["Ref($volume, %d)/($volume+1e-12)" % i]
+            fields += ["Log(Ref($volume, %d)+1) - Log($volume+1)" % i]
             names += ["VOLUME%d" % i]
-        fields += ["$volume/($volume+1e-12)"]
+        fields += ["Log($volume+1) - Log($volume+1)"]  # = 0 for VOLUME0
         names += ["VOLUME0"]
 
         return fields, names
