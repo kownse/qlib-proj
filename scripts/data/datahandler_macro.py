@@ -725,3 +725,203 @@ class Alpha360_Macro(DataHandlerLP):
         """Return N-day volatility label."""
         volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [volatility_expr], ["LABEL0"]
+
+
+class Alpha180_Macro(DataHandlerLP):
+    """
+    Alpha180 (180 features) + Time-aligned Macro features
+
+    Combines Alpha180's 30-day OHLCV history with macro market features,
+    where each timestep includes both stock and macro data from that day.
+
+    Structure: (30, 6+M) where M = number of macro features
+    - Stock features: CLOSE, OPEN, HIGH, LOW, VWAP, VOLUME per timestep
+    - Macro features: VIX, bonds, yields, etc. per timestep (same for all stocks on that day)
+
+    Feature counts:
+    - macro_features="none": 180 features (6 × 30)
+    - macro_features="vix_only": 570 features ((6+13) × 30)
+    - macro_features="core": 930 features ((6+25) × 30)
+    - macro_features="all": 3330 features ((6+105) × 30)
+
+    Usage:
+        handler = Alpha180_Macro(
+            volatility_window=2,
+            instruments=["AAPL", "MSFT", "NVDA"],
+            start_time="2020-01-01",
+            end_time="2024-12-31",
+            macro_features="core",  # or "all", "vix_only", "none"
+        )
+
+        # For ALSTM/TCN/Transformer:
+        # d_feat = 6 + num_macro_features (e.g., 31 for core)
+        # seq_len = 30
+    """
+
+    # Reuse macro feature definitions from Alpha158_Volatility_TALib_Macro
+    ALL_MACRO_FEATURES = Alpha158_Volatility_TALib_Macro.ALL_MACRO_FEATURES
+    CORE_MACRO_FEATURES = Alpha158_Volatility_TALib_Macro.CORE_MACRO_FEATURES
+    VIX_ONLY_FEATURES = Alpha158_Volatility_TALib_Macro.VIX_ONLY_FEATURES
+
+    def __init__(
+        self,
+        volatility_window: int = 2,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq: str = "day",
+        infer_processors=[],
+        learn_processors=None,
+        fit_start_time=None,
+        fit_end_time=None,
+        process_type=DataHandlerLP.PTYPE_A,
+        filter_pipe=None,
+        inst_processors=None,
+        # Macro feature parameters
+        macro_data_path: Union[str, Path] = None,
+        macro_features: str = "core",  # "all", "core", "vix_only", "none"
+        **kwargs,
+    ):
+        """
+        Initialize Alpha180 + Macro DataHandler.
+
+        Args:
+            volatility_window: Prediction window (days) for label
+            macro_data_path: Path to macro features parquet file
+            macro_features: Macro feature set to use
+                - "all": All macro features (~105)
+                - "core": Core features (~25) [default]
+                - "vix_only": VIX features only (~13)
+                - "none": No macro features (pure Alpha180)
+            **kwargs: Additional arguments for parent class
+        """
+        self.volatility_window = volatility_window
+        self.macro_data_path = Path(macro_data_path) if macro_data_path else DEFAULT_MACRO_PATH
+        self.macro_features = macro_features
+
+        # Load macro features
+        self._macro_df = self._load_macro_features()
+
+        from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
+        from data.datahandler_ext import Alpha180DL
+
+        if learn_processors is None:
+            learn_processors = _DEFAULT_LEARN_PROCESSORS
+
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        # Use Alpha180's feature config
+        fields, names = Alpha180DL.get_feature_config()
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": (fields, names),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            infer_processors=infer_processors,
+            learn_processors=learn_processors,
+            process_type=process_type,
+            **kwargs,
+        )
+
+    def process_data(self, with_fit: bool = False):
+        """
+        Override process_data to add time-aligned macro features AFTER processors run.
+        """
+        # First, call parent's process_data
+        super().process_data(with_fit=with_fit)
+
+        # Then add macro features with temporal expansion
+        if self._macro_df is not None and self.macro_features != "none":
+            self._add_macro_to_processed_data()
+
+    def _add_macro_to_processed_data(self):
+        """Add time-aligned macro features to _learn and _infer."""
+        try:
+            macro_cols = self._get_macro_feature_columns()
+            available_cols = [c for c in macro_cols if c in self._macro_df.columns]
+
+            if not available_cols:
+                print("Warning: No macro features available")
+                return
+
+            # Add to _learn with temporal expansion
+            if hasattr(self, "_learn") and self._learn is not None:
+                self._learn = self._expand_macro_temporally(self._learn, available_cols)
+                num_macro_expanded = len(available_cols) * 30
+                print(f"Added {num_macro_expanded} macro features to learn data "
+                      f"({len(available_cols)} features × 30 timesteps)")
+
+            # Add to _infer with temporal expansion
+            if hasattr(self, "_infer") and self._infer is not None:
+                self._infer = self._expand_macro_temporally(self._infer, available_cols)
+
+        except Exception as e:
+            print(f"Warning: Error adding macro features: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _expand_macro_temporally(self, df: pd.DataFrame, macro_cols: list) -> pd.DataFrame:
+        """
+        Expand macro features temporally to align with Alpha180's 30-day structure.
+
+        For each macro feature col, creates 30 columns: col_29, col_28, ..., col_0
+        where col_i contains the macro value from i days ago.
+
+        Args:
+            df: DataFrame with Alpha180 features (index: datetime, instrument)
+            macro_cols: List of macro feature column names
+
+        Returns:
+            DataFrame with additional macro columns for each timestep
+        """
+        datetime_col = df.index.names[0]
+        main_datetimes = df.index.get_level_values(datetime_col)
+        has_multi_columns = isinstance(df.columns, pd.MultiIndex)
+
+        # Build all expanded macro columns at once to avoid fragmentation
+        expanded_data = {}
+        for col in macro_cols:
+            base_series = self._macro_df[col]
+            for i in range(29, -1, -1):  # 30 days: 29, 28, ..., 0
+                col_name = f"{col}_{i}"
+                # Shift macro data by i days (shift(i) means value from i days ago)
+                shifted = base_series.shift(i)
+                aligned_values = shifted.reindex(main_datetimes).values
+
+                if has_multi_columns:
+                    expanded_data[('feature', col_name)] = aligned_values
+                else:
+                    expanded_data[col_name] = aligned_values
+
+        # Create DataFrame with all expanded macro columns
+        expanded_df = pd.DataFrame(expanded_data, index=df.index)
+
+        # Use pd.concat to merge all columns at once (avoids fragmentation warning)
+        merged = pd.concat([df, expanded_df], axis=1, copy=False)
+
+        # Return a copy to ensure defragmentation
+        return merged.copy()
+
+    # Reuse methods from Alpha158_Volatility_TALib_Macro
+    _load_macro_features = Alpha158_Volatility_TALib_Macro._load_macro_features
+    _get_macro_feature_columns = Alpha158_Volatility_TALib_Macro._get_macro_feature_columns
+
+    def get_label_config(self):
+        """Return N-day volatility label."""
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]

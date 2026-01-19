@@ -34,3 +34,14 @@ from .training import (
 )
 
 from .backtest import run_backtest
+
+from .cv_utils import (
+    CV_FOLDS,
+    FINAL_TEST,
+    create_data_handler_for_fold,
+    create_dataset_for_fold,
+    prepare_data_from_dataset,
+    compute_ic,
+    print_cv_info,
+    prepare_cv_fold_data,
+)

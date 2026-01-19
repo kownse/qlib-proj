@@ -6,9 +6,10 @@ TCN 超参数搜索 - Optuna 版本 (带 Pruning)
 - 时间序列交叉验证
 - 断点续传
 
-时间窗口设计 (缩短以加速):
-  Fold 1: train 2018-2022, valid 2023
-  Fold 2: train 2018-2023, valid 2024
+时间窗口设计:
+  Fold 1: train 2000-2021, valid 2022
+  Fold 2: train 2000-2022, valid 2023
+  Fold 3: train 2000-2023, valid 2024
   Test:   2025 (完全独立)
 
 使用方法:
@@ -52,9 +53,6 @@ from optuna.samplers import TPESampler
 import torch
 import torch.nn as nn
 
-from qlib.data.dataset import DatasetH
-from qlib.data.dataset.handler import DataHandlerLP
-
 from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
 
@@ -62,39 +60,13 @@ from models.common import (
     HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
     init_qlib,
     run_backtest,
+    CV_FOLDS,
+    FINAL_TEST,
+    create_data_handler_for_fold,
+    create_dataset_for_fold,
+    prepare_data_from_dataset,
+    compute_ic,
 )
-
-
-# ============================================================================
-# 时间序列交叉验证的 Fold 配置 (缩短时间范围以加速)
-# ============================================================================
-
-CV_FOLDS = [
-    {
-        'name': 'Fold 1 (valid 2023)',
-        'train_start': '2018-01-01',
-        'train_end': '2022-12-31',
-        'valid_start': '2023-01-01',
-        'valid_end': '2023-12-31',
-    },
-    {
-        'name': 'Fold 2 (valid 2024)',
-        'train_start': '2018-01-01',
-        'train_end': '2023-12-31',
-        'valid_start': '2024-01-01',
-        'valid_end': '2024-12-31',
-    },
-]
-
-# 最终测试集
-FINAL_TEST = {
-    'train_start': '2018-01-01',
-    'train_end': '2024-09-30',    # 修复：避免与验证集重叠
-    'valid_start': '2024-10-01',  # 验证集（无重叠）
-    'valid_end': '2024-12-31',
-    'test_start': '2025-01-01',
-    'test_end': '2025-12-31',
-}
 
 
 # Handler d_feat 配置
@@ -106,69 +78,6 @@ HANDLER_D_FEAT = {
     'alpha158-talib': 158,
     'alpha158-talib-lite': 158,
 }
-
-
-def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
-    """为特定 fold 创建 DataHandler"""
-    from models.common.handlers import get_handler_class
-
-    HandlerClass = get_handler_class(args.handler)
-
-    end_time = fold_config.get('test_end', fold_config['valid_end'])
-
-    handler = HandlerClass(
-        volatility_window=args.nday,
-        instruments=symbols,
-        start_time=fold_config['train_start'],
-        end_time=end_time,
-        fit_start_time=fold_config['train_start'],
-        fit_end_time=fold_config['train_end'],
-        infer_processors=[],
-    )
-
-    return handler
-
-
-def create_dataset_for_fold(handler, fold_config):
-    """为特定 fold 创建 Dataset"""
-    segments = {
-        "train": (fold_config['train_start'], fold_config['train_end']),
-        "valid": (fold_config['valid_start'], fold_config['valid_end']),
-    }
-    if 'test_start' in fold_config:
-        segments["test"] = (fold_config['test_start'], fold_config['test_end'])
-
-    return DatasetH(handler=handler, segments=segments)
-
-
-def prepare_data_from_dataset(dataset: DatasetH, segment: str):
-    """从 Dataset 准备数据"""
-    features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
-    features = features.fillna(0).replace([np.inf, -np.inf], 0).clip(-10, 10)
-
-    try:
-        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
-        if isinstance(labels, pd.DataFrame):
-            labels = labels.iloc[:, 0]
-        labels = labels.fillna(0).values
-        return features.values, labels, features.index
-    except Exception:
-        return features.values, None, features.index
-
-
-def compute_ic(pred, label, index):
-    """计算 IC"""
-    df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
-    ic_by_date = df.groupby(level='datetime').apply(
-        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
-    )
-    ic_by_date = ic_by_date.dropna()
-    if len(ic_by_date) == 0:
-        return 0.0, 0.0, 0.0
-    mean_ic = ic_by_date.mean()
-    ic_std = ic_by_date.std()
-    icir = mean_ic / ic_std if ic_std > 0 else 0
-    return mean_ic, ic_std, icir
 
 
 def create_tcn_model(d_feat, n_chans, num_layers, kernel_size, dropout, device):
@@ -639,13 +548,13 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
-    parser.add_argument('--handler', type=str, default='alpha360',
+    parser.add_argument('--handler', type=str, default='alpha180',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
 
     # Optuna 参数
-    parser.add_argument('--n-trials', type=int, default=30,
+    parser.add_argument('--n-trials', type=int, default=50,
                         help='Number of Optuna trials')
     parser.add_argument('--cv-epochs', type=int, default=30,
                         help='Max epochs per CV fold (会被 pruning 提前终止)')

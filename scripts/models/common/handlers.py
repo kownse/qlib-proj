@@ -31,6 +31,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 (158 technical indicators)',
         'use_talib': False,
     },
+    'alpha180': {
+        'module': 'data.datahandler_ext',
+        'class_name': 'Alpha180_Volatility',
+        'description': 'Alpha180 (180 features - 30 days OHLCV)',
+        'use_talib': False,
+    },
     'alpha360': {
         'module': 'data.datahandler_ext',
         'class_name': 'Alpha360_Volatility',
@@ -83,6 +89,12 @@ HANDLER_REGISTRY = {
         'module': 'data.datahandler_macro',
         'class_name': 'Alpha158_Macro',
         'description': 'Alpha158 + Macro features (no TA-Lib, ~193 features)',
+        'use_talib': False,
+    },
+    'alpha180-macro': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha180_Macro',
+        'description': 'Alpha180 + Macro features (30 timesteps × (6+M) features)',
         'use_talib': False,
     },
     'alpha360-macro': {

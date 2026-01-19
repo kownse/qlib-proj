@@ -11,11 +11,179 @@ from pathlib import Path
 script_dir = Path(__file__).parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
-from qlib.contrib.data.handler import Alpha158, Alpha360
+from qlib.contrib.data.handler import Alpha158, Alpha360, check_transform_proc, _DEFAULT_LEARN_PROCESSORS, _DEFAULT_INFER_PROCESSORS
 from qlib.data.dataset.handler import DataHandlerLP
 
 # Import TA-Lib custom operators
 from utils.talib_ops import TALIB_OPS
+
+
+# ============================================================================
+# Alpha180: 30天 OHLCV 数据 (6 × 30 = 180 特征)
+# ============================================================================
+
+class Alpha180DL:
+    """
+    Alpha180 数据加载器的特征配置。
+
+    类似于 Alpha360，但使用 30 天而不是 60 天的历史数据。
+    包含 CLOSE, OPEN, HIGH, LOW, VWAP, VOLUME 各 30 天历史。
+    所有价格数据用当前 $close 标准化，成交量用当前 $volume 标准化。
+    总共 180 个特征 (6 × 30)。
+    """
+
+    @staticmethod
+    def get_feature_config():
+        """
+        获取 Alpha180 特征配置。
+
+        Returns:
+            tuple: (fields, names) 特征表达式和名称列表
+        """
+        fields = []
+        names = []
+
+        # CLOSE: 30 天历史收盘价，用当前收盘价标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($close, %d)/$close" % i]
+            names += ["CLOSE%d" % i]
+        fields += ["$close/$close"]
+        names += ["CLOSE0"]
+
+        # OPEN: 30 天历史开盘价，用当前收盘价标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($open, %d)/$close" % i]
+            names += ["OPEN%d" % i]
+        fields += ["$open/$close"]
+        names += ["OPEN0"]
+
+        # HIGH: 30 天历史最高价，用当前收盘价标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($high, %d)/$close" % i]
+            names += ["HIGH%d" % i]
+        fields += ["$high/$close"]
+        names += ["HIGH0"]
+
+        # LOW: 30 天历史最低价，用当前收盘价标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($low, %d)/$close" % i]
+            names += ["LOW%d" % i]
+        fields += ["$low/$close"]
+        names += ["LOW0"]
+
+        # VWAP: 30 天历史成交均价，用当前收盘价标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($vwap, %d)/$close" % i]
+            names += ["VWAP%d" % i]
+        fields += ["$vwap/$close"]
+        names += ["VWAP0"]
+
+        # VOLUME: 30 天历史成交量，用当前成交量标准化
+        for i in range(29, 0, -1):
+            fields += ["Ref($volume, %d)/($volume+1e-12)" % i]
+            names += ["VOLUME%d" % i]
+        fields += ["$volume/($volume+1e-12)"]
+        names += ["VOLUME0"]
+
+        return fields, names
+
+
+class Alpha180(DataHandlerLP):
+    """
+    Alpha180 数据处理器。
+
+    使用最近 30 天的价格和成交量数据，共 180 个特征。
+    适用于需要较短历史窗口的模型（如某些 RNN/Transformer 模型）。
+
+    特征说明：
+    - CLOSE0-CLOSE29: 收盘价（用当前收盘价标准化）
+    - OPEN0-OPEN29: 开盘价（用当前收盘价标准化）
+    - HIGH0-HIGH29: 最高价（用当前收盘价标准化）
+    - LOW0-LOW29: 最低价（用当前收盘价标准化）
+    - VWAP0-VWAP29: 成交均价（用当前收盘价标准化）
+    - VOLUME0-VOLUME29: 成交量（用当前成交量标准化）
+    """
+
+    def __init__(
+        self,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=_DEFAULT_INFER_PROCESSORS,
+        learn_processors=_DEFAULT_LEARN_PROCESSORS,
+        fit_start_time=None,
+        fit_end_time=None,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": Alpha180DL.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            learn_processors=learn_processors,
+            infer_processors=infer_processors,
+            **kwargs,
+        )
+
+    def get_label_config(self):
+        """默认标签：2天收益率"""
+        return ["Ref($close, -2)/Ref($close, -1) - 1"], ["LABEL0"]
+
+
+class Alpha180_Volatility(Alpha180):
+    """
+    Alpha180 特征 + N天价格波动率标签。
+
+    继承 Alpha180 的所有特征（30天的 OHLCV 数据），只修改标签为N天波动率。
+
+    Alpha180 特征说明：
+    - 使用最近 30 天的价格和成交量数据
+    - 包含 CLOSE, OPEN, HIGH, LOW, VWAP, VOLUME 各 30 天历史
+    - 所有价格数据用当前 $close 标准化
+    - 成交量数据用当前 $volume 标准化
+    - 总共 180 个特征 (6 × 30)
+    """
+
+    def __init__(self, volatility_window=2, **kwargs):
+        """
+        初始化波动率预测的 Alpha180 DataHandler。
+
+        Args:
+            volatility_window: 波动率预测窗口（天数）
+            **kwargs: 传递给父类的其他参数
+        """
+        self.volatility_window = volatility_window
+        super().__init__(**kwargs)
+
+    def get_label_config(self):
+        """
+        返回N天波动率标签。
+
+        Returns:
+            fields: 标签表达式列表
+            names: 标签名称列表
+        """
+        volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
+        return [volatility_expr], ["LABEL0"]
 
 
 class Alpha360_Volatility(Alpha360):
