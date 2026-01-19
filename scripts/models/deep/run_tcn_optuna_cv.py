@@ -365,7 +365,7 @@ def run_optuna_search(args, handler_config, symbols):
         sampler=sampler,
         pruner=pruner,
         storage=storage,
-        load_if_exists=args.resume,
+        load_if_exists=True,  # 默认允许复用已有 study
     )
 
     # 回调函数：打印进度
@@ -548,7 +548,7 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
-    parser.add_argument('--handler', type=str, default='alpha180',
+    parser.add_argument('--handler', type=str, default='alpha360',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
