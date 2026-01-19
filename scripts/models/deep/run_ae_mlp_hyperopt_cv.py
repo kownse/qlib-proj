@@ -26,7 +26,8 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 抑制 TensorFlow 日志
 os.environ['OMP_NUM_THREADS'] = '4'
 os.environ['MKL_NUM_THREADS'] = '4'
 os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # 优化 GPU 线程
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'  # 启用 XLA JIT 编译
+# 注意: XLA 和混合精度可能导致数值不稳定，默认禁用
+# os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'  # 启用 XLA JIT 编译
 
 import sys
 from pathlib import Path
@@ -352,7 +353,7 @@ class CVHyperoptObjective:
     """时间序列交叉验证的 Hyperopt 目标函数"""
 
     def __init__(self, args, handler_config, symbols, n_epochs=30, early_stop=5, gpu=0,
-                 use_mixed_precision=True, prefetch_to_gpu=True, max_batch_size=4096):
+                 use_mixed_precision=False, prefetch_to_gpu=True, max_batch_size=4096):
         self.args = args
         self.handler_config = handler_config
         self.symbols = symbols
@@ -537,7 +538,7 @@ class CVHyperoptObjective:
             }
 
 
-def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=True,
+def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=False,
                            use_prefetch=True, max_batch_size=4096):
     """运行时间序列交叉验证的超参数搜索"""
     print("\n" + "=" * 70)
@@ -604,7 +605,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, use_mixed_precision=Tr
     return best_params, trials, best_trial, objective.num_columns
 
 
-def train_final_model(args, handler_config, symbols, best_params, use_mixed_precision=True):
+def train_final_model(args, handler_config, symbols, best_params, use_mixed_precision=False):
     """使用最优参数在完整数据上训练最终模型"""
     print("\n[*] Training final model on full data...")
     print("    Parameters:")
@@ -727,8 +728,8 @@ def main():
                         help='GPU device ID (-1 for CPU)')
 
     # GPU 优化参数
-    parser.add_argument('--no-mixed-precision', action='store_true',
-                        help='Disable mixed precision (FP16) training')
+    parser.add_argument('--mixed-precision', action='store_true',
+                        help='Enable mixed precision (FP16) training (may cause numerical instability)')
     parser.add_argument('--no-prefetch', action='store_true',
                         help='Disable tf.data prefetching')
     parser.add_argument('--max-batch-size', type=int, default=4096,
@@ -750,7 +751,7 @@ def main():
     symbols = STOCK_POOLS[args.stock_pool]
 
     # GPU 优化设置
-    use_mixed_precision = not args.no_mixed_precision and args.gpu >= 0
+    use_mixed_precision = args.mixed_precision and args.gpu >= 0
     use_prefetch = not args.no_prefetch
 
     # 打印头部
@@ -767,7 +768,7 @@ def main():
     print(f"GPU Optimizations:")
     print(f"  - Mixed precision (FP16): {'ON' if use_mixed_precision else 'OFF'}")
     print(f"  - tf.data prefetch: {'ON' if use_prefetch else 'OFF'}")
-    print(f"  - XLA JIT compilation: ON")
+    print(f"  - XLA JIT compilation: OFF (disabled for numerical stability)")
     print(f"  - Max batch size: {args.max_batch_size} (use --max-batch-size to adjust)")
     print("=" * 70)
 

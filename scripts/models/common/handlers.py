@@ -153,6 +153,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V10 (~37 features: nested CV backward elimination protected)',
         'use_talib': True,
     },
+    'alpha158-enhanced-v11': {
+        'module': 'data.datahandler_enhanced_v11',
+        'class_name': 'Alpha158_Enhanced_V11',
+        'description': 'Alpha158 Enhanced V11 (~38 features: nested CV forward selection optimal)',
+        'use_talib': True,
+    },
 }
 
 
