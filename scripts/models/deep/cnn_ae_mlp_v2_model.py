@@ -153,6 +153,7 @@ class CNNAEMLPV2:
         early_stop: int = 10,
         loss_weights: Dict[str, float] = None,
         use_ic_loss: bool = False,
+        gradient_accumulation_steps: int = 1,
         GPU: int = 0,
         seed: int = 42,
     ):
@@ -174,6 +175,7 @@ class CNNAEMLPV2:
         self.early_stop = early_stop
         self.loss_weights = loss_weights or {'decoder': 0.1, 'ae_action': 0.1, 'action': 1.0}
         self.use_ic_loss = use_ic_loss
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.GPU = GPU
         self.seed = seed
 
@@ -554,7 +556,7 @@ class CNNAEMLPV2:
 
         # 使用 tf.data.Dataset 流式加载数据，减少显存占用
         # Decoder 目标改为重建原始输入（而不是 CNN 特征），进一步减少内存
-        def create_tf_dataset(X, y, batch_size, shuffle=True):
+        def create_tf_dataset(X, y, batch_size, shuffle=True, repeat=False):
             """创建 tf.data.Dataset，数据保持在 CPU 上直到需要时才传输到 GPU"""
             with tf.device('/CPU:0'):
                 # 转换为 float32
@@ -576,13 +578,18 @@ class CNNAEMLPV2:
                     dataset = dataset.shuffle(buffer_size=buffer_size)
 
                 dataset = dataset.batch(batch_size)
+
+                if repeat:
+                    # 训练集需要 repeat，否则会在 epoch 结束时耗尽
+                    dataset = dataset.repeat()
+
                 dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
             return dataset
 
         print("\n[*] Creating tf.data.Dataset...")
-        train_dataset = create_tf_dataset(X_train, y_train, self.batch_size, shuffle=True)
-        valid_dataset = create_tf_dataset(X_valid, y_valid, self.batch_size, shuffle=False)
+        train_dataset = create_tf_dataset(X_train, y_train, self.batch_size, shuffle=True, repeat=True)
+        valid_dataset = create_tf_dataset(X_valid, y_valid, self.batch_size, shuffle=False, repeat=True)
 
         # 计算 steps
         steps_per_epoch = len(X_train) // self.batch_size
@@ -679,6 +686,8 @@ PRESET_CONFIGS = {
         'dropout_rates': [0.05, 0.05, 0.1, 0.1, 0.1, 0.1, 0.1],
     },
     'alpha300_lite': {
+        # 轻量版：关闭 attention 和 feature interaction，减少 filters
+        # 预计显存: ~15-20GB
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
@@ -689,6 +698,20 @@ PRESET_CONFIGS = {
         'use_feature_interaction': False,
         'hidden_units': [64, 64, 256, 128],
         'dropout_rates': [0.05, 0.05, 0.1, 0.1, 0.1],
+    },
+    'alpha300_minimal': {
+        # 超轻量版：最小化所有组件，适合显存受限场景
+        # 预计显存: ~8-12GB
+        'num_columns': 300,
+        'time_steps': 60,
+        'features_per_step': 5,
+        'cnn_filters': [32],  # 单层 CNN
+        'multiscale_kernels': [5],  # 单一 kernel
+        'num_residual_blocks': 0,  # 无残差块
+        'use_attention': False,
+        'use_feature_interaction': False,
+        'hidden_units': [64, 64, 128, 64],  # 更小的 MLP
+        'dropout_rates': [0.05, 0.05, 0.1, 0.1],
     },
     'alpha360': {
         'num_columns': 360,

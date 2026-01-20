@@ -121,7 +121,8 @@ def main():
 
     # 训练参数
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--batch-size', type=int, default=2048)
+    parser.add_argument('--batch-size', type=int, default=2048,
+                        help='Batch size (reduce to save GPU memory, e.g., 512 or 256)')
     parser.add_argument('--n-epochs', type=int, default=100)
     parser.add_argument('--early-stop', type=int, default=10)
     parser.add_argument('--gpu', type=int, default=0)
