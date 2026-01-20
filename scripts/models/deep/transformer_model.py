@@ -353,7 +353,7 @@ class TransformerModel:
             weight_decay=self.weight_decay
         )
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
         )
         mse_loss = nn.MSELoss()
 
