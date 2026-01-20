@@ -85,6 +85,16 @@ def combined_loss(y_true, y_pred, mse_weight=0.5, ic_weight=0.5):
     return mse_weight * mse - ic_weight * ic
 
 
+def ae_action_loss(y_true, y_pred):
+    """AE 分支损失：MSE 0.7 + IC 0.3"""
+    return combined_loss(y_true, y_pred, mse_weight=0.7, ic_weight=0.3)
+
+
+def action_loss(y_true, y_pred):
+    """主输出损失：MSE 0.5 + IC 0.5"""
+    return combined_loss(y_true, y_pred, mse_weight=0.5, ic_weight=0.5)
+
+
 class CNNAEMLPV2:
     """
     CNN-AE-MLP V2 模型
@@ -436,8 +446,8 @@ class CNNAEMLPV2:
                 optimizer=keras.optimizers.Adam(learning_rate=self.lr),
                 loss={
                     'decoder': 'mse',
-                    'ae_action': lambda y_true, y_pred: combined_loss(y_true, y_pred, 0.7, 0.3),
-                    'action': lambda y_true, y_pred: combined_loss(y_true, y_pred, 0.5, 0.5),
+                    'ae_action': ae_action_loss,
+                    'action': action_loss,
                 },
                 loss_weights=self.loss_weights,
             )
@@ -687,7 +697,6 @@ PRESET_CONFIGS = {
     },
     'alpha300_lite': {
         # 轻量版：关闭 attention 和 feature interaction，减少 filters
-        # 预计显存: ~15-20GB
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
@@ -700,18 +709,49 @@ PRESET_CONFIGS = {
         'dropout_rates': [0.05, 0.05, 0.1, 0.1, 0.1],
     },
     'alpha300_minimal': {
-        # 超轻量版：最小化所有组件，适合显存受限场景
-        # 预计显存: ~8-12GB
+        # 超轻量版：最小化所有组件
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
-        'cnn_filters': [32],  # 单层 CNN
-        'multiscale_kernels': [5],  # 单一 kernel
-        'num_residual_blocks': 0,  # 无残差块
+        'cnn_filters': [32],
+        'multiscale_kernels': [5],
+        'num_residual_blocks': 0,
         'use_attention': False,
         'use_feature_interaction': False,
-        'hidden_units': [64, 64, 128, 64],  # 更小的 MLP
+        'hidden_units': [64, 64, 128, 64],
         'dropout_rates': [0.05, 0.05, 0.1, 0.1],
+    },
+    'alpha300_simple': {
+        # 简单版：类似 AE-MLP 的简单结构，最小化 CNN 复杂度
+        # 重点：强正则化 + 简单架构
+        'num_columns': 300,
+        'time_steps': 60,
+        'features_per_step': 5,
+        'cnn_filters': [32],  # 单层小 CNN
+        'multiscale_kernels': [5],  # 单一 kernel，捕获周级模式
+        'num_residual_blocks': 0,
+        'use_attention': False,
+        'use_feature_interaction': False,
+        'hidden_units': [64, 64, 128, 64],  # 小 MLP
+        'dropout_rates': [0.1, 0.2, 0.2, 0.2, 0.2],  # 更高 dropout
+        'l2_reg': 1e-4,  # 更强 L2 正则化
+        'loss_weights': {'decoder': 0.3, 'ae_action': 0.1, 'action': 1.0},  # 增加 decoder 权重
+    },
+    'alpha300_regularized': {
+        # 正则化版：保留中等复杂度但增强正则化
+        # 适合在验证集表现好但测试集差的情况
+        'num_columns': 300,
+        'time_steps': 60,
+        'features_per_step': 5,
+        'cnn_filters': [32, 64],
+        'multiscale_kernels': [3, 7],  # 短期 + 中期模式
+        'num_residual_blocks': 1,
+        'use_attention': False,  # 关闭注意力减少复杂度
+        'use_feature_interaction': False,
+        'hidden_units': [64, 64, 128, 64],
+        'dropout_rates': [0.1, 0.2, 0.25, 0.25, 0.2],  # 高 dropout
+        'l2_reg': 5e-5,
+        'loss_weights': {'decoder': 0.2, 'ae_action': 0.1, 'action': 1.0},
     },
     'alpha360': {
         'num_columns': 360,
