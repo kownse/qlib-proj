@@ -724,20 +724,20 @@ PRESET_CONFIGS = {
         'dropout_rates': [0.05, 0.05, 0.1, 0.1],
     },
     'alpha300_simple': {
-        # 简单版：简化架构但保持学习能力
-        # 修正：降低正则化强度，让模型能够学习
+        # 简单版：模仿原始 cnn_ae_mlp 的成功设计
+        # 关键：低 dropout，简单架构
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
-        'cnn_filters': [48, 64],  # 两层 CNN，保持一定表达能力
-        'multiscale_kernels': [5],  # 单一 kernel
+        'cnn_filters': [32, 64],  # 和原始模型一致
+        'multiscale_kernels': [3],  # 单一小 kernel
         'num_residual_blocks': 0,
         'use_attention': False,
         'use_feature_interaction': False,
-        'hidden_units': [64, 64, 128, 64],
-        'dropout_rates': [0.05, 0.1, 0.1, 0.1, 0.1],  # 适中 dropout
-        'l2_reg': 1e-5,  # 标准 L2
-        'loss_weights': {'decoder': 0.1, 'ae_action': 0.1, 'action': 1.0},  # 标准权重
+        'hidden_units': [96, 96, 512, 256, 128],  # 和原始模型一致
+        'dropout_rates': [0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03],  # 低 dropout！
+        'l2_reg': 0,  # 无 L2
+        'loss_weights': {'decoder': 0.1, 'ae_action': 0.1, 'action': 1.0},
     },
     'alpha300_regularized': {
         # 正则化版：在 simple 基础上增加适度正则化
