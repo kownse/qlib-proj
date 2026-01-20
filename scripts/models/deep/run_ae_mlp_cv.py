@@ -362,7 +362,7 @@ def setup_gpu(gpu: int, use_mixed_precision: bool = False):
 
 
 def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_precision=False):
-    """加载预训练模型并在 CV folds 上评估 IC"""
+    """加载预训练模型并在 CV folds 和2025测试集上评估 IC"""
     print("\n" + "=" * 70)
     print("CROSS-VALIDATION EVALUATION (AE-MLP)")
     print("=" * 70)
@@ -370,6 +370,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
     print(f"CV Folds: {len(CV_FOLDS)}")
     for fold in CV_FOLDS:
         print(f"  - {fold['name']}: valid {fold['valid_start']}~{fold['valid_end']}")
+    print(f"Test Set: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']} (2025)")
     print("=" * 70)
 
     # 设置 GPU
@@ -381,8 +382,17 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
     print(f"    Model input shape: {model.input_shape}")
     print(f"    Model loaded successfully")
 
+    # 预先准备2025测试集数据
+    print("\n[*] Preparing 2025 test data for evaluation...")
+    test_handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
+    test_dataset = create_dataset_for_fold(test_handler, FINAL_TEST)
+    X_test, y_test, test_index = prepare_data_from_dataset(test_dataset, "test")
+    print(f"    Test (2025): {X_test.shape}")
+
     fold_results = []
     fold_ics = []
+    fold_test_ics = []
+    batch_size = 4096  # 使用较大的 batch size 加速预测
 
     for fold_idx, fold in enumerate(CV_FOLDS):
         print(f"\n[*] Evaluating on {fold['name']}...")
@@ -395,8 +405,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
 
         print(f"    Valid: {X_valid.shape}")
 
-        # 预测
-        batch_size = 4096  # 使用较大的 batch size 加速预测
+        # 预测验证集
         outputs = model.predict(X_valid, batch_size=batch_size, verbose=0)
 
         # AE-MLP 有 3 个输出: [decoder, ae_action, action]
@@ -405,36 +414,55 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
         else:
             valid_pred = outputs.flatten()
 
-        # 计算 IC
+        # 计算验证集 IC
         mean_ic, ic_std, icir = compute_ic(valid_pred, y_valid, valid_index)
 
+        # ========== 2025 测试集评估 ==========
+        test_outputs = model.predict(X_test, batch_size=batch_size, verbose=0)
+        if isinstance(test_outputs, list) and len(test_outputs) == 3:
+            test_pred = test_outputs[2].flatten()
+        else:
+            test_pred = test_outputs.flatten()
+        test_ic, test_ic_std, test_icir = compute_ic(test_pred, y_test, test_index)
+
         fold_ics.append(mean_ic)
+        fold_test_ics.append(test_ic)
         fold_results.append({
             'name': fold['name'],
             'ic': mean_ic,
             'icir': icir,
+            'test_ic': test_ic,
+            'test_icir': test_icir,
         })
 
-        print(f"    {fold['name']}: IC={mean_ic:.4f}, ICIR={icir:.4f}")
+        print(f"    {fold['name']}: Valid IC={mean_ic:.4f}, Test IC (2025)={test_ic:.4f}")
 
     # 汇总结果
     mean_ic_all = np.mean(fold_ics)
     std_ic_all = np.std(fold_ics)
+    mean_test_ic_all = np.mean(fold_test_ics)
+    std_test_ic_all = np.std(fold_test_ics)
 
     print("\n" + "=" * 70)
     print("CV EVALUATION COMPLETE")
     print("=" * 70)
-    print(f"Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+    print(f"Valid Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+    print(f"Test Mean IC (2025): {mean_test_ic_all:.4f} (±{std_test_ic_all:.4f})")
     print("\nIC by fold:")
+    print(f"  {'Fold':<25s} {'Valid IC':>10s} {'Test IC':>10s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10}")
     for r in fold_results:
-        print(f"  {r['name']}: IC={r['ic']:.4f}, ICIR={r['icir']:.4f}")
+        print(f"  {r['name']:<25s} {r['ic']:>10.4f} {r['test_ic']:>10.4f}")
     print("=" * 70)
 
-    return fold_results, mean_ic_all, std_ic_all
+    # 返回测试集预测（用于backtest）
+    test_pred_series = pd.Series(test_pred, index=test_index, name='score')
+
+    return fold_results, mean_ic_all, std_ic_all, test_pred_series, test_dataset
 
 
 def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=False):
-    """运行 CV 训练以复现 IC"""
+    """运行 CV 训练以复现 IC，同时在2025测试集上评估"""
     print("\n" + "=" * 70)
     print("CROSS-VALIDATION TRAINING (AE-MLP)")
     print("=" * 70)
@@ -442,6 +470,7 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
     for fold in CV_FOLDS:
         print(f"  - {fold['name']}: train {fold['train_start']}~{fold['train_end']}, "
               f"valid {fold['valid_start']}~{fold['valid_end']}")
+    print(f"Test Set: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']} (2025)")
     print(f"Epochs: {args.cv_epochs}")
     print(f"Early stop patience: {args.cv_early_stop}")
     if args.seed is not None:
@@ -451,8 +480,16 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
     # 设置 GPU
     setup_gpu(args.gpu, use_mixed_precision)
 
+    # 预先准备2025测试集数据（只需准备一次）
+    print("\n[*] Preparing 2025 test data for evaluation...")
+    test_handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
+    test_dataset = create_dataset_for_fold(test_handler, FINAL_TEST)
+    X_test, y_test, test_index = prepare_data_from_dataset(test_dataset, "test")
+    print(f"    Test (2025): {X_test.shape}")
+
     fold_results = []
     fold_ics = []
+    fold_test_ics = []
 
     for fold_idx, fold in enumerate(CV_FOLDS):
         print(f"\n[*] Training {fold['name']}...")
@@ -512,34 +549,47 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
         _, _, valid_pred = model.predict(X_valid, batch_size=batch_size, verbose=0)
         valid_pred = valid_pred.flatten()
 
-        # 计算 IC
+        # 计算验证集 IC
         mean_ic, ic_std, icir = compute_ic(valid_pred, y_valid, valid_index)
+
+        # ========== 2025 测试集评估 ==========
+        _, _, test_pred = model.predict(X_test, batch_size=batch_size, verbose=0)
+        test_pred = test_pred.flatten()
+        test_ic, test_ic_std, test_icir = compute_ic(test_pred, y_test, test_index)
 
         best_epoch = len(history.history['loss']) - args.cv_early_stop
         if best_epoch < 1:
             best_epoch = len(history.history['loss'])
 
         fold_ics.append(mean_ic)
+        fold_test_ics.append(test_ic)
         fold_results.append({
             'name': fold['name'],
             'ic': mean_ic,
             'icir': icir,
+            'test_ic': test_ic,
+            'test_icir': test_icir,
             'best_epoch': best_epoch,
         })
 
-        print(f"    {fold['name']}: IC={mean_ic:.4f}, ICIR={icir:.4f}, best_epoch={best_epoch}")
+        print(f"    {fold['name']}: Valid IC={mean_ic:.4f}, Test IC (2025)={test_ic:.4f}, epoch={best_epoch}")
 
     # 汇总结果
     mean_ic_all = np.mean(fold_ics)
     std_ic_all = np.std(fold_ics)
+    mean_test_ic_all = np.mean(fold_test_ics)
+    std_test_ic_all = np.std(fold_test_ics)
 
     print("\n" + "=" * 70)
     print("CV TRAINING COMPLETE")
     print("=" * 70)
-    print(f"Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+    print(f"Valid Mean IC: {mean_ic_all:.4f} (±{std_ic_all:.4f})")
+    print(f"Test Mean IC (2025): {mean_test_ic_all:.4f} (±{std_test_ic_all:.4f})")
     print("\nIC by fold:")
+    print(f"  {'Fold':<25s} {'Valid IC':>10s} {'Test IC':>10s} {'Epoch':>8s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*8}")
     for r in fold_results:
-        print(f"  {r['name']}: IC={r['ic']:.4f}, ICIR={r['icir']:.4f}, epoch={r['best_epoch']}")
+        print(f"  {r['name']:<25s} {r['ic']:>10.4f} {r['test_ic']:>10.4f} {r['best_epoch']:>8d}")
     print("=" * 70)
 
     return fold_results, mean_ic_all, std_ic_all
@@ -723,12 +773,41 @@ def main():
         print(f"Handler: {args.handler}")
         print(f"N-day: {args.nday}")
         print(f"GPU: {args.gpu}")
+        print(f"Backtest: {'ON' if args.backtest else 'OFF'}")
         print("=" * 70)
 
-        fold_results, mean_ic, std_ic = run_cv_evaluation(
+        fold_results, mean_ic, std_ic, test_pred, test_dataset = run_cv_evaluation(
             args, handler_config, symbols, args.model_path,
             use_mixed_precision=use_mixed_precision
         )
+
+        # 回测（评估模式）
+        if args.backtest:
+            print("\n[*] Running backtest on 2025 test set...")
+            pred_df = test_pred.to_frame("score")
+
+            time_splits = {
+                'train_start': FINAL_TEST['train_start'],
+                'train_end': FINAL_TEST['train_end'],
+                'valid_start': FINAL_TEST['valid_start'],
+                'valid_end': FINAL_TEST['valid_end'],
+                'test_start': FINAL_TEST['test_start'],
+                'test_end': FINAL_TEST['test_end'],
+            }
+
+            def load_model_func(path):
+                return keras.models.load_model(str(path))
+
+            def get_feature_count_func(m):
+                return m.input_shape[1]
+
+            run_backtest(
+                args.model_path, test_dataset, pred_df, args, time_splits,
+                model_name="AE-MLP (CV Eval)",
+                load_model_func=load_model_func,
+                get_feature_count_func=get_feature_count_func
+            )
+
         return
 
     # ========== 训练模式 ==========
@@ -768,15 +847,20 @@ def main():
                 args, handler_config, symbols, params,
                 use_mixed_precision=use_mixed_precision
             )
+            # 计算测试集平均IC
+            mean_test_ic = np.mean([r['test_ic'] for r in fold_results])
             all_results.append({
                 'seed': seed,
                 'mean_ic': mean_ic,
                 'std_ic': std_ic,
+                'mean_test_ic': mean_test_ic,
                 'fold_results': fold_results,
             })
 
-        # 找到最佳种子
+        # 找到最佳种子（基于验证集IC）
         best_result = max(all_results, key=lambda x: x['mean_ic'])
+        # 也找出测试集最佳种子
+        best_test_result = max(all_results, key=lambda x: x['mean_test_ic'])
         args.seed = best_result['seed']
         fold_results = best_result['fold_results']
         mean_ic = best_result['mean_ic']
@@ -785,10 +869,14 @@ def main():
         print("\n" + "=" * 70)
         print("MULTI-SEED SUMMARY")
         print("=" * 70)
+        print(f"  {'Seed':<10s} {'Valid IC':>12s} {'Test IC (2025)':>16s}")
+        print(f"  {'-'*10} {'-'*12} {'-'*16}")
         for r in all_results:
-            marker = " ★ BEST" if r['seed'] == best_result['seed'] else ""
-            print(f"  Seed {r['seed']}: Mean IC = {r['mean_ic']:.4f} (±{r['std_ic']:.4f}){marker}")
-        print(f"\nBest seed: {best_result['seed']} with Mean IC = {best_result['mean_ic']:.4f}")
+            valid_marker = " ★" if r['seed'] == best_result['seed'] else ""
+            test_marker = " ◆" if r['seed'] == best_test_result['seed'] else ""
+            print(f"  {r['seed']:<10d} {r['mean_ic']:>10.4f}{valid_marker:<2s} {r['mean_test_ic']:>14.4f}{test_marker:<2s}")
+        print(f"\n★ Best valid seed: {best_result['seed']} (Valid IC={best_result['mean_ic']:.4f}, Test IC={best_result['mean_test_ic']:.4f})")
+        print(f"◆ Best test seed:  {best_test_result['seed']} (Valid IC={best_test_result['mean_ic']:.4f}, Test IC={best_test_result['mean_test_ic']:.4f})")
         print("=" * 70)
     else:
         fold_results, mean_ic, std_ic = run_cv_training(
