@@ -386,10 +386,10 @@ class CNNAEMLPV2:
         encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
         encoder = layers.Activation('swish', name='encoder_act')(encoder)
 
-        # Decoder (重建 CNN 特征，而非原始输入)
+        # Decoder (重建原始输入，提供正则化)
         decoder = layers.Dropout(self.dropout_rates[1], name='decoder_dropout')(encoder)
         decoder = layers.Dense(
-            self.cnn_output_dim,  # 重建 CNN 输出维度
+            self.num_columns,  # 重建原始输入维度
             name='decoder'
         )(decoder)
 
@@ -552,38 +552,55 @@ class CNNAEMLPV2:
             ),
         ]
 
-        # 训练数据
-        # Decoder 目标是 CNN 输出，需要先前向传播获取
-        # 这里简化处理：用 X_train 的投影作为目标（会在训练中自动对齐）
-        # 实际上 Keras 会自动处理这个问题
+        # 使用 tf.data.Dataset 流式加载数据，减少显存占用
+        # Decoder 目标改为重建原始输入（而不是 CNN 特征），进一步减少内存
+        def create_tf_dataset(X, y, batch_size, shuffle=True):
+            """创建 tf.data.Dataset，数据保持在 CPU 上直到需要时才传输到 GPU"""
+            with tf.device('/CPU:0'):
+                # 转换为 float32
+                X_tensor = X.astype(np.float32)
+                y_tensor = y.astype(np.float32)
 
-        # 临时构建一个只有 CNN 部分的模型来获取 CNN 输出
-        cnn_model = Model(
-            inputs=self.model.input,
-            outputs=self.model.get_layer('pool_concat').output
-        )
-        cnn_train_out = cnn_model.predict(X_train, batch_size=self.batch_size, verbose=0)
-        cnn_valid_out = cnn_model.predict(X_valid, batch_size=self.batch_size, verbose=0)
+                # 创建输出字典
+                outputs = {
+                    'decoder': X_tensor,  # 重建原始输入
+                    'ae_action': y_tensor,
+                    'action': y_tensor,
+                }
 
-        train_outputs = {
-            'decoder': cnn_train_out,  # 重建 CNN 特征
-            'ae_action': y_train,
-            'action': y_train,
-        }
-        valid_outputs = {
-            'decoder': cnn_valid_out,
-            'ae_action': y_valid,
-            'action': y_valid,
-        }
+                dataset = tf.data.Dataset.from_tensor_slices((X_tensor, outputs))
+
+                if shuffle:
+                    # 使用较小的 buffer 避免内存问题
+                    buffer_size = min(len(X), 50000)
+                    dataset = dataset.shuffle(buffer_size=buffer_size)
+
+                dataset = dataset.batch(batch_size)
+                dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+            return dataset
+
+        print("\n[*] Creating tf.data.Dataset...")
+        train_dataset = create_tf_dataset(X_train, y_train, self.batch_size, shuffle=True)
+        valid_dataset = create_tf_dataset(X_valid, y_valid, self.batch_size, shuffle=False)
+
+        # 计算 steps
+        steps_per_epoch = len(X_train) // self.batch_size
+        validation_steps = len(X_valid) // self.batch_size
+
+        # 释放原始 numpy 数组以节省内存
+        del X_train, X_valid, y_train, y_valid
+        import gc
+        gc.collect()
 
         # 训练
         print("\n[*] Training...")
         history = self.model.fit(
-            X_train,
-            train_outputs,
-            validation_data=(X_valid, valid_outputs),
+            train_dataset,
+            validation_data=valid_dataset,
             epochs=self.n_epochs,
-            batch_size=self.batch_size,
+            steps_per_epoch=steps_per_epoch,
+            validation_steps=validation_steps,
             callbacks=cb_list,
             verbose=verbose,
         )
