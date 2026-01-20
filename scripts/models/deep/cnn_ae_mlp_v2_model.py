@@ -722,36 +722,35 @@ PRESET_CONFIGS = {
         'dropout_rates': [0.05, 0.05, 0.1, 0.1],
     },
     'alpha300_simple': {
-        # 简单版：类似 AE-MLP 的简单结构，最小化 CNN 复杂度
-        # 重点：强正则化 + 简单架构
+        # 简单版：简化架构但保持学习能力
+        # 修正：降低正则化强度，让模型能够学习
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
-        'cnn_filters': [32],  # 单层小 CNN
-        'multiscale_kernels': [5],  # 单一 kernel，捕获周级模式
+        'cnn_filters': [48, 64],  # 两层 CNN，保持一定表达能力
+        'multiscale_kernels': [5],  # 单一 kernel
         'num_residual_blocks': 0,
         'use_attention': False,
         'use_feature_interaction': False,
-        'hidden_units': [64, 64, 128, 64],  # 小 MLP
-        'dropout_rates': [0.1, 0.2, 0.2, 0.2, 0.2],  # 更高 dropout
-        'l2_reg': 1e-4,  # 更强 L2 正则化
-        'loss_weights': {'decoder': 0.3, 'ae_action': 0.1, 'action': 1.0},  # 增加 decoder 权重
+        'hidden_units': [64, 64, 128, 64],
+        'dropout_rates': [0.05, 0.1, 0.1, 0.1, 0.1],  # 适中 dropout
+        'l2_reg': 1e-5,  # 标准 L2
+        'loss_weights': {'decoder': 0.1, 'ae_action': 0.1, 'action': 1.0},  # 标准权重
     },
     'alpha300_regularized': {
-        # 正则化版：保留中等复杂度但增强正则化
-        # 适合在验证集表现好但测试集差的情况
+        # 正则化版：在 simple 基础上增加适度正则化
         'num_columns': 300,
         'time_steps': 60,
         'features_per_step': 5,
-        'cnn_filters': [32, 64],
+        'cnn_filters': [48, 64],
         'multiscale_kernels': [3, 7],  # 短期 + 中期模式
         'num_residual_blocks': 1,
-        'use_attention': False,  # 关闭注意力减少复杂度
+        'use_attention': False,
         'use_feature_interaction': False,
         'hidden_units': [64, 64, 128, 64],
-        'dropout_rates': [0.1, 0.2, 0.25, 0.25, 0.2],  # 高 dropout
-        'l2_reg': 5e-5,
-        'loss_weights': {'decoder': 0.2, 'ae_action': 0.1, 'action': 1.0},
+        'dropout_rates': [0.05, 0.15, 0.15, 0.15, 0.1],  # 适中 dropout
+        'l2_reg': 2e-5,
+        'loss_weights': {'decoder': 0.15, 'ae_action': 0.1, 'action': 1.0},
     },
     'alpha360': {
         'num_columns': 360,
