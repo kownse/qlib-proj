@@ -546,16 +546,18 @@ class CNNAEMLPV2:
             self.model.summary(print_fn=lambda x: print(f"    {x}"))
 
         # 回调
+        # 监控 val_loss（综合损失）而不是 val_action_loss
+        # 因为 val_loss 综合了 decoder/ae_action/action，更稳定
         cb_list = [
             callbacks.EarlyStopping(
-                monitor='val_action_loss',
+                monitor='val_loss',
                 patience=self.early_stop,
                 restore_best_weights=True,
                 verbose=1,
                 mode='min'
             ),
             callbacks.ReduceLROnPlateau(
-                monitor='val_action_loss',
+                monitor='val_loss',
                 factor=0.5,
                 patience=5,
                 min_lr=1e-6,
