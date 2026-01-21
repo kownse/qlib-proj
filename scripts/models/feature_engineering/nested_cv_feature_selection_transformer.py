@@ -1,11 +1,12 @@
 """
-Transformer 嵌套交叉验证 Forward Selection - 基于 Alpha300 逐步添加 Macro 和 TALib 特征
+Transformer 嵌套交叉验证 Forward Selection (贪婪模式) - 基于 Alpha300 逐步添加 Macro 和 TALib 特征
 
 设计原理:
 - 从 Alpha300 (5 OHLCV × 60 days = 300 features) 作为基线
 - 逐个测试候选特征（macro 和 TALib），每个特征加入过去60天的值
-- 如果某特征加入后导致 IC 变差，则加入排除列表并立即保存
-- 一轮中所有能提升 IC 的特征都会被加入下一轮的特征集
+- 贪婪添加：当发现一个特征能提升IC超过阈值(默认0.002)时，立即添加到特征集
+- 如果某特征加入后导致 IC 变差，则加入排除列表
+- 每次添加或排除特征后立即保存checkpoint，支持中断恢复
 
 内层CV (只用2000-2024年数据):
   Fold 1: train 2000-2020, valid 2021
@@ -14,9 +15,17 @@ Transformer 嵌套交叉验证 Forward Selection - 基于 Alpha300 逐步添加 
   Fold 4: train 2000-2023, valid 2024
 
 使用方法:
+    # 从头开始
     python scripts/models/feature_engineering/nested_cv_feature_selection_transformer.py --stock-pool sp500
+
+    # 从checkpoint恢复（读取已添加和已排除的特征）
     python scripts/models/feature_engineering/nested_cv_feature_selection_transformer.py --resume
+
+    # 从指定文件恢复
     python scripts/models/feature_engineering/nested_cv_feature_selection_transformer.py --resume-from forward_selection_transformer_xxx.json
+
+    # 指定IC提升阈值
+    python scripts/models/feature_engineering/nested_cv_feature_selection_transformer.py --min-improvement 0.003
 """
 
 import os
@@ -308,7 +317,13 @@ class DynamicAlpha300Handler(DataHandlerLP):
 # ============================================================================
 
 class TransformerForwardSelection(ForwardSelectionBase):
-    """Transformer 模型的 Forward Selection 实现"""
+    """Transformer 模型的 Forward Selection 实现
+
+    特点：
+    - 贪婪添加：当发现一个特征能提升IC超过阈值时，立即添加
+    - 每次添加后保存checkpoint，方便resume
+    - 支持从checkpoint恢复，包括已添加的特征和已排除的特征
+    """
 
     def __init__(
         self,
@@ -319,7 +334,7 @@ class TransformerForwardSelection(ForwardSelectionBase):
         candidate_macro: List[str],
         nday: int = 5,
         max_features: int = 30,
-        min_improvement: float = 0.0005,
+        min_improvement: float = 0.002,  # 默认阈值改为 0.002
         epochs: int = 20,
         early_stop: int = 8,
         params: dict = None,
@@ -351,6 +366,201 @@ class TransformerForwardSelection(ForwardSelectionBase):
             self.device = torch.device(f'cuda:{gpu}')
         else:
             self.device = torch.device('cpu')
+
+    def run(
+        self,
+        excluded_features: set = None,
+        method_name: str = "nested_cv_transformer_forward_selection",
+    ) -> Tuple[Dict, List, set]:
+        """
+        运行贪婪 forward selection
+
+        与基类不同的是，这里采用贪婪策略：
+        - 当发现一个特征能提升IC超过阈值时，立即添加到特征集
+        - 每次添加后更新baseline IC并保存checkpoint
+        - 继续测试剩余候选特征（基于更新后的特征集）
+        """
+        from models.feature_engineering.feature_selection_utils import (
+            INNER_CV_FOLDS, save_final_result,
+        )
+
+        if excluded_features is not None:
+            self.excluded_features = set(excluded_features)
+
+        counts = self.get_feature_counts()
+        counts_str = " + ".join([f"{v} {k}" for k, v in counts.items()])
+
+        print("\n" + "=" * 70)
+        print("NESTED CV FORWARD SELECTION (Greedy Mode)")
+        print("=" * 70)
+        print(f"Current features: {counts_str}")
+        print(f"Max features: {self.max_features}")
+        print(f"Min IC improvement to add: {self.min_improvement}")
+        print(f"Inner CV Folds: {len(INNER_CV_FOLDS)}")
+        print("=" * 70)
+
+        if self.excluded_features:
+            print(f"\nExcluded features from previous runs: {len(self.excluded_features)}")
+
+        # 基线评估
+        print("\n[*] Evaluating baseline features...")
+        self.baseline_ic, baseline_fold_ics = self.evaluate_feature_set()
+        self.current_ic = self.baseline_ic
+
+        print(f"    Baseline Inner CV IC: {self.baseline_ic:.4f}")
+        print(f"    Fold ICs: {[f'{ic:.4f}' for ic in baseline_fold_ics]}")
+
+        counts = self.get_feature_counts()
+        self.history.append({
+            'round': 0,
+            'action': 'BASELINE',
+            'feature': None,
+            'type': None,
+            'inner_cv_ic': self.baseline_ic,
+            'fold_ics': baseline_fold_ics,
+            'ic_change': 0,
+            **{f'{k}_count': v for k, v in counts.items()},
+        })
+
+        # 保存初始 checkpoint
+        self._save_checkpoint(0)
+
+        round_num = 0
+        features_added_this_session = 0
+
+        # 贪婪 forward selection loop
+        while sum(self.get_feature_counts().values()) < self.max_features:
+            round_num += 1
+
+            testable_talib, testable_macro = self.get_testable_candidates()
+
+            if not testable_talib and not testable_macro:
+                print(f"\n[!] No more candidates to test. Stopping.")
+                break
+
+            counts = self.get_feature_counts()
+            counts_str = " + ".join([f"{v} {k}" for k, v in counts.items()])
+            print(f"\n[Round {round_num}] Current IC: {self.current_ic:.4f}, Features: {counts_str}")
+            print(f"    Excluded: {len(self.excluded_features)}, Candidates: {len(testable_talib)} TALib + {len(testable_macro)} macro")
+
+            found_improvement = False
+
+            # 测试 TALib 特征
+            talib_items = list(testable_talib.items())
+            for name, expr in talib_items:
+                if name in self.excluded_features:
+                    continue
+
+                try:
+                    self.cleanup_after_evaluation()
+                    ic, fold_ics = self.test_feature(name, 'feature', expr)
+                    ic_change = ic - self.current_ic
+
+                    if ic_change < 0:
+                        # IC 下降，排除该特征
+                        self.excluded_features.add(name)
+                        self._save_checkpoint(round_num)
+                        print(f"    X {name}: IC={ic:.4f} ({ic_change:+.4f}) -> excluded")
+
+                    elif ic_change >= self.min_improvement:
+                        # IC 提升足够，立即添加
+                        self.add_feature(name, 'feature', expr)
+                        self.current_ic = ic
+                        features_added_this_session += 1
+
+                        counts = self.get_feature_counts()
+                        self.history.append({
+                            'round': round_num,
+                            'action': 'ADD',
+                            'feature': name,
+                            'type': 'talib',
+                            'inner_cv_ic': ic,
+                            'fold_ics': fold_ics,
+                            'ic_change': ic_change,
+                            **{f'{k}_count': v for k, v in counts.items()},
+                        })
+
+                        self._save_checkpoint(round_num)
+                        print(f"    + {name}: IC={ic:.4f} (+{ic_change:.4f}) -> ADDED")
+                        found_improvement = True
+
+                    else:
+                        # IC 提升不够，暂不添加也不排除
+                        print(f"      {name}: IC={ic:.4f} ({ic_change:+.4f}) -> skipped (below threshold)")
+
+                except Exception as e:
+                    print(f"    ! {name}: ERROR - {e}")
+
+            # 测试 Macro 特征
+            macro_items = list(testable_macro)
+            for name in macro_items:
+                if name in self.excluded_features:
+                    continue
+
+                try:
+                    self.cleanup_after_evaluation()
+                    ic, fold_ics = self.test_feature(name, 'macro', None)
+                    ic_change = ic - self.current_ic
+
+                    if ic_change < 0:
+                        # IC 下降，排除该特征
+                        self.excluded_features.add(name)
+                        self._save_checkpoint(round_num)
+                        print(f"    X {name}: IC={ic:.4f} ({ic_change:+.4f}) -> excluded")
+
+                    elif ic_change >= self.min_improvement:
+                        # IC 提升足够，立即添加
+                        self.add_feature(name, 'macro', None)
+                        self.current_ic = ic
+                        features_added_this_session += 1
+
+                        counts = self.get_feature_counts()
+                        self.history.append({
+                            'round': round_num,
+                            'action': 'ADD',
+                            'feature': name,
+                            'type': 'macro',
+                            'inner_cv_ic': ic,
+                            'fold_ics': fold_ics,
+                            'ic_change': ic_change,
+                            **{f'{k}_count': v for k, v in counts.items()},
+                        })
+
+                        self._save_checkpoint(round_num)
+                        print(f"    + {name}: IC={ic:.4f} (+{ic_change:.4f}) -> ADDED")
+                        found_improvement = True
+
+                    else:
+                        # IC 提升不够，暂不添加也不排除
+                        print(f"      {name}: IC={ic:.4f} ({ic_change:+.4f}) -> skipped (below threshold)")
+
+                except Exception as e:
+                    print(f"    ! {name}: ERROR - {e}")
+
+            # 如果这一轮没有找到任何改进，停止
+            if not found_improvement:
+                print(f"\n[!] No feature improved IC by >= {self.min_improvement} in this round. Stopping.")
+                break
+
+        # 打印最终结果
+        self._print_final_result()
+        print(f"\nFeatures added this session: {features_added_this_session}")
+
+        # 保存最终结果
+        if self.output_dir:
+            result_file = save_final_result(
+                self.output_dir,
+                self.result_prefix,
+                method_name,
+                self.baseline_ic,
+                self.current_ic,
+                self.get_current_features_dict(),
+                self.excluded_features,
+                self.history,
+            )
+            print(f"Results saved to: {result_file}")
+
+        return self.get_current_features_dict(), self.history, self.excluded_features
 
     def prepare_fold_data(self, fold_config: Dict) -> Tuple:
         """准备单个fold的数据"""
@@ -585,8 +795,11 @@ class TransformerForwardSelection(ForwardSelectionBase):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Transformer Nested CV Forward Feature Selection')
+    parser = argparse.ArgumentParser(description='Transformer Nested CV Forward Feature Selection (Greedy Mode)')
     add_common_args(parser)
+
+    # 覆盖 min_improvement 默认值为 0.002
+    parser.set_defaults(min_improvement=0.002)
 
     # Transformer 特有参数
     parser.add_argument('--d-model', type=int, default=64)
@@ -639,19 +852,35 @@ def main():
             baseline_macro = checkpoint.get('final_macro_features', [])
 
         excluded_features = set(checkpoint.get('excluded_features', []))
-        print(f"    Features: {len(baseline_talib)} TALib + {len(baseline_macro)} macro")
+        print(f"    Current IC: {checkpoint.get('current_ic', 'N/A')}")
+        print(f"    Included TALib: {len(baseline_talib)}")
+        if baseline_talib:
+            for name in sorted(baseline_talib.keys()):
+                print(f"      - {name}")
+        print(f"    Included Macro: {len(baseline_macro)}")
+        if baseline_macro:
+            for name in baseline_macro:
+                print(f"      - {name}")
         print(f"    Excluded: {len(excluded_features)}")
 
     elif args.resume:
         checkpoint_file = output_dir / "forward_selection_transformer_checkpoint.json"
         if checkpoint_file.exists():
-            print(f"\n[*] Resuming from checkpoint")
+            print(f"\n[*] Resuming from checkpoint: {checkpoint_file}")
             checkpoint = load_checkpoint(checkpoint_file)
 
-            baseline_talib = checkpoint['current_talib_features']
-            baseline_macro = checkpoint['current_macro_features']
+            baseline_talib = checkpoint.get('current_talib_features', {})
+            baseline_macro = checkpoint.get('current_macro_features', [])
             excluded_features = set(checkpoint.get('excluded_features', []))
-            print(f"    Features: {len(baseline_talib)} TALib + {len(baseline_macro)} macro")
+            print(f"    Current IC: {checkpoint.get('current_ic', 'N/A')}")
+            print(f"    Included TALib: {len(baseline_talib)}")
+            if baseline_talib:
+                for name in sorted(baseline_talib.keys()):
+                    print(f"      - {name}")
+            print(f"    Included Macro: {len(baseline_macro)}")
+            if baseline_macro:
+                for name in baseline_macro:
+                    print(f"      - {name}")
             print(f"    Excluded: {len(excluded_features)}")
         else:
             print("No checkpoint file found, starting fresh")
@@ -693,6 +922,7 @@ def main():
     print(f"    lr: {params['lr']}")
     print(f"    epochs: {args.epochs}")
     print(f"    early_stop: {args.early_stop}")
+    print(f"    min_improvement: {args.min_improvement} (IC threshold to add feature)")
 
     # 倒计时
     if not args.no_countdown:
