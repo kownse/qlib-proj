@@ -20,6 +20,7 @@ Generated features (~105 total):
 """
 
 import argparse
+import warnings
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -273,7 +274,7 @@ class MacroFeatureProcessor:
 
     def _pct_change(self, series: pd.Series, periods: int) -> pd.Series:
         """Calculate percentage change over N periods."""
-        return series.pct_change(periods)
+        return series.pct_change(periods, fill_method=None)
 
     def _ma_ratio(self, series: pd.Series, window: int) -> pd.Series:
         """Calculate ratio of current value to moving average."""
@@ -288,7 +289,7 @@ class MacroFeatureProcessor:
 
     def _volatility(self, series: pd.Series, window: int) -> pd.Series:
         """Calculate rolling volatility (std of returns)."""
-        returns = series.pct_change()
+        returns = series.pct_change(fill_method=None)
         return returns.rolling(window=window, min_periods=1).std()
 
     def _vix_regime(self, vix_series: pd.Series) -> pd.Series:
@@ -329,6 +330,9 @@ class MacroFeatureProcessor:
         Returns:
             DataFrame with date index and feature columns
         """
+        # 抑制 DataFrame 碎片化警告（由于逐列添加特征导致）
+        warnings.filterwarnings('ignore', message='DataFrame is highly fragmented')
+
         # Get common date index from all available data
         all_dates = set()
         for df in self._data.values():
@@ -591,6 +595,9 @@ class MacroFeatureProcessor:
         elif feature_set == "vix_only":
             available = [f for f in self.VIX_ONLY_FEATURES if f in features.columns]
             features = features[available]
+
+        # Defragment DataFrame (avoid PerformanceWarning from repeated column inserts)
+        features = features.copy()
 
         # Forward fill missing values (up to 5 days)
         features = features.ffill(limit=5)

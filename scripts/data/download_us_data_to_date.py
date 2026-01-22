@@ -190,9 +190,17 @@ def download_missing_data(symbols: list, csv_dir: Path, end_date: str):
 
 def convert_to_qlib_bin(csv_dir: Path, qlib_dir: Path):
     """将 CSV 转换为 Qlib bin 格式"""
-    scripts_path = str(PROJECT_ROOT / "qlib" / "scripts")
-    if scripts_path not in sys.path:
-        sys.path.insert(0, scripts_path)
+    # 尝试多个可能的路径
+    possible_paths = [
+        PROJECT_ROOT / "qlib-src" / "scripts",
+        PROJECT_ROOT / "qlib" / "scripts",
+    ]
+
+    for scripts_path in possible_paths:
+        if scripts_path.exists():
+            if str(scripts_path) not in sys.path:
+                sys.path.insert(0, str(scripts_path))
+            break
 
     from dump_bin import DumpDataAll
 
@@ -219,7 +227,10 @@ def convert_to_qlib_bin(csv_dir: Path, qlib_dir: Path):
 
 
 def create_instruments_file(symbols: list, qlib_dir: Path, pool_name: str = "sp500"):
-    """创建股票池文件，根据实际 CSV 数据确定日期范围"""
+    """创建股票池文件，根据实际 CSV 数据确定日期范围
+
+    注意：Qlib dump_bin 会将股票代码转为小写，所以 instruments 文件也要用小写
+    """
     instruments_dir = qlib_dir / "instruments"
     instruments_dir.mkdir(parents=True, exist_ok=True)
 
@@ -235,7 +246,8 @@ def create_instruments_file(symbols: list, qlib_dir: Path, pool_name: str = "sp5
                 if not df.empty:
                     start = df.index.min().strftime("%Y-%m-%d")
                     end = df.index.max().strftime("%Y-%m-%d")
-                    stock_ranges.append((symbol, start, end))
+                    # 使用小写符号以匹配 Qlib dump_bin 的行为
+                    stock_ranges.append((symbol.lower(), start, end))
             except Exception:
                 pass
 
@@ -245,7 +257,8 @@ def create_instruments_file(symbols: list, qlib_dir: Path, pool_name: str = "sp5
             f.write(f"{symbol}\t{start}\t{end}\n")
 
     # 对应股票池文件
-    pool_symbols = set(STOCK_POOLS.get(pool_name, symbols))
+    # 也需要将 pool_symbols 转为小写进行比较
+    pool_symbols = set(s.lower() for s in STOCK_POOLS.get(pool_name, symbols))
     with open(instruments_dir / f"{pool_name}.txt", "w") as f:
         for symbol, start, end in stock_ranges:
             if symbol in pool_symbols:
@@ -279,13 +292,16 @@ Examples:
                         help='Only check status, do not download')
     args = parser.parse_args()
 
-    symbols = STOCK_POOLS[args.pool]
+    symbols = list(STOCK_POOLS[args.pool])
+    # 确保 SPY 总是被包含（作为 benchmark）
+    if "SPY" not in symbols:
+        symbols.append("SPY")
     end_date = datetime.now().strftime("%Y-%m-%d")
 
     print("=" * 60)
     print("US Stock Data Incremental Updater")
     print("=" * 60)
-    print(f"Stock pool: {args.pool} ({len(symbols)} stocks)")
+    print(f"Stock pool: {args.pool} ({len(symbols)} stocks, including SPY as benchmark)")
     print(f"Target date: {end_date}")
     print(f"CSV directory: {CSV_DIR}")
     print(f"Qlib directory: {QLIB_DIR}")
@@ -307,7 +323,7 @@ Examples:
             print(f"    ... and {len(status['needs_update']) - 10} more")
 
     if status['missing']:
-        print(f"\n  Missing stocks: {status['missing'][:10]}")
+        print(f"\n  Missing stocks (will be skipped): {status['missing'][:10]}")
         if len(status['missing']) > 10:
             print(f"    ... and {len(status['missing']) - 10} more")
 
@@ -330,13 +346,23 @@ Examples:
             all_success.extend(success)
             all_failed.extend(failed)
 
+        # 跳过缺失的股票（通常是已退市或被移除的），但 SPY 必须下载
         if status['missing']:
-            print("\n" + "=" * 60)
-            print("Step 2b: Downloading missing stocks")
-            print("=" * 60 + "\n")
-            success, failed = download_missing_data(status['missing'], CSV_DIR, end_date)
-            all_success.extend(success)
-            all_failed.extend(failed)
+            # 检查 SPY 是否在缺失列表中
+            if 'SPY' in status['missing']:
+                print("\n" + "=" * 60)
+                print("Step 2b: Downloading SPY (benchmark)")
+                print("=" * 60 + "\n")
+                spy_success, spy_failed = download_missing_data(['SPY'], CSV_DIR, end_date)
+                all_success.extend(spy_success)
+                all_failed.extend(spy_failed)
+                # 从缺失列表中移除 SPY
+                remaining_missing = [s for s in status['missing'] if s != 'SPY']
+            else:
+                remaining_missing = status['missing']
+
+            if remaining_missing:
+                print(f"\n  Skipping {len(remaining_missing)} missing stocks (likely delisted or removed from index)")
 
         print(f"\nDownload summary: {len(all_success)} success, {len(all_failed)} failed")
         if all_failed:
