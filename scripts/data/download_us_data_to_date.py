@@ -226,6 +226,69 @@ def convert_to_qlib_bin(csv_dir: Path, qlib_dir: Path):
     print("Conversion completed!")
 
 
+def extend_calendar_with_future_dates(qlib_dir: Path, days_ahead: int = 10):
+    """向 Qlib 日历添加未来几天的交易日
+
+    Qlib 回测需要访问 end_date 下一天的日历数据，
+    所以需要预先添加未来的交易日到日历中。
+
+    Parameters
+    ----------
+    qlib_dir : Path
+        Qlib 数据目录
+    days_ahead : int
+        要添加的未来天数（默认 10 天，约 2 周工作日）
+    """
+    calendar_path = qlib_dir / "calendars" / "day.txt"
+
+    if not calendar_path.exists():
+        print(f"Warning: Calendar file not found: {calendar_path}")
+        return
+
+    # 读取现有日历
+    with open(calendar_path, 'r') as f:
+        dates = [line.strip() for line in f.readlines() if line.strip()]
+
+    if not dates:
+        print("Warning: Calendar is empty")
+        return
+
+    # 获取最新日期
+    latest_date = datetime.strptime(dates[-1], "%Y-%m-%d")
+    today = datetime.now()
+
+    # 如果日历已经超过今天，不需要添加
+    if latest_date >= today + timedelta(days=days_ahead):
+        print(f"Calendar already extends to {latest_date.strftime('%Y-%m-%d')}, no need to extend")
+        return
+
+    # 生成未来的交易日（周一到周五）
+    new_dates = []
+    current_date = latest_date + timedelta(days=1)
+    target_date = today + timedelta(days=days_ahead)
+
+    while current_date <= target_date:
+        # 跳过周末 (5=Saturday, 6=Sunday)
+        if current_date.weekday() < 5:
+            date_str = current_date.strftime("%Y-%m-%d")
+            if date_str not in dates:  # 避免重复
+                new_dates.append(date_str)
+        current_date += timedelta(days=1)
+
+    if not new_dates:
+        print("No future dates to add")
+        return
+
+    # 追加到日历文件
+    with open(calendar_path, 'a') as f:
+        for date in new_dates:
+            f.write(f"{date}\n")
+
+    print(f"Extended calendar with {len(new_dates)} future trading days")
+    print(f"  Latest existing date: {latest_date.strftime('%Y-%m-%d')}")
+    print(f"  New dates added: {new_dates[0]} to {new_dates[-1]}")
+
+
 def create_instruments_file(symbols: list, qlib_dir: Path, pool_name: str = "sp500"):
     """创建股票池文件，根据实际 CSV 数据确定日期范围
 
@@ -389,6 +452,12 @@ Examples:
     existing_csvs = list(CSV_DIR.glob("*.csv"))
     all_symbols = [f.stem for f in existing_csvs]
     create_instruments_file(all_symbols, QLIB_DIR, args.pool)
+
+    # 扩展日历以支持回测到最新日期
+    print("\n" + "=" * 60)
+    print("Step 5: Extending calendar with future trading days")
+    print("=" * 60)
+    extend_calendar_with_future_dates(QLIB_DIR, days_ahead=10)
 
     print("\n" + "=" * 60)
     print("Done!")
