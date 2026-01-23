@@ -86,6 +86,10 @@ def add_master_args(parser):
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
 
+    # 调试参数
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable detailed debug output for first training iteration')
+
     return parser
 
 
@@ -133,6 +137,48 @@ def main():
         gate_input_start = 142
         gate_input_end = 205
 
+    # Debug: 检查原始 handler 数据
+    print(f"\n[5.1] Raw handler data statistics:")
+    try:
+        raw_features = handler.fetch(col_set="feature")
+        raw_labels = handler.fetch(col_set="label")
+        print(f"    Feature shape: {raw_features.shape}")
+        print(f"    Label shape: {raw_labels.shape}")
+        print(f"    Feature columns: {len(raw_features.columns)}")
+
+        # Feature statistics
+        feat_vals = raw_features.values
+        print(f"\n    Feature stats:")
+        print(f"      mean={np.nanmean(feat_vals):.6f}, std={np.nanstd(feat_vals):.6f}")
+        print(f"      min={np.nanmin(feat_vals):.6f}, max={np.nanmax(feat_vals):.6f}")
+        print(f"      NaN%: {np.isnan(feat_vals).mean()*100:.2f}%")
+
+        # Check for extreme values
+        extreme_mask = np.abs(feat_vals) > 100
+        if extreme_mask.any():
+            print(f"      WARNING: {extreme_mask.sum()} values with |x| > 100 ({extreme_mask.mean()*100:.4f}%)")
+
+        # Stock features vs Market features
+        if raw_features.shape[1] >= gate_input_end:
+            stock_vals = feat_vals[:, :d_feat]
+            market_vals = feat_vals[:, d_feat:gate_input_end]
+            print(f"\n    Stock features [0:{d_feat}]:")
+            print(f"      mean={np.nanmean(stock_vals):.6f}, std={np.nanstd(stock_vals):.6f}")
+            print(f"      min={np.nanmin(stock_vals):.6f}, max={np.nanmax(stock_vals):.6f}")
+            print(f"    Market features [{d_feat}:{gate_input_end}]:")
+            print(f"      mean={np.nanmean(market_vals):.6f}, std={np.nanstd(market_vals):.6f}")
+            print(f"      min={np.nanmin(market_vals):.6f}, max={np.nanmax(market_vals):.6f}")
+
+        # Label statistics
+        label_vals = raw_labels.values
+        print(f"\n    Label stats:")
+        print(f"      mean={np.nanmean(label_vals):.6f}, std={np.nanstd(label_vals):.6f}")
+        print(f"      min={np.nanmin(label_vals):.6f}, max={np.nanmax(label_vals):.6f}")
+        print(f"      NaN%: {np.isnan(label_vals).mean()*100:.2f}%")
+
+    except Exception as e:
+        print(f"    Warning: Could not fetch raw handler data: {e}")
+
     # 创建 MTSDatasetH (时间序列数据集)
     print(f"\n[6] Creating time-series dataset...")
     print(f"    seq_len: {args.seq_len}")
@@ -157,19 +203,84 @@ def main():
     dl_valid = dataset.prepare("valid")
     dl_test = dataset.prepare("test")
 
-    # 检查数据格式
-    print(f"\n[7] Data format check:")
+    # 检查数据格式和统计信息
+    print(f"\n[7] Data format check and statistics:")
+    batch_count = 0
+    all_data_stats = {'mean': [], 'std': [], 'min': [], 'max': [], 'nan_pct': []}
+    all_label_stats = {'mean': [], 'std': [], 'min': [], 'max': [], 'nan_pct': []}
+
     for batch in dl_train:
         if isinstance(batch, dict):
             data = batch['data']
             label = batch['label']
-            print(f"    Data shape: {data.shape}")
-            print(f"    Label shape: {label.shape}")
-            print(f"    Expected: data=(N_stocks, T={args.seq_len}, F={gate_input_end}), label=(N_stocks,)")
+
+            if batch_count == 0:
+                print(f"    Data shape: {data.shape}")
+                print(f"    Label shape: {label.shape}")
+                print(f"    Expected: data=(N_stocks, T={args.seq_len}, F={gate_input_end}), label=(N_stocks,)")
+
+                # Detailed first batch analysis
+                print(f"\n    [First batch detailed analysis]")
+                print(f"    Data dtype: {data.dtype}")
+                print(f"    Label dtype: {label.dtype}")
+
+                # Overall data statistics
+                data_np = data.numpy()
+                label_np = label.numpy()
+                print(f"\n    Data overall: mean={np.nanmean(data_np):.6f}, std={np.nanstd(data_np):.6f}, "
+                      f"min={np.nanmin(data_np):.6f}, max={np.nanmax(data_np):.6f}")
+                print(f"    Data NaN%: {np.isnan(data_np).mean()*100:.2f}%")
+
+                # Stock features vs Market features
+                stock_feat = data_np[:, :, :d_feat]
+                market_feat = data_np[:, :, d_feat:gate_input_end]
+                print(f"\n    Stock features [0:{d_feat}]:")
+                print(f"      mean={np.nanmean(stock_feat):.6f}, std={np.nanstd(stock_feat):.6f}, "
+                      f"min={np.nanmin(stock_feat):.6f}, max={np.nanmax(stock_feat):.6f}")
+                print(f"      NaN%: {np.isnan(stock_feat).mean()*100:.2f}%")
+
+                print(f"\n    Market features [{d_feat}:{gate_input_end}]:")
+                print(f"      mean={np.nanmean(market_feat):.6f}, std={np.nanstd(market_feat):.6f}, "
+                      f"min={np.nanmin(market_feat):.6f}, max={np.nanmax(market_feat):.6f}")
+                print(f"      NaN%: {np.isnan(market_feat).mean()*100:.2f}%")
+
+                # Check last timestep market features (used for gate)
+                gate_input = data_np[:, -1, d_feat:gate_input_end]
+                print(f"\n    Gate input (last timestep market features):")
+                print(f"      shape: {gate_input.shape}")
+                print(f"      mean={np.nanmean(gate_input):.6f}, std={np.nanstd(gate_input):.6f}, "
+                      f"min={np.nanmin(gate_input):.6f}, max={np.nanmax(gate_input):.6f}")
+
+                # Label statistics
+                print(f"\n    Label: mean={np.nanmean(label_np):.6f}, std={np.nanstd(label_np):.6f}, "
+                      f"min={np.nanmin(label_np):.6f}, max={np.nanmax(label_np):.6f}")
+                print(f"    Label NaN%: {np.isnan(label_np).mean()*100:.2f}%")
+
+            # Collect statistics for aggregation
+            data_np = data.numpy()
+            label_np = label.numpy()
+            all_data_stats['mean'].append(np.nanmean(data_np))
+            all_data_stats['std'].append(np.nanstd(data_np))
+            all_data_stats['nan_pct'].append(np.isnan(data_np).mean()*100)
+            all_label_stats['mean'].append(np.nanmean(label_np))
+            all_label_stats['std'].append(np.nanstd(label_np))
+            all_label_stats['nan_pct'].append(np.isnan(label_np).mean()*100)
+
+            batch_count += 1
+            if batch_count >= 10:  # Sample first 10 batches for statistics
+                break
         else:
             data = torch.squeeze(batch, dim=0)
             print(f"    Data shape: {data.shape}")
-        break
+            break
+
+    if batch_count > 1:
+        print(f"\n    [Aggregated statistics over {batch_count} batches]")
+        print(f"    Data mean: avg={np.mean(all_data_stats['mean']):.6f}, std across batches={np.std(all_data_stats['mean']):.6f}")
+        print(f"    Data std: avg={np.mean(all_data_stats['std']):.6f}")
+        print(f"    Data NaN%: avg={np.mean(all_data_stats['nan_pct']):.2f}%")
+        print(f"    Label mean: avg={np.mean(all_label_stats['mean']):.6f}, std across batches={np.std(all_label_stats['mean']):.6f}")
+        print(f"    Label std: avg={np.mean(all_label_stats['std']):.6f}")
 
     # 构建模型参数
     model_params = {
@@ -201,6 +312,7 @@ def main():
     print(f"    lr: {model_params['lr']}")
     print(f"    n_epochs: {model_params['n_epochs']}")
     print(f"    early_stop: {model_params['early_stop']}")
+    print(f"    debug: {args.debug}")
 
     # 定义模型加载函数
     def load_model(path):
@@ -222,7 +334,7 @@ def main():
         # 训练模型
         print("\n[9] Training MASTER model...")
         model = MASTERModel(**model_params)
-        model.fit(dl_train, dl_valid)
+        model.fit(dl_train, dl_valid, debug=args.debug)
         print("    Model training completed")
 
         # 保存模型

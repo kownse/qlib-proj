@@ -297,6 +297,10 @@ class MASTER(nn.Module):
         self.d_gate_input = gate_input_end_index - gate_input_start_index
         self.d_feat = d_feat
 
+        # Layer normalization for market features (important for US market data)
+        # This normalizes market features before feeding to gate, ensuring proper softmax behavior
+        self.market_norm = nn.LayerNorm(self.d_gate_input)
+
         # Feature gate using market information
         self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
 
@@ -308,29 +312,93 @@ class MASTER(nn.Module):
         self.temporalatten = TemporalAttention(d_model=d_model)
         self.decoder = nn.Linear(d_model, 1)
 
-    def forward(self, x):
+    def forward(self, x, debug=False):
         """
         Args:
             x: (N, T, F) where F = d_feat + market_features
+            debug: If True, print detailed debug information
 
         Returns:
             (N,) predictions
         """
         # Split stock features and market features
         src = x[:, :, :self.gate_input_start_index]  # (N, T, d_feat)
-        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (N, d_gate)
+        gate_input_raw = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (N, d_gate)
+
+        if debug:
+            print("\n" + "="*80)
+            print("[DEBUG] MASTER Forward Pass")
+            print("="*80)
+            print(f"  Input x shape: {x.shape}")
+            print(f"  Stock features (src) shape: {src.shape}")
+            print(f"  Stock features stats: mean={src.mean().item():.6f}, std={src.std().item():.6f}, "
+                  f"min={src.min().item():.6f}, max={src.max().item():.6f}")
+            print(f"  Stock features NaN count: {torch.isnan(src).sum().item()}")
+            print(f"\n  Gate input (raw) shape: {gate_input_raw.shape}")
+            print(f"  Gate input (raw) stats: mean={gate_input_raw.mean().item():.6f}, std={gate_input_raw.std().item():.6f}, "
+                  f"min={gate_input_raw.min().item():.6f}, max={gate_input_raw.max().item():.6f}")
+            print(f"  Gate input (raw) NaN count: {torch.isnan(gate_input_raw).sum().item()}")
+
+        # Normalize market features for better gate behavior
+        # This is important because raw market features may have very small values
+        gate_input = self.market_norm(gate_input_raw)
+
+        if debug:
+            print(f"\n  Gate input (after LayerNorm) stats: mean={gate_input.mean().item():.6f}, std={gate_input.std().item():.6f}, "
+                  f"min={gate_input.min().item():.6f}, max={gate_input.max().item():.6f}")
 
         # Apply feature gate (broadcast to all time steps)
         gate_weight = self.feature_gate(gate_input)  # (N, d_feat)
+
+        if debug:
+            print(f"\n  Gate weight shape: {gate_weight.shape}")
+            print(f"  Gate weight stats: mean={gate_weight.mean().item():.6f}, std={gate_weight.std().item():.6f}, "
+                  f"min={gate_weight.min().item():.6f}, max={gate_weight.max().item():.6f}")
+            # Check gate weight distribution (should not be uniform if gate is working)
+            gate_entropy = -(gate_weight * torch.log(gate_weight / self.d_feat + 1e-10)).sum(dim=-1).mean()
+            print(f"  Gate weight entropy (lower=more selective): {gate_entropy.item():.4f}")
+            # Show top-5 and bottom-5 feature weights (averaged across samples)
+            avg_weights = gate_weight.mean(dim=0)
+            top5_idx = avg_weights.argsort(descending=True)[:5]
+            bot5_idx = avg_weights.argsort()[:5]
+            print(f"  Top-5 feature weights: {[(i.item(), avg_weights[i].item():.4f) for i in top5_idx]}")
+            print(f"  Bottom-5 feature weights: {[(i.item(), avg_weights[i].item():.4f) for i in bot5_idx]}")
+
         src = src * torch.unsqueeze(gate_weight, dim=1)  # (N, T, d_feat)
+
+        if debug:
+            print(f"\n  Gated src stats: mean={src.mean().item():.6f}, std={src.std().item():.6f}, "
+                  f"min={src.min().item():.6f}, max={src.max().item():.6f}")
 
         # Main forward pass
         x = self.x2y(src)  # (N, T, d_model)
+
+        if debug:
+            print(f"\n  After x2y (Linear) stats: mean={x.mean().item():.6f}, std={x.std().item():.6f}")
+
         x = self.pe(x)
         x = self.tatten(x)
+
+        if debug:
+            print(f"  After TAttention stats: mean={x.mean().item():.6f}, std={x.std().item():.6f}")
+
         x = self.satten(x)
+
+        if debug:
+            print(f"  After SAttention stats: mean={x.mean().item():.6f}, std={x.std().item():.6f}")
+
         x = self.temporalatten(x)  # (N, d_model)
+
+        if debug:
+            print(f"  After TemporalAttention stats: mean={x.mean().item():.6f}, std={x.std().item():.6f}")
+
         output = self.decoder(x).squeeze(-1)  # (N,)
+
+        if debug:
+            print(f"\n  Output shape: {output.shape}")
+            print(f"  Output stats: mean={output.mean().item():.6f}, std={output.std().item():.6f}, "
+                  f"min={output.min().item():.6f}, max={output.max().item():.6f}")
+            print("="*80 + "\n")
 
         return output
 
@@ -473,11 +541,12 @@ class MASTERModel:
         loss = (pred[mask] - label[mask]) ** 2
         return torch.mean(loss)
 
-    def _train_epoch(self, dl_train):
+    def _train_epoch(self, dl_train, debug_first_iter=False):
         """Train one epoch"""
         self.model.train()
         losses = []
         ics = []
+        is_first_iter = True
 
         # MTSDatasetH yields dict with 'data', 'label', etc.
         for batch in dl_train:
@@ -491,29 +560,104 @@ class MASTERModel:
                 feature = data[:, :, 0:-1].to(self.device)
                 label = data[:, -1, -1].to(self.device)
 
-            # Drop extreme labels and apply zscore
+            # Debug: Print input data statistics for first iteration
+            if debug_first_iter and is_first_iter:
+                print("\n" + "#"*80)
+                print("[DEBUG] First Training Iteration - Input Data")
+                print("#"*80)
+                print(f"  Raw feature shape: {feature.shape}")
+                print(f"  Raw feature stats: mean={feature.mean().item():.6f}, std={feature.std().item():.6f}, "
+                      f"min={feature.min().item():.6f}, max={feature.max().item():.6f}")
+                print(f"  Raw feature NaN count: {torch.isnan(feature).sum().item()}")
+                print(f"\n  Raw label shape: {label.shape}")
+                print(f"  Raw label stats: mean={label.mean().item():.6f}, std={label.std().item():.6f}, "
+                      f"min={label.min().item():.6f}, max={label.max().item():.6f}")
+                print(f"  Raw label NaN count: {torch.isnan(label).sum().item()}")
+
+                # Check feature ranges by region
+                n_stock_feat = self.gate_input_start_index
+                n_market_feat = self.gate_input_end_index - self.gate_input_start_index
+                stock_feat = feature[:, :, :n_stock_feat]
+                market_feat = feature[:, :, n_stock_feat:self.gate_input_end_index]
+                print(f"\n  Stock features [{0}:{n_stock_feat}] stats:")
+                print(f"    mean={stock_feat.mean().item():.6f}, std={stock_feat.std().item():.6f}")
+                print(f"  Market features [{n_stock_feat}:{self.gate_input_end_index}] stats:")
+                print(f"    mean={market_feat.mean().item():.6f}, std={market_feat.std().item():.6f}")
+
+            # Drop extreme labels (top/bottom 2.5%) and apply zscore
+            # Note: zscore is applied AFTER filtering to ensure proper normalization of filtered subset
             mask, label_clean = drop_extreme(label)
             if mask.sum() < 10:  # Skip if too few samples
+                if debug_first_iter and is_first_iter:
+                    print(f"  [WARN] Skipping batch: only {mask.sum().item()} samples after drop_extreme")
                 continue
             feature = feature[mask, :, :]
-            label_clean = zscore(label_clean)
 
-            # Forward pass
-            pred = self.model(feature.float())
+            if debug_first_iter and is_first_iter:
+                print(f"\n  After drop_extreme: {mask.sum().item()}/{len(mask)} samples kept")
+                print(f"  Label before zscore: mean={label_clean.mean().item():.6f}, std={label_clean.std().item():.6f}")
+
+            label_clean = zscore(label_clean)  # Normalize filtered labels
+
+            if debug_first_iter and is_first_iter:
+                print(f"  Label after zscore: mean={label_clean.mean().item():.6f}, std={label_clean.std().item():.6f}, "
+                      f"min={label_clean.min().item():.6f}, max={label_clean.max().item():.6f}")
+
+            # Forward pass (with debug for first iteration)
+            pred = self.model(feature.float(), debug=(debug_first_iter and is_first_iter))
+
+            if debug_first_iter and is_first_iter:
+                print(f"\n[DEBUG] Prediction vs Label comparison:")
+                print(f"  Pred stats: mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+                print(f"  Label stats: mean={label_clean.mean().item():.6f}, std={label_clean.std().item():.6f}")
+                # Compute correlation
+                pred_np = pred.detach().cpu().numpy()
+                label_np = label_clean.detach().cpu().numpy()
+                corr = np.corrcoef(pred_np, label_np)[0, 1]
+                print(f"  Pearson correlation: {corr:.6f}")
+
             loss = self.loss_fn(pred, label_clean)
             losses.append(loss.item())
 
             # Compute IC
             with torch.no_grad():
-                ic, _ = calc_ic(pred.cpu().numpy(), label_clean.cpu().numpy())
+                ic, ric = calc_ic(pred.cpu().numpy(), label_clean.cpu().numpy())
                 if not np.isnan(ic):
                     ics.append(ic)
+
+            if debug_first_iter and is_first_iter:
+                print(f"\n[DEBUG] Loss and IC:")
+                print(f"  Loss: {loss.item():.6f}")
+                print(f"  IC: {ic:.6f}, RankIC: {ric:.6f}")
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+
+            if debug_first_iter and is_first_iter:
+                # Check gradient statistics
+                total_grad_norm = 0.0
+                max_grad = 0.0
+                min_grad = float('inf')
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        total_grad_norm += grad_norm ** 2
+                        max_grad = max(max_grad, param.grad.abs().max().item())
+                        min_grad = min(min_grad, param.grad.abs().min().item())
+                total_grad_norm = total_grad_norm ** 0.5
+                print(f"\n[DEBUG] Gradient statistics:")
+                print(f"  Total gradient norm: {total_grad_norm:.6f}")
+                print(f"  Max gradient value: {max_grad:.6f}")
+                print(f"  Min gradient value: {min_grad:.6f}")
+
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
             self.optimizer.step()
+
+            if debug_first_iter and is_first_iter:
+                print("#"*80 + "\n")
+
+            is_first_iter = False
 
         return float(np.mean(losses)), float(np.mean(ics)) if ics else 0.0
 
@@ -534,7 +678,8 @@ class MASTERModel:
                     feature = data[:, :, 0:-1].to(self.device)
                     label = data[:, -1, -1].to(self.device)
 
-                # Drop NaN labels and apply zscore
+                # Drop NaN labels and apply zscore (match official implementation)
+                # Note: zscore is applied AFTER filtering to ensure proper normalization
                 mask, label_clean = drop_na(label)
                 if mask.sum() < 10:
                     continue
@@ -552,7 +697,7 @@ class MASTERModel:
 
         return float(np.mean(losses)), float(np.mean(ics)) if ics else 0.0
 
-    def fit(self, dl_train, dl_valid=None, verbose=True):
+    def fit(self, dl_train, dl_valid=None, verbose=True, debug=True):
         """
         Train the model
 
@@ -560,7 +705,9 @@ class MASTERModel:
             dl_train: Training data (TSDataSampler or similar)
             dl_valid: Validation data (optional)
             verbose: Print training progress
+            debug: Enable debug output for first epoch (default: True)
         """
+        self._debug = debug
         print("\n[*] Initializing MASTER model...")
         self._init_model()
 
@@ -586,7 +733,9 @@ class MASTERModel:
         patience_counter = 0
 
         for epoch in range(1, self.n_epochs + 1):
-            train_loss, train_ic = self._train_epoch(dl_train)
+            # Enable debug output for first epoch only (if debug mode is on)
+            debug_first = self._debug and (epoch == 1)
+            train_loss, train_ic = self._train_epoch(dl_train, debug_first_iter=debug_first)
 
             if dl_valid:
                 val_loss, val_ic = self._valid_epoch(dl_valid)
