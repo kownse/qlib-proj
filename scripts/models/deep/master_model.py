@@ -289,6 +289,7 @@ class MASTER(nn.Module):
         gate_input_start_index: int = 158,
         gate_input_end_index: int = 221,
         beta: float = 5.0,
+        use_market_norm: bool = True,  # Whether to use LayerNorm on market features
     ):
         super(MASTER, self).__init__()
 
@@ -296,10 +297,14 @@ class MASTER(nn.Module):
         self.gate_input_end_index = gate_input_end_index
         self.d_gate_input = gate_input_end_index - gate_input_start_index
         self.d_feat = d_feat
+        self.use_market_norm = use_market_norm
 
-        # Layer normalization for market features (important for US market data)
-        # This normalizes market features before feeding to gate, ensuring proper softmax behavior
-        self.market_norm = nn.LayerNorm(self.d_gate_input)
+        # Layer normalization for market features (optional, not in official code)
+        # This helps when market features have small magnitude (e.g., US market data)
+        if use_market_norm:
+            self.market_norm = nn.LayerNorm(self.d_gate_input)
+        else:
+            self.market_norm = None
 
         # Feature gate using market information
         self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
@@ -311,6 +316,11 @@ class MASTER(nn.Module):
         self.satten = SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate)
         self.temporalatten = TemporalAttention(d_model=d_model)
         self.decoder = nn.Linear(d_model, 1)
+
+        # Initialize decoder bias to 0 to prevent output shift
+        # This is important because labels are centered at 0
+        nn.init.zeros_(self.decoder.bias)
+        nn.init.xavier_uniform_(self.decoder.weight, gain=0.01)  # Small weights for stable output
 
     def forward(self, x, debug=False):
         """
@@ -339,13 +349,16 @@ class MASTER(nn.Module):
                   f"min={gate_input_raw.min().item():.6f}, max={gate_input_raw.max().item():.6f}")
             print(f"  Gate input (raw) NaN count: {torch.isnan(gate_input_raw).sum().item()}")
 
-        # Normalize market features for better gate behavior
-        # This is important because raw market features may have very small values
-        gate_input = self.market_norm(gate_input_raw)
-
-        if debug:
-            print(f"\n  Gate input (after LayerNorm) stats: mean={gate_input.mean().item():.6f}, std={gate_input.std().item():.6f}, "
-                  f"min={gate_input.min().item():.6f}, max={gate_input.max().item():.6f}")
+        # Optionally normalize market features for better gate behavior
+        if self.market_norm is not None:
+            gate_input = self.market_norm(gate_input_raw)
+            if debug:
+                print(f"\n  Gate input (after LayerNorm) stats: mean={gate_input.mean().item():.6f}, std={gate_input.std().item():.6f}, "
+                      f"min={gate_input.min().item():.6f}, max={gate_input.max().item():.6f}")
+        else:
+            gate_input = gate_input_raw
+            if debug:
+                print(f"\n  Gate input (no normalization, using raw): same as above")
 
         # Apply feature gate (broadcast to all time steps)
         gate_weight = self.feature_gate(gate_input)  # (N, d_feat)
@@ -475,6 +488,7 @@ class MASTERModel:
         seed: int = 42,
         save_path: str = 'model/',
         save_prefix: str = '',
+        use_market_norm: bool = True,  # Whether to use LayerNorm on market features
     ):
         self.d_feat = d_feat
         self.d_model = d_model
@@ -486,6 +500,7 @@ class MASTERModel:
         self.S_dropout_rate = S_dropout_rate
         self.beta = beta
         self.seq_len = seq_len
+        self.use_market_norm = use_market_norm
 
         self.n_epochs = n_epochs
         self.lr = lr
@@ -533,6 +548,7 @@ class MASTERModel:
             gate_input_start_index=self.gate_input_start_index,
             gate_input_end_index=self.gate_input_end_index,
             beta=self.beta,
+            use_market_norm=self.use_market_norm,
         )
         self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), self.lr)
@@ -856,6 +872,7 @@ class MASTERModel:
                 'S_dropout_rate': self.S_dropout_rate,
                 'beta': self.beta,
                 'seq_len': self.seq_len,
+                'use_market_norm': self.use_market_norm,
             }
         }, path)
         print(f"    Model saved to: {path}")
@@ -877,6 +894,7 @@ class MASTERModel:
             S_dropout_rate=config['S_dropout_rate'],
             beta=config['beta'],
             seq_len=config.get('seq_len', 8),
+            use_market_norm=config.get('use_market_norm', True),
             GPU=GPU,
         )
 

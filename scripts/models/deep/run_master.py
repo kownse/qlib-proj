@@ -90,6 +90,10 @@ def add_master_args(parser):
     parser.add_argument('--debug', action='store_true',
                         help='Enable detailed debug output for first training iteration')
 
+    # 实验性参数
+    parser.add_argument('--no-market-norm', action='store_true',
+                        help='Disable LayerNorm on market features (match official MASTER)')
+
     return parser
 
 
@@ -300,6 +304,7 @@ def main():
         'train_stop_loss_thred': args.train_stop_loss,
         'GPU': args.gpu if torch.cuda.is_available() else -1,
         'seed': args.seed,
+        'use_market_norm': not args.no_market_norm,
     }
 
     print(f"\n[8] Model Configuration:")
@@ -312,6 +317,7 @@ def main():
     print(f"    lr: {model_params['lr']}")
     print(f"    n_epochs: {model_params['n_epochs']}")
     print(f"    early_stop: {model_params['early_stop']}")
+    print(f"    use_market_norm: {model_params['use_market_norm']}")
     print(f"    debug: {args.debug}")
 
     # 定义模型加载函数
