@@ -361,8 +361,10 @@ class MASTER(nn.Module):
             avg_weights = gate_weight.mean(dim=0)
             top5_idx = avg_weights.argsort(descending=True)[:5]
             bot5_idx = avg_weights.argsort()[:5]
-            print(f"  Top-5 feature weights: {[(i.item(), avg_weights[i].item():.4f) for i in top5_idx]}")
-            print(f"  Bottom-5 feature weights: {[(i.item(), avg_weights[i].item():.4f) for i in bot5_idx]}")
+            top5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in top5_idx])
+            bot5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in bot5_idx])
+            print(f"  Top-5 feature weights: [{top5_str}]")
+            print(f"  Bottom-5 feature weights: [{bot5_str}]")
 
         src = src * torch.unsqueeze(gate_weight, dim=1)  # (N, T, d_feat)
 
