@@ -82,8 +82,9 @@ GLOBAL_ETFS = {
 
 # Market benchmarks (relative strength calculations)
 MARKET_BENCHMARKS = {
-    "SPY": "SPY",   # S&P 500 ETF
-    "QQQ": "QQQ",   # Nasdaq 100 ETF
+    "SPY": "SPY",   # S&P 500 ETF (Large-cap)
+    "QQQ": "QQQ",   # Nasdaq 100 ETF (Tech)
+    "IWM": "IWM",   # Russell 2000 ETF (Small-cap)
 }
 
 # Combine all Yahoo Finance symbols

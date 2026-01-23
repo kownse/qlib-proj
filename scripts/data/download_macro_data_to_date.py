@@ -73,8 +73,9 @@ GLOBAL_ETFS = {
 }
 
 MARKET_BENCHMARKS = {
-    "SPY": "SPY",
-    "QQQ": "QQQ",
+    "SPY": "SPY",   # S&P 500 ETF (Large-cap)
+    "QQQ": "QQQ",   # Nasdaq 100 ETF (Tech)
+    "IWM": "IWM",   # Russell 2000 ETF (Small-cap) - for MASTER model
 }
 
 ALL_YAHOO_SYMBOLS = {

@@ -183,6 +183,20 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V11 (~38 features: nested CV forward selection optimal)',
         'use_talib': True,
     },
+
+    # MASTER model handlers
+    'alpha158-master': {
+        'module': 'data.datahandler_master',
+        'class_name': 'Alpha158_Master',
+        'description': 'Alpha158 + MASTER market info (221 features: 158 stock + 63 market)',
+        'use_talib': False,
+    },
+    'alpha360-master': {
+        'module': 'data.datahandler_master',
+        'class_name': 'Alpha360_Master',
+        'description': 'Alpha360 + MASTER market info (60×69 features: time-aligned)',
+        'use_talib': False,
+    },
 }
 
 
