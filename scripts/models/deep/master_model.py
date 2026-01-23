@@ -108,6 +108,7 @@ class TAttention(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
+        self.temperature = math.sqrt(d_model / nhead)  # Scale factor for attention
         self.qtrans = nn.Linear(d_model, d_model, bias=False)
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
@@ -146,7 +147,10 @@ class TAttention(nn.Module):
                 qh = q[:, :, i * dim:(i + 1) * dim]
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
-            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
+            # Add temperature scaling like standard Transformer: softmax(QK^T / sqrt(d_k))
+            atten_ave_matrixh = torch.softmax(
+                torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1
+            )
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh))

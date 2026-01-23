@@ -283,7 +283,7 @@ class Alpha158_Master(DataHandlerLP):
             # Add to _learn
             if hasattr(self, "_learn") and self._learn is not None:
                 self._learn = self._merge_market_info_to_df(self._learn, available_cols)
-                print(f"    Added {len(available_cols)} market info features to learn data")
+                print(f"    Added {len(available_cols)} market info features to learn data (z-score normalized)")
 
             # Add to _infer
             if hasattr(self, "_infer") and self._infer is not None:
@@ -324,6 +324,16 @@ class Alpha158_Master(DataHandlerLP):
             if col_nan > 0:
                 nan_count += col_nan
                 aligned_values = pd.Series(aligned_values).fillna(0).values
+
+            # Z-score normalize market features to match Alpha158 features (which go through CSZScoreNorm)
+            # This ensures all features have similar scale (mean~0, std~1)
+            series = pd.Series(aligned_values)
+            mean_val = series.mean()
+            std_val = series.std()
+            if std_val > 1e-8:
+                aligned_values = ((series - mean_val) / std_val).values
+            else:
+                aligned_values = (series - mean_val).values
 
             if has_multi_columns:
                 market_data[('feature', col)] = aligned_values
@@ -520,10 +530,19 @@ class Alpha360_Master(DataHandlerLP):
         nan_count = 0
         for col in market_cols:
             base_series = self._market_info_df[col]
+
+            # Z-score normalize the base series first (before shifting)
+            mean_val = base_series.mean()
+            std_val = base_series.std()
+            if std_val > 1e-8:
+                normalized_series = (base_series - mean_val) / std_val
+            else:
+                normalized_series = base_series - mean_val
+
             for i in range(59, -1, -1):
                 col_name = f"{col}_{i}"
                 # Shift market info data by i days (shift(i) means value from i days ago)
-                shifted = base_series.shift(i)
+                shifted = normalized_series.shift(i)
                 aligned_values = shifted.reindex(main_datetimes).values
 
                 # Fill NaN with 0 (for dates not in market info or from shifting)
