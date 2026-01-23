@@ -297,14 +297,24 @@ class Alpha158_Master(DataHandlerLP):
 
         # Build all market info columns at once to avoid fragmentation
         market_data = {}
+        nan_count = 0
         for col in cols:
             market_series = self._market_info_df[col]
             aligned_values = market_series.reindex(main_datetimes).values
+
+            # Fill NaN with 0 (for dates not in market info)
+            col_nan = pd.isna(aligned_values).sum()
+            if col_nan > 0:
+                nan_count += col_nan
+                aligned_values = pd.Series(aligned_values).fillna(0).values
 
             if has_multi_columns:
                 market_data[('feature', col)] = aligned_values
             else:
                 market_data[col] = aligned_values
+
+        if nan_count > 0:
+            print(f"    Note: Filled {nan_count} NaN values in market info features with 0")
 
         # Create DataFrame with all market info columns
         market_df = pd.DataFrame(market_data, index=df.index)
@@ -490,6 +500,7 @@ class Alpha360_Master(DataHandlerLP):
 
         # Build all expanded market info columns at once
         expanded_data = {}
+        nan_count = 0
         for col in market_cols:
             base_series = self._market_info_df[col]
             for i in range(59, -1, -1):
@@ -498,10 +509,19 @@ class Alpha360_Master(DataHandlerLP):
                 shifted = base_series.shift(i)
                 aligned_values = shifted.reindex(main_datetimes).values
 
+                # Fill NaN with 0 (for dates not in market info or from shifting)
+                col_nan = pd.isna(aligned_values).sum()
+                if col_nan > 0:
+                    nan_count += col_nan
+                    aligned_values = pd.Series(aligned_values).fillna(0).values
+
                 if has_multi_columns:
                     expanded_data[('feature', col_name)] = aligned_values
                 else:
                     expanded_data[col_name] = aligned_values
+
+        if nan_count > 0:
+            print(f"    Note: Filled {nan_count} NaN values in expanded market info features with 0")
 
         # Create DataFrame with all expanded market info columns
         expanded_df = pd.DataFrame(expanded_data, index=df.index)
