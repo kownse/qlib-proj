@@ -290,6 +290,7 @@ class MASTER(nn.Module):
         gate_input_end_index: int = 221,
         beta: float = 5.0,
         use_market_norm: bool = True,  # Whether to use LayerNorm on market features
+        use_gate: bool = True,  # Whether to use market-guided gate (set False to test baseline)
     ):
         super(MASTER, self).__init__()
 
@@ -298,16 +299,20 @@ class MASTER(nn.Module):
         self.d_gate_input = gate_input_end_index - gate_input_start_index
         self.d_feat = d_feat
         self.use_market_norm = use_market_norm
+        self.use_gate = use_gate
 
         # Layer normalization for market features (optional, not in official code)
         # This helps when market features have small magnitude (e.g., US market data)
-        if use_market_norm:
-            self.market_norm = nn.LayerNorm(self.d_gate_input)
+        if use_gate:
+            if use_market_norm:
+                self.market_norm = nn.LayerNorm(self.d_gate_input)
+            else:
+                self.market_norm = None
+            # Feature gate using market information
+            self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
         else:
             self.market_norm = None
-
-        # Feature gate using market information
-        self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
+            self.feature_gate = None
 
         # Main network
         self.x2y = nn.Linear(d_feat, d_model)
@@ -335,7 +340,6 @@ class MASTER(nn.Module):
         """
         # Split stock features and market features
         src = x[:, :, :self.gate_input_start_index]  # (N, T, d_feat)
-        gate_input_raw = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (N, d_gate)
 
         if debug:
             print("\n" + "="*80)
@@ -346,46 +350,55 @@ class MASTER(nn.Module):
             print(f"  Stock features stats: mean={src.mean().item():.6f}, std={src.std().item():.6f}, "
                   f"min={src.min().item():.6f}, max={src.max().item():.6f}")
             print(f"  Stock features NaN count: {torch.isnan(src).sum().item()}")
-            print(f"\n  Gate input (raw) shape: {gate_input_raw.shape}")
-            print(f"  Gate input (raw) stats: mean={gate_input_raw.mean().item():.6f}, std={gate_input_raw.std().item():.6f}, "
-                  f"min={gate_input_raw.min().item():.6f}, max={gate_input_raw.max().item():.6f}")
-            print(f"  Gate input (raw) NaN count: {torch.isnan(gate_input_raw).sum().item()}")
 
-        # Optionally normalize market features for better gate behavior
-        if self.market_norm is not None:
-            gate_input = self.market_norm(gate_input_raw)
+        # Apply feature gate if enabled
+        if self.use_gate:
+            gate_input_raw = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (N, d_gate)
+
             if debug:
-                print(f"\n  Gate input (after LayerNorm) stats: mean={gate_input.mean().item():.6f}, std={gate_input.std().item():.6f}, "
-                      f"min={gate_input.min().item():.6f}, max={gate_input.max().item():.6f}")
+                print(f"\n  Gate input (raw) shape: {gate_input_raw.shape}")
+                print(f"  Gate input (raw) stats: mean={gate_input_raw.mean().item():.6f}, std={gate_input_raw.std().item():.6f}, "
+                      f"min={gate_input_raw.min().item():.6f}, max={gate_input_raw.max().item():.6f}")
+                print(f"  Gate input (raw) NaN count: {torch.isnan(gate_input_raw).sum().item()}")
+
+            # Optionally normalize market features for better gate behavior
+            if self.market_norm is not None:
+                gate_input = self.market_norm(gate_input_raw)
+                if debug:
+                    print(f"\n  Gate input (after LayerNorm) stats: mean={gate_input.mean().item():.6f}, std={gate_input.std().item():.6f}, "
+                          f"min={gate_input.min().item():.6f}, max={gate_input.max().item():.6f}")
+            else:
+                gate_input = gate_input_raw
+                if debug:
+                    print(f"\n  Gate input (no normalization, using raw): same as above")
+
+            # Apply feature gate (broadcast to all time steps)
+            gate_weight = self.feature_gate(gate_input)  # (N, d_feat)
+
+            if debug:
+                print(f"\n  Gate weight shape: {gate_weight.shape}")
+                print(f"  Gate weight stats: mean={gate_weight.mean().item():.6f}, std={gate_weight.std().item():.6f}, "
+                      f"min={gate_weight.min().item():.6f}, max={gate_weight.max().item():.6f}")
+                # Check gate weight distribution (should not be uniform if gate is working)
+                gate_entropy = -(gate_weight * torch.log(gate_weight / self.d_feat + 1e-10)).sum(dim=-1).mean()
+                print(f"  Gate weight entropy (lower=more selective): {gate_entropy.item():.4f}")
+                # Show top-5 and bottom-5 feature weights (averaged across samples)
+                avg_weights = gate_weight.mean(dim=0)
+                top5_idx = avg_weights.argsort(descending=True)[:5]
+                bot5_idx = avg_weights.argsort()[:5]
+                top5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in top5_idx])
+                bot5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in bot5_idx])
+                print(f"  Top-5 feature weights: [{top5_str}]")
+                print(f"  Bottom-5 feature weights: [{bot5_str}]")
+
+            src = src * torch.unsqueeze(gate_weight, dim=1)  # (N, T, d_feat)
+
+            if debug:
+                print(f"\n  Gated src stats: mean={src.mean().item():.6f}, std={src.std().item():.6f}, "
+                      f"min={src.min().item():.6f}, max={src.max().item():.6f}")
         else:
-            gate_input = gate_input_raw
             if debug:
-                print(f"\n  Gate input (no normalization, using raw): same as above")
-
-        # Apply feature gate (broadcast to all time steps)
-        gate_weight = self.feature_gate(gate_input)  # (N, d_feat)
-
-        if debug:
-            print(f"\n  Gate weight shape: {gate_weight.shape}")
-            print(f"  Gate weight stats: mean={gate_weight.mean().item():.6f}, std={gate_weight.std().item():.6f}, "
-                  f"min={gate_weight.min().item():.6f}, max={gate_weight.max().item():.6f}")
-            # Check gate weight distribution (should not be uniform if gate is working)
-            gate_entropy = -(gate_weight * torch.log(gate_weight / self.d_feat + 1e-10)).sum(dim=-1).mean()
-            print(f"  Gate weight entropy (lower=more selective): {gate_entropy.item():.4f}")
-            # Show top-5 and bottom-5 feature weights (averaged across samples)
-            avg_weights = gate_weight.mean(dim=0)
-            top5_idx = avg_weights.argsort(descending=True)[:5]
-            bot5_idx = avg_weights.argsort()[:5]
-            top5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in top5_idx])
-            bot5_str = ", ".join([f"({i.item()}: {avg_weights[i].item():.4f})" for i in bot5_idx])
-            print(f"  Top-5 feature weights: [{top5_str}]")
-            print(f"  Bottom-5 feature weights: [{bot5_str}]")
-
-        src = src * torch.unsqueeze(gate_weight, dim=1)  # (N, T, d_feat)
-
-        if debug:
-            print(f"\n  Gated src stats: mean={src.mean().item():.6f}, std={src.std().item():.6f}, "
-                  f"min={src.min().item():.6f}, max={src.max().item():.6f}")
+                print(f"\n  Gate DISABLED - using stock features directly")
 
         # Main forward pass
         x = self.x2y(src)  # (N, T, d_model)
@@ -491,6 +504,7 @@ class MASTERModel:
         save_path: str = 'model/',
         save_prefix: str = '',
         use_market_norm: bool = True,  # Whether to use LayerNorm on market features
+        use_gate: bool = True,  # Whether to use market-guided gate
     ):
         self.d_feat = d_feat
         self.d_model = d_model
@@ -503,6 +517,7 @@ class MASTERModel:
         self.beta = beta
         self.seq_len = seq_len
         self.use_market_norm = use_market_norm
+        self.use_gate = use_gate
 
         self.n_epochs = n_epochs
         self.lr = lr
@@ -551,6 +566,7 @@ class MASTERModel:
             gate_input_end_index=self.gate_input_end_index,
             beta=self.beta,
             use_market_norm=self.use_market_norm,
+            use_gate=self.use_gate,
         )
         self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), self.lr)
@@ -875,6 +891,7 @@ class MASTERModel:
                 'beta': self.beta,
                 'seq_len': self.seq_len,
                 'use_market_norm': self.use_market_norm,
+                'use_gate': self.use_gate,
             }
         }, path)
         print(f"    Model saved to: {path}")
@@ -897,6 +914,7 @@ class MASTERModel:
             beta=config['beta'],
             seq_len=config.get('seq_len', 8),
             use_market_norm=config.get('use_market_norm', True),
+            use_gate=config.get('use_gate', True),
             GPU=GPU,
         )
 
