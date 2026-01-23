@@ -131,6 +131,8 @@ class TAttention(nn.Module):
 
     def forward(self, x):
         # x: (N, T, D)
+        # Pre-LN: normalize then attention, residual connects to original input
+        residual = x
         x = self.norm1(x)
         q = self.qtrans(x)
         k = self.ktrans(x)
@@ -156,12 +158,13 @@ class TAttention(nn.Module):
             att_output.append(torch.matmul(atten_ave_matrixh, vh))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN with residual
-        xt = x + att_output
-        xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
+        # FFN with residual - connect to ORIGINAL input, not normed
+        x = residual + att_output
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.ffn(x)
 
-        return att_output
+        return x
 
 
 class SAttention(nn.Module):
@@ -199,6 +202,8 @@ class SAttention(nn.Module):
 
     def forward(self, x):
         # x: (N, T, D)
+        # Pre-LN: normalize then attention, residual connects to original input
+        residual = x
         x = self.norm1(x)
         # Transpose to (T, N, D) for cross-stock attention
         q = self.qtrans(x).transpose(0, 1)
@@ -226,12 +231,13 @@ class SAttention(nn.Module):
             att_output.append(torch.matmul(atten_ave_matrixh, vh).transpose(0, 1))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN with residual
-        xt = x + att_output
-        xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
+        # FFN with residual - connect to ORIGINAL input, not normed
+        x = residual + att_output
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.ffn(x)
 
-        return att_output
+        return x
 
 
 class Gate(nn.Module):
