@@ -108,7 +108,6 @@ class TAttention(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
-        self.temperature = math.sqrt(d_model / nhead)  # Scale factor for attention
         self.qtrans = nn.Linear(d_model, d_model, bias=False)
         self.ktrans = nn.Linear(d_model, d_model, bias=False)
         self.vtrans = nn.Linear(d_model, d_model, bias=False)
@@ -131,8 +130,6 @@ class TAttention(nn.Module):
 
     def forward(self, x):
         # x: (N, T, D)
-        # Pre-LN: normalize then attention, residual connects to original input
-        residual = x
         x = self.norm1(x)
         q = self.qtrans(x)
         k = self.ktrans(x)
@@ -149,22 +146,19 @@ class TAttention(nn.Module):
                 qh = q[:, :, i * dim:(i + 1) * dim]
                 kh = k[:, :, i * dim:(i + 1) * dim]
                 vh = v[:, :, i * dim:(i + 1) * dim]
-            # Add temperature scaling like standard Transformer: softmax(QK^T / sqrt(d_k))
-            atten_ave_matrixh = torch.softmax(
-                torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1
-            )
+            # No temperature scaling - match official MASTER
+            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
             if self.attn_dropout:
                 atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
             att_output.append(torch.matmul(atten_ave_matrixh, vh))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN with residual - connect to ORIGINAL input, not normed
-        x = residual + att_output
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.ffn(x)
+        # FFN - match official MASTER
+        xt = x + att_output
+        xt = self.norm2(xt)
+        att_output = xt + self.ffn(xt)
 
-        return x
+        return att_output
 
 
 class SAttention(nn.Module):
@@ -202,8 +196,6 @@ class SAttention(nn.Module):
 
     def forward(self, x):
         # x: (N, T, D)
-        # Pre-LN: normalize then attention, residual connects to original input
-        residual = x
         x = self.norm1(x)
         # Transpose to (T, N, D) for cross-stock attention
         q = self.qtrans(x).transpose(0, 1)
@@ -231,13 +223,12 @@ class SAttention(nn.Module):
             att_output.append(torch.matmul(atten_ave_matrixh, vh).transpose(0, 1))
         att_output = torch.concat(att_output, dim=-1)
 
-        # FFN with residual - connect to ORIGINAL input, not normed
-        x = residual + att_output
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.ffn(x)
+        # FFN - match official MASTER
+        xt = x + att_output
+        xt = self.norm2(xt)
+        att_output = xt + self.ffn(xt)
 
-        return x
+        return att_output
 
 
 class Gate(nn.Module):
