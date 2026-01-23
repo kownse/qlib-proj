@@ -1,432 +1,440 @@
 """
 MASTER Model: Market-Guided Stock Transformer for Stock Price Forecasting
 
-Reference: https://arxiv.org/abs/2312.15235
+Official implementation based on: https://github.com/SJTU-DMTai/MASTER
+Paper: https://arxiv.org/abs/2312.15235
 
 MASTER 使用市场信息来引导个股预测，通过门控机制融合市场状态和个股特征。
 
 架构:
-    Stock Features (158) → Stock Encoder → Stock Embedding
-    Market Features (63) → Market Encoder → Market Embedding
-    [Stock Embedding, Market Embedding] → Gating Fusion → Output
+    输入 (N, T, F) → Gate(market_features) → stock × gate_weight
+    → Linear → PositionalEncoding → TAttention → SAttention
+    → TemporalAttention → Linear → 输出
 
 特点:
-1. 双编码器架构：分别处理个股特征和市场信息
-2. 市场引导门控：用市场状态调制个股预测
-3. 跨股票市场信息共享：同一天所有股票共享相同的市场特征
+1. 双注意力架构：TAttention (时间维度) + SAttention (股票维度)
+2. 市场引导门控：用市场状态的 softmax 权重调制股票特征
+3. 按天采样：每个 batch 是同一天的所有股票，支持跨股票注意力
+
+数据格式:
+    - 输入: (N, T, F) = (股票数, 时间步=8, 特征数)
+    - F = d_feat (股票特征) + market_features (市场特征)
+    - 标签: (N,) 最后一个时间步的收益率
 """
 
-import os
+import math
+import copy
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Tuple
-import math
+from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.modules.linear import Linear
+from torch.nn.modules.dropout import Dropout
+from torch.nn.modules.normalization import LayerNorm
+from torch.utils.data import DataLoader, Sampler
 
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 
-class StockEncoder(nn.Module):
-    """
-    个股特征编码器
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
-    将个股特征编码为固定维度的嵌入向量。
-    使用多层 MLP + LayerNorm + Dropout。
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        layers = []
-        in_dim = input_dim
-
-        for i in range(num_layers):
-            out_dim = hidden_dim if i < num_layers - 1 else output_dim
-            layers.extend([
-                nn.Linear(in_dim, out_dim),
-                nn.LayerNorm(out_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            in_dim = out_dim
-
-        self.encoder = nn.Sequential(*layers)
-
-    def forward(self, x):
-        """
-        Args:
-            x: (batch, stock_features)
-        Returns:
-            (batch, output_dim)
-        """
-        return self.encoder(x)
+def calc_ic(pred, label):
+    """计算 IC 和 RankIC"""
+    df = pd.DataFrame({'pred': pred, 'label': label})
+    ic = df['pred'].corr(df['label'])
+    ric = df['pred'].corr(df['label'], method='spearman')
+    return ic, ric
 
 
-class MarketEncoder(nn.Module):
-    """
-    市场信息编码器
+def zscore(x):
+    """Cross-sectional z-score normalization"""
+    return (x - x.mean()).div(x.std() + 1e-8)
 
-    将市场信息特征编码为固定维度的嵌入向量。
-    使用多层 MLP + LayerNorm + Dropout。
-    """
 
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 128,
-        output_dim: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
+def drop_extreme(x):
+    """Drop top and bottom 2.5% extreme values"""
+    sorted_tensor, indices = x.sort()
+    N = x.shape[0]
+    percent_2_5 = int(0.025 * N)
+    if percent_2_5 == 0:
+        return torch.ones_like(x, dtype=torch.bool), x
+    filtered_indices = indices[percent_2_5:-percent_2_5]
+    mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+    mask[filtered_indices] = True
+    return mask, x[mask]
 
-        layers = []
-        in_dim = input_dim
 
-        for i in range(num_layers):
-            out_dim = hidden_dim if i < num_layers - 1 else output_dim
-            layers.extend([
-                nn.Linear(in_dim, out_dim),
-                nn.LayerNorm(out_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
-            in_dim = out_dim
+def drop_na(x):
+    """Drop NaN values"""
+    mask = ~torch.isnan(x)
+    return mask, x[mask]
 
-        self.encoder = nn.Sequential(*layers)
+
+# =============================================================================
+# Network Components (from official MASTER)
+# =============================================================================
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for time series"""
+
+    def __init__(self, d_model, max_len=100):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
 
     def forward(self, x):
-        """
-        Args:
-            x: (batch, market_features)
-        Returns:
-            (batch, output_dim)
-        """
-        return self.encoder(x)
+        # x: (N, T, D)
+        return x + self.pe[:x.shape[1], :]
 
 
-class MarketGuidedGating(nn.Module):
+class TAttention(nn.Module):
     """
-    市场引导门控机制
+    Temporal Attention (intra-stock)
 
-    使用市场信息生成门控信号，调制个股嵌入。
-    gate = sigmoid(W_gate @ market_emb + b_gate)
-    output = stock_emb * gate + stock_emb
+    Self-attention along the time dimension for each stock.
     """
 
-    def __init__(
-        self,
-        stock_dim: int,
-        market_dim: int,
-        hidden_dim: int = 128,
-    ):
+    def __init__(self, d_model, nhead, dropout):
         super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.qtrans = nn.Linear(d_model, d_model, bias=False)
+        self.ktrans = nn.Linear(d_model, d_model, bias=False)
+        self.vtrans = nn.Linear(d_model, d_model, bias=False)
 
-        # 门控网络：从市场嵌入生成门控权重
-        self.gate_net = nn.Sequential(
-            nn.Linear(market_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, stock_dim),
-            nn.Sigmoid(),
+        self.attn_dropout = []
+        if dropout > 0:
+            for i in range(nhead):
+                self.attn_dropout.append(Dropout(p=dropout))
+            self.attn_dropout = nn.ModuleList(self.attn_dropout)
+
+        self.norm1 = LayerNorm(d_model, eps=1e-5)
+        self.norm2 = LayerNorm(d_model, eps=1e-5)
+        self.ffn = nn.Sequential(
+            Linear(d_model, d_model),
+            nn.ReLU(),
+            Dropout(p=dropout),
+            Linear(d_model, d_model),
+            Dropout(p=dropout)
         )
 
-        # 可选：交叉注意力风格的融合
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=stock_dim,
-            num_heads=4,
-            dropout=0.1,
-            batch_first=True,
+    def forward(self, x):
+        # x: (N, T, D)
+        x = self.norm1(x)
+        q = self.qtrans(x)
+        k = self.ktrans(x)
+        v = self.vtrans(x)
+
+        dim = int(self.d_model / self.nhead)
+        att_output = []
+        for i in range(self.nhead):
+            if i == self.nhead - 1:
+                qh = q[:, :, i * dim:]
+                kh = k[:, :, i * dim:]
+                vh = v[:, :, i * dim:]
+            else:
+                qh = q[:, :, i * dim:(i + 1) * dim]
+                kh = k[:, :, i * dim:(i + 1) * dim]
+                vh = v[:, :, i * dim:(i + 1) * dim]
+            atten_ave_matrixh = torch.softmax(torch.matmul(qh, kh.transpose(1, 2)), dim=-1)
+            if self.attn_dropout:
+                atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
+            att_output.append(torch.matmul(atten_ave_matrixh, vh))
+        att_output = torch.concat(att_output, dim=-1)
+
+        # FFN with residual
+        xt = x + att_output
+        xt = self.norm2(xt)
+        att_output = xt + self.ffn(xt)
+
+        return att_output
+
+
+class SAttention(nn.Module):
+    """
+    Stock Attention (inter-stock)
+
+    Self-attention across stocks for each time step.
+    This is the key component that enables cross-stock modeling.
+    """
+
+    def __init__(self, d_model, nhead, dropout):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.temperature = math.sqrt(self.d_model / nhead)
+
+        self.qtrans = nn.Linear(d_model, d_model, bias=False)
+        self.ktrans = nn.Linear(d_model, d_model, bias=False)
+        self.vtrans = nn.Linear(d_model, d_model, bias=False)
+
+        attn_dropout_layer = []
+        for i in range(nhead):
+            attn_dropout_layer.append(Dropout(p=dropout))
+        self.attn_dropout = nn.ModuleList(attn_dropout_layer)
+
+        self.norm1 = LayerNorm(d_model, eps=1e-5)
+        self.norm2 = LayerNorm(d_model, eps=1e-5)
+        self.ffn = nn.Sequential(
+            Linear(d_model, d_model),
+            nn.ReLU(),
+            Dropout(p=dropout),
+            Linear(d_model, d_model),
+            Dropout(p=dropout)
         )
 
-        self.norm = nn.LayerNorm(stock_dim)
+    def forward(self, x):
+        # x: (N, T, D)
+        x = self.norm1(x)
+        # Transpose to (T, N, D) for cross-stock attention
+        q = self.qtrans(x).transpose(0, 1)
+        k = self.ktrans(x).transpose(0, 1)
+        v = self.vtrans(x).transpose(0, 1)
 
-    def forward(self, stock_emb, market_emb):
-        """
-        Args:
-            stock_emb: (batch, stock_dim)
-            market_emb: (batch, market_dim)
-        Returns:
-            (batch, stock_dim)
-        """
-        # 门控
-        gate = self.gate_net(market_emb)  # (batch, stock_dim)
-        gated_stock = stock_emb * gate
+        dim = int(self.d_model / self.nhead)
+        att_output = []
+        for i in range(self.nhead):
+            if i == self.nhead - 1:
+                qh = q[:, :, i * dim:]
+                kh = k[:, :, i * dim:]
+                vh = v[:, :, i * dim:]
+            else:
+                qh = q[:, :, i * dim:(i + 1) * dim]
+                kh = k[:, :, i * dim:(i + 1) * dim]
+                vh = v[:, :, i * dim:(i + 1) * dim]
 
-        # 残差连接
-        output = self.norm(stock_emb + gated_stock)
+            # Attention across stocks (N dimension)
+            atten_ave_matrixh = torch.softmax(
+                torch.matmul(qh, kh.transpose(1, 2)) / self.temperature, dim=-1
+            )
+            if self.attn_dropout:
+                atten_ave_matrixh = self.attn_dropout[i](atten_ave_matrixh)
+            att_output.append(torch.matmul(atten_ave_matrixh, vh).transpose(0, 1))
+        att_output = torch.concat(att_output, dim=-1)
 
+        # FFN with residual
+        xt = x + att_output
+        xt = self.norm2(xt)
+        att_output = xt + self.ffn(xt)
+
+        return att_output
+
+
+class Gate(nn.Module):
+    """
+    Feature Gate with softmax
+
+    Uses market information to generate soft feature selection weights.
+    """
+
+    def __init__(self, d_input, d_output, beta=1.0):
+        super().__init__()
+        self.trans = nn.Linear(d_input, d_output)
+        self.d_output = d_output
+        self.t = beta  # temperature
+
+    def forward(self, gate_input):
+        # gate_input: (N, d_gate_input)
+        output = self.trans(gate_input)
+        output = torch.softmax(output / self.t, dim=-1)
+        return self.d_output * output  # scale by d_output
+
+
+class TemporalAttention(nn.Module):
+    """
+    Temporal Attention for aggregation
+
+    Uses the last time step as query to aggregate all time steps.
+    """
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.trans = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, z):
+        # z: (N, T, D)
+        h = self.trans(z)
+        query = h[:, -1, :].unsqueeze(-1)  # (N, D, 1)
+        lam = torch.matmul(h, query).squeeze(-1)  # (N, T)
+        lam = torch.softmax(lam, dim=1).unsqueeze(1)  # (N, 1, T)
+        output = torch.matmul(lam, z).squeeze(1)  # (N, D)
         return output
 
 
-class MarketGuidedAttention(nn.Module):
+class MASTER(nn.Module):
     """
-    市场引导注意力机制
-
-    使用市场嵌入作为 Query，个股嵌入作为 Key/Value，
-    实现市场对个股的注意力加权。
-    """
-
-    def __init__(
-        self,
-        stock_dim: int,
-        market_dim: int,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        # 将 market_dim 投影到 stock_dim
-        self.market_proj = nn.Linear(market_dim, stock_dim)
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=stock_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        self.norm = nn.LayerNorm(stock_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, stock_emb, market_emb):
-        """
-        Args:
-            stock_emb: (batch, stock_dim)
-            market_emb: (batch, market_dim)
-        Returns:
-            (batch, stock_dim)
-        """
-        # 投影市场嵌入
-        market_proj = self.market_proj(market_emb)  # (batch, stock_dim)
-
-        # 添加序列维度
-        stock_emb_seq = stock_emb.unsqueeze(1)  # (batch, 1, stock_dim)
-        market_proj_seq = market_proj.unsqueeze(1)  # (batch, 1, stock_dim)
-
-        # 交叉注意力: 用市场信息查询个股信息
-        attn_out, _ = self.cross_attn(
-            query=market_proj_seq,
-            key=stock_emb_seq,
-            value=stock_emb_seq,
-        )
-        attn_out = attn_out.squeeze(1)  # (batch, stock_dim)
-
-        # 残差连接
-        output = self.norm(stock_emb + self.dropout(attn_out))
-
-        return output
-
-
-class MASTERNet(nn.Module):
-    """
-    MASTER 网络结构
+    MASTER Network
 
     Market-Guided Stock Transformer for Stock Price Forecasting
     """
 
     def __init__(
         self,
-        d_feat: int = 221,
-        stock_feat_dim: int = 158,
-        market_feat_dim: int = 63,
-        stock_hidden_dim: int = 256,
-        stock_emb_dim: int = 128,
-        market_hidden_dim: int = 128,
-        market_emb_dim: int = 64,
-        fusion_hidden_dim: int = 128,
-        num_stock_layers: int = 2,
-        num_market_layers: int = 2,
-        dropout: float = 0.1,
-        use_attention: bool = True,
+        d_feat: int = 158,
+        d_model: int = 256,
+        t_nhead: int = 4,
+        s_nhead: int = 2,
+        T_dropout_rate: float = 0.5,
+        S_dropout_rate: float = 0.5,
+        gate_input_start_index: int = 158,
+        gate_input_end_index: int = 221,
+        beta: float = 5.0,
     ):
-        super().__init__()
+        super(MASTER, self).__init__()
 
+        self.gate_input_start_index = gate_input_start_index
+        self.gate_input_end_index = gate_input_end_index
+        self.d_gate_input = gate_input_end_index - gate_input_start_index
         self.d_feat = d_feat
-        self.stock_feat_dim = stock_feat_dim
-        self.market_feat_dim = market_feat_dim
-        self.use_attention = use_attention
 
-        # 个股编码器
-        self.stock_encoder = StockEncoder(
-            input_dim=stock_feat_dim,
-            hidden_dim=stock_hidden_dim,
-            output_dim=stock_emb_dim,
-            num_layers=num_stock_layers,
-            dropout=dropout,
-        )
+        # Feature gate using market information
+        self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
 
-        # 市场编码器
-        self.market_encoder = MarketEncoder(
-            input_dim=market_feat_dim,
-            hidden_dim=market_hidden_dim,
-            output_dim=market_emb_dim,
-            num_layers=num_market_layers,
-            dropout=dropout,
-        )
-
-        # 门控融合
-        self.gating = MarketGuidedGating(
-            stock_dim=stock_emb_dim,
-            market_dim=market_emb_dim,
-            hidden_dim=fusion_hidden_dim,
-        )
-
-        # 可选：注意力融合
-        if use_attention:
-            self.attention = MarketGuidedAttention(
-                stock_dim=stock_emb_dim,
-                market_dim=market_emb_dim,
-                num_heads=4,
-                dropout=dropout,
-            )
-
-        # 输出头
-        self.output_head = nn.Sequential(
-            nn.Linear(stock_emb_dim, fusion_hidden_dim),
-            nn.LayerNorm(fusion_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_hidden_dim, 1),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """初始化权重"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        # Main network
+        self.x2y = nn.Linear(d_feat, d_model)
+        self.pe = PositionalEncoding(d_model)
+        self.tatten = TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate)
+        self.satten = SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate)
+        self.temporalatten = TemporalAttention(d_model=d_model)
+        self.decoder = nn.Linear(d_model, 1)
 
     def forward(self, x):
         """
         Args:
-            x: (batch, d_feat) - 前 stock_feat_dim 是个股特征，后 market_feat_dim 是市场特征
+            x: (N, T, F) where F = d_feat + market_features
+
         Returns:
-            (batch,) predictions
+            (N,) predictions
         """
-        # 分离个股特征和市场特征
-        stock_features = x[:, :self.stock_feat_dim]
-        market_features = x[:, self.stock_feat_dim:]
+        # Split stock features and market features
+        src = x[:, :, :self.gate_input_start_index]  # (N, T, d_feat)
+        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (N, d_gate)
 
-        # 编码
-        stock_emb = self.stock_encoder(stock_features)  # (batch, stock_emb_dim)
-        market_emb = self.market_encoder(market_features)  # (batch, market_emb_dim)
+        # Apply feature gate (broadcast to all time steps)
+        gate_weight = self.feature_gate(gate_input)  # (N, d_feat)
+        src = src * torch.unsqueeze(gate_weight, dim=1)  # (N, T, d_feat)
 
-        # 门控融合
-        fused_emb = self.gating(stock_emb, market_emb)
+        # Main forward pass
+        x = self.x2y(src)  # (N, T, d_model)
+        x = self.pe(x)
+        x = self.tatten(x)
+        x = self.satten(x)
+        x = self.temporalatten(x)  # (N, d_model)
+        output = self.decoder(x).squeeze(-1)  # (N,)
 
-        # 可选：注意力融合
-        if self.use_attention:
-            fused_emb = self.attention(fused_emb, market_emb)
-
-        # 输出
-        output = self.output_head(fused_emb)
-
-        return output.squeeze(-1)
+        return output
 
 
-def ic_loss(pred, label):
-    """IC Loss: 最大化预测与标签的相关系数"""
-    pred = pred - pred.mean()
-    label = label - label.mean()
+# =============================================================================
+# Daily Batch Sampler
+# =============================================================================
 
-    cov = (pred * label).mean()
-    pred_std = pred.std() + 1e-8
-    label_std = label.std() + 1e-8
+class DailyBatchSamplerRandom(Sampler):
+    """
+    Sampler that yields indices for one day at a time.
 
-    ic = cov / (pred_std * label_std)
-    return -ic
+    This enables cross-stock attention by ensuring all stocks
+    in a batch are from the same trading day.
+    """
 
+    def __init__(self, data_source, shuffle=False):
+        self.data_source = data_source
+        self.shuffle = shuffle
+
+        # Calculate number of samples in each day
+        self.daily_count = pd.Series(
+            index=self.data_source.get_index()
+        ).groupby("datetime").size().values
+
+        # Calculate begin index of each day
+        self.daily_index = np.roll(np.cumsum(self.daily_count), 1)
+        self.daily_index[0] = 0
+
+    def __iter__(self):
+        if self.shuffle:
+            index = np.arange(len(self.daily_count))
+            np.random.shuffle(index)
+            for i in index:
+                yield np.arange(self.daily_index[i], self.daily_index[i] + self.daily_count[i])
+        else:
+            for idx, count in zip(self.daily_index, self.daily_count):
+                yield np.arange(idx, idx + count)
+
+    def __len__(self):
+        return len(self.daily_count)
+
+
+# =============================================================================
+# MASTER Model Wrapper
+# =============================================================================
 
 class MASTERModel:
     """
-    MASTER 模型封装类
+    MASTER Model wrapper compatible with Qlib
 
     Market-Guided Stock Transformer for Stock Price Forecasting
-
-    参数说明:
-    - d_feat: 总特征数 (stock_feat_dim + market_feat_dim)
-    - gate_input_start_index: 市场特征开始索引 (即 stock_feat_dim)
-    - gate_input_end_index: 市场特征结束索引 (即 d_feat)
     """
 
     def __init__(
         self,
-        d_feat: int = 221,
+        d_feat: int = 158,
+        d_model: int = 256,
+        t_nhead: int = 4,
+        s_nhead: int = 2,
         gate_input_start_index: int = 158,
         gate_input_end_index: int = 221,
-        stock_hidden_dim: int = 256,
-        stock_emb_dim: int = 128,
-        market_hidden_dim: int = 128,
-        market_emb_dim: int = 64,
-        fusion_hidden_dim: int = 128,
-        num_stock_layers: int = 2,
-        num_market_layers: int = 2,
-        dropout: float = 0.1,
-        use_attention: bool = True,
-        use_ic_loss: bool = False,
-        ic_loss_weight: float = 0.5,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-3,
-        n_epochs: int = 100,
-        batch_size: int = 4096,
+        T_dropout_rate: float = 0.5,
+        S_dropout_rate: float = 0.5,
+        beta: float = 5.0,
+        seq_len: int = 8,
+        n_epochs: int = 40,
+        lr: float = 8e-6,
         early_stop: int = 10,
+        train_stop_loss_thred: float = None,
         GPU: int = 0,
         seed: int = 42,
+        save_path: str = 'model/',
+        save_prefix: str = '',
     ):
         self.d_feat = d_feat
+        self.d_model = d_model
+        self.t_nhead = t_nhead
+        self.s_nhead = s_nhead
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
-        self.stock_feat_dim = gate_input_start_index
-        self.market_feat_dim = gate_input_end_index - gate_input_start_index
+        self.T_dropout_rate = T_dropout_rate
+        self.S_dropout_rate = S_dropout_rate
+        self.beta = beta
+        self.seq_len = seq_len
 
-        self.stock_hidden_dim = stock_hidden_dim
-        self.stock_emb_dim = stock_emb_dim
-        self.market_hidden_dim = market_hidden_dim
-        self.market_emb_dim = market_emb_dim
-        self.fusion_hidden_dim = fusion_hidden_dim
-        self.num_stock_layers = num_stock_layers
-        self.num_market_layers = num_market_layers
-        self.dropout = dropout
-        self.use_attention = use_attention
-        self.use_ic_loss = use_ic_loss
-        self.ic_loss_weight = ic_loss_weight
-
-        self.lr = lr
-        self.weight_decay = weight_decay
         self.n_epochs = n_epochs
-        self.batch_size = batch_size
+        self.lr = lr
         self.early_stop = early_stop
+        self.train_stop_loss_thred = train_stop_loss_thred
         self.GPU = GPU
         self.seed = seed
+        self.save_path = save_path
+        self.save_prefix = save_prefix
 
-        self.model = None
         self.fitted = False
+        self.model = None
         self.device = None
 
         self._setup_device()
         self._set_seed()
 
     def _setup_device(self):
-        """配置设备"""
+        """Setup compute device"""
         if self.GPU >= 0 and torch.cuda.is_available():
             self.device = torch.device(f'cuda:{self.GPU}')
             print(f"    Using GPU: cuda:{self.GPU}")
@@ -435,240 +443,252 @@ class MASTERModel:
             print("    Using CPU")
 
     def _set_seed(self):
-        """设置随机种子"""
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.seed)
+        """Set random seed for reproducibility"""
+        if self.seed is not None:
+            np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.seed)
+                torch.backends.cudnn.deterministic = True
 
-    def _prepare_data(self, dataset: DatasetH, segment: str):
-        """从 Qlib Dataset 准备数据"""
-        features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
-
-        features = features.fillna(0)
-        features = features.replace([np.inf, -np.inf], 0)
-        features = features.clip(-10, 10)
-
-        try:
-            labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
-            if isinstance(labels, pd.DataFrame):
-                labels = labels.iloc[:, 0]
-            labels = labels.fillna(0).values
-            return features.values, labels, features.index
-        except Exception:
-            return features.values, None, features.index
-
-    def _compute_ic(self, pred, label):
-        """计算 IC"""
-        if len(pred) == 0:
-            return 0.0
-        pred_centered = pred - pred.mean()
-        label_centered = label - label.mean()
-        cov = (pred_centered * label_centered).mean()
-        pred_std = pred.std() + 1e-8
-        label_std = label.std() + 1e-8
-        return cov / (pred_std * label_std)
-
-    def fit(self, dataset: DatasetH, verbose: bool = True):
-        """训练模型"""
-        print("\n[*] Preparing data...")
-        X_train, y_train, _ = self._prepare_data(dataset, "train")
-        X_valid, y_valid, _ = self._prepare_data(dataset, "valid")
-
-        print(f"    Train samples: {len(X_train):,}")
-        print(f"    Valid samples: {len(X_valid):,}")
-
-        # 检查特征维度
-        num_features = X_train.shape[1]
-        if num_features != self.d_feat:
-            print(f"    Warning: Adjusting d_feat from {self.d_feat} to {num_features}")
-            # 重新计算维度
-            self.d_feat = num_features
-            # 假设市场特征数量不变
-            self.stock_feat_dim = num_features - self.market_feat_dim
-            self.gate_input_start_index = self.stock_feat_dim
-
-        print(f"    Stock features: {self.stock_feat_dim}")
-        print(f"    Market features: {self.market_feat_dim}")
-        print(f"    Total features: {self.d_feat}")
-
-        # 创建模型
-        print("\n[*] Creating MASTER model...")
-        self.model = MASTERNet(
+    def _init_model(self):
+        """Initialize MASTER network"""
+        self.model = MASTER(
             d_feat=self.d_feat,
-            stock_feat_dim=self.stock_feat_dim,
-            market_feat_dim=self.market_feat_dim,
-            stock_hidden_dim=self.stock_hidden_dim,
-            stock_emb_dim=self.stock_emb_dim,
-            market_hidden_dim=self.market_hidden_dim,
-            market_emb_dim=self.market_emb_dim,
-            fusion_hidden_dim=self.fusion_hidden_dim,
-            num_stock_layers=self.num_stock_layers,
-            num_market_layers=self.num_market_layers,
-            dropout=self.dropout,
-            use_attention=self.use_attention,
-        ).to(self.device)
+            d_model=self.d_model,
+            t_nhead=self.t_nhead,
+            s_nhead=self.s_nhead,
+            T_dropout_rate=self.T_dropout_rate,
+            S_dropout_rate=self.S_dropout_rate,
+            gate_input_start_index=self.gate_input_start_index,
+            gate_input_end_index=self.gate_input_end_index,
+            beta=self.beta,
+        )
+        self.model.to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), self.lr)
+
+    def loss_fn(self, pred, label):
+        """MSE loss ignoring NaN"""
+        mask = ~torch.isnan(label)
+        loss = (pred[mask] - label[mask]) ** 2
+        return torch.mean(loss)
+
+    def _train_epoch(self, dl_train):
+        """Train one epoch"""
+        self.model.train()
+        losses = []
+        ics = []
+
+        # MTSDatasetH yields dict with 'data', 'label', etc.
+        for batch in dl_train:
+            if isinstance(batch, dict):
+                # MTSDatasetH format: data is (N, T, F) features only, label is separate
+                feature = batch['data'].to(self.device)  # (N, T, F)
+                label = batch['label'].to(self.device)  # (N,)
+            else:
+                # Legacy format: data includes label in last column
+                data = torch.squeeze(batch, dim=0)
+                feature = data[:, :, 0:-1].to(self.device)
+                label = data[:, -1, -1].to(self.device)
+
+            # Drop extreme labels and apply zscore
+            mask, label_clean = drop_extreme(label)
+            if mask.sum() < 10:  # Skip if too few samples
+                continue
+            feature = feature[mask, :, :]
+            label_clean = zscore(label_clean)
+
+            # Forward pass
+            pred = self.model(feature.float())
+            loss = self.loss_fn(pred, label_clean)
+            losses.append(loss.item())
+
+            # Compute IC
+            with torch.no_grad():
+                ic, _ = calc_ic(pred.cpu().numpy(), label_clean.cpu().numpy())
+                if not np.isnan(ic):
+                    ics.append(ic)
+
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
+            self.optimizer.step()
+
+        return float(np.mean(losses)), float(np.mean(ics)) if ics else 0.0
+
+    def _valid_epoch(self, dl_valid):
+        """Validate one epoch"""
+        self.model.eval()
+        losses = []
+        ics = []
+
+        with torch.no_grad():
+            for batch in dl_valid:
+                if isinstance(batch, dict):
+                    # MTSDatasetH format
+                    feature = batch['data'].to(self.device)
+                    label = batch['label'].to(self.device)
+                else:
+                    data = torch.squeeze(batch, dim=0)
+                    feature = data[:, :, 0:-1].to(self.device)
+                    label = data[:, -1, -1].to(self.device)
+
+                # Drop NaN labels and apply zscore
+                mask, label_clean = drop_na(label)
+                if mask.sum() < 10:
+                    continue
+                label_clean = zscore(label_clean)
+
+                # Forward pass (use all features for cross-stock attention)
+                pred = self.model(feature.float())
+                loss = self.loss_fn(pred[mask], label_clean)
+                losses.append(loss.item())
+
+                # Compute IC
+                ic, _ = calc_ic(pred[mask].cpu().numpy(), label_clean.cpu().numpy())
+                if not np.isnan(ic):
+                    ics.append(ic)
+
+        return float(np.mean(losses)), float(np.mean(ics)) if ics else 0.0
+
+    def fit(self, dl_train, dl_valid=None, verbose=True):
+        """
+        Train the model
+
+        Args:
+            dl_train: Training data (TSDataSampler or similar)
+            dl_valid: Validation data (optional)
+            verbose: Print training progress
+        """
+        print("\n[*] Initializing MASTER model...")
+        self._init_model()
 
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"    Total parameters: {total_params:,}")
-        print(f"    Trainable parameters: {trainable_params:,}")
+        print(f"    d_feat: {self.d_feat}, d_model: {self.d_model}")
+        print(f"    gate_input: [{self.gate_input_start_index}, {self.gate_input_end_index})")
+        print(f"    beta: {self.beta}, seq_len: {self.seq_len}")
 
-        # 创建数据加载器
-        train_dataset = TensorDataset(
-            torch.FloatTensor(X_train),
-            torch.FloatTensor(y_train)
-        )
-        valid_dataset = TensorDataset(
-            torch.FloatTensor(X_valid),
-            torch.FloatTensor(y_valid)
-        )
+        # Enable training mode for MTSDatasetH (if applicable)
+        if hasattr(dl_train, 'train'):
+            dl_train.train()
+        if dl_valid and hasattr(dl_valid, 'eval'):
+            dl_valid.eval()
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=True if self.GPU >= 0 else False
-        )
-        valid_loader = DataLoader(
-            valid_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True if self.GPU >= 0 else False
-        )
-
-        # 优化器
-        optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=1e-6
-        )
-        mse_loss = nn.MSELoss()
-
-        # 训练循环
         print("\n[*] Training...")
-        print("-" * 90)
-        print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Val Loss':>11} | {'Train IC':>9} | {'Val IC':>9} | {'LR':>10}")
-        print("-" * 90)
+        print("-" * 80)
+        print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Train IC':>9} | {'Val Loss':>11} | {'Val IC':>9}")
+        print("-" * 80)
 
-        best_val_loss = float('inf')
         best_val_ic = -float('inf')
         best_model_state = None
         patience_counter = 0
 
-        history = {'train_loss': [], 'val_loss': [], 'train_ic': [], 'val_ic': []}
-
         for epoch in range(1, self.n_epochs + 1):
-            # 训练
-            self.model.train()
-            train_losses = []
-            train_preds = []
-            train_labels = []
+            train_loss, train_ic = self._train_epoch(dl_train)
 
-            for batch_x, batch_y in train_loader:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
+            if dl_valid:
+                val_loss, val_ic = self._valid_epoch(dl_valid)
+                print(f"{epoch:>6} | {train_loss:>11.6f} | {train_ic:>9.4f} | {val_loss:>11.6f} | {val_ic:>9.4f}")
 
-                optimizer.zero_grad()
-                pred = self.model(batch_x)
-
-                loss = mse_loss(pred, batch_y)
-                if self.use_ic_loss:
-                    loss = loss + self.ic_loss_weight * ic_loss(pred, batch_y)
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                train_losses.append(loss.item())
-                train_preds.extend(pred.detach().cpu().numpy())
-                train_labels.extend(batch_y.detach().cpu().numpy())
-
-            train_loss = np.mean(train_losses)
-            train_ic = self._compute_ic(np.array(train_preds), np.array(train_labels))
-
-            # 验证
-            self.model.eval()
-            val_losses = []
-            val_preds = []
-            val_labels = []
-
-            with torch.no_grad():
-                for batch_x, batch_y in valid_loader:
-                    batch_x = batch_x.to(self.device)
-                    batch_y = batch_y.to(self.device)
-
-                    pred = self.model(batch_x)
-
-                    loss = mse_loss(pred, batch_y)
-                    if self.use_ic_loss:
-                        loss = loss + self.ic_loss_weight * ic_loss(pred, batch_y)
-
-                    val_losses.append(loss.item())
-                    val_preds.extend(pred.cpu().numpy())
-                    val_labels.extend(batch_y.cpu().numpy())
-
-            val_loss = np.mean(val_losses)
-            val_ic = self._compute_ic(np.array(val_preds), np.array(val_labels))
-
-            # 记录
-            history['train_loss'].append(train_loss)
-            history['val_loss'].append(val_loss)
-            history['train_ic'].append(train_ic)
-            history['val_ic'].append(val_ic)
-
-            scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
-
-            print(f"{epoch:>6} | {train_loss:>11.6f} | {val_loss:>11.6f} | {train_ic:>9.4f} | {val_ic:>9.4f} | {current_lr:>10.2e}")
-
-            # Early stopping (基于 val_ic)
-            if val_ic > best_val_ic:
-                best_val_loss = val_loss
-                best_val_ic = val_ic
-                best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
-                patience_counter = 0
+                # Early stopping based on validation IC
+                if val_ic > best_val_ic:
+                    best_val_ic = val_ic
+                    best_model_state = copy.deepcopy(self.model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.early_stop:
+                        print(f"\nEarly stopping at epoch {epoch}")
+                        break
             else:
-                patience_counter += 1
-                if patience_counter >= self.early_stop:
-                    print(f"\nEarly stopping at epoch {epoch}")
-                    break
+                print(f"{epoch:>6} | {train_loss:>11.6f} | {train_ic:>9.4f} |      -      |      -")
 
-        print("-" * 90)
-        print(f"Best validation - Loss: {best_val_loss:.6f}, IC: {best_val_ic:.4f}")
+            # Stop if training loss threshold reached
+            if self.train_stop_loss_thred and train_loss <= self.train_stop_loss_thred:
+                print(f"\nTraining loss threshold reached at epoch {epoch}")
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                break
+
+        print("-" * 80)
 
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
-            self.model.to(self.device)
+            print(f"Best validation IC: {best_val_ic:.4f}")
 
         self.fitted = True
-        return history
 
-    def predict(self, dataset: DatasetH, segment: str = "test") -> pd.Series:
-        """预测"""
-        if not self.fitted or self.model is None:
+    def predict(self, dl_test) -> pd.Series:
+        """
+        Generate predictions
+
+        Args:
+            dl_test: Test data (MTSDatasetH or similar)
+
+        Returns:
+            pd.Series with predictions indexed by (datetime, instrument)
+        """
+        if not self.fitted:
             raise ValueError("Model not fitted. Call fit() first.")
 
-        X, _, index = self._prepare_data(dataset, segment)
+        # Enable eval mode for MTSDatasetH
+        if hasattr(dl_test, 'eval'):
+            dl_test.eval()
+
+        preds = []
+        indices = []
+        ics = []
 
         self.model.eval()
-        preds = []
-
         with torch.no_grad():
-            for i in range(0, len(X), self.batch_size):
-                batch_x = torch.FloatTensor(X[i:i+self.batch_size]).to(self.device)
-                pred = self.model(batch_x)
-                preds.extend(pred.cpu().numpy())
+            for batch in dl_test:
+                if isinstance(batch, dict):
+                    # MTSDatasetH format
+                    feature = batch['data'].to(self.device)
+                    label = batch['label']
+                    batch_indices = batch['index']  # indices into original data
+                else:
+                    data = torch.squeeze(batch, dim=0)
+                    feature = data[:, :, 0:-1].to(self.device)
+                    label = data[:, -1, -1]
+                    batch_indices = None
 
-        return pd.Series(np.array(preds), index=index, name='score')
+                pred = self.model(feature.float()).detach().cpu().numpy()
+                preds.append(pred.ravel())
+
+                if batch_indices is not None:
+                    indices.extend(batch_indices.tolist())
+
+                # Compute daily IC
+                if isinstance(label, torch.Tensor):
+                    label_np = label.cpu().numpy()
+                else:
+                    label_np = label
+                daily_ic, _ = calc_ic(pred, label_np)
+                if not np.isnan(daily_ic):
+                    ics.append(daily_ic)
+
+        # Restore original index using MTSDatasetH's restore_index method
+        all_preds = np.concatenate(preds)
+
+        if hasattr(dl_test, 'restore_index') and indices:
+            original_index = dl_test.restore_index(indices)
+            predictions = pd.Series(all_preds, index=original_index)
+        else:
+            # Fallback: create simple integer index
+            predictions = pd.Series(all_preds)
+
+        # Print metrics
+        if ics:
+            mean_ic = np.mean(ics)
+            std_ic = np.std(ics) if len(ics) > 1 else 1.0
+            print(f"    Test IC: {mean_ic:.4f}, ICIR: {mean_ic/std_ic:.4f}")
+
+        return predictions
 
     def save(self, path: str):
-        """保存模型"""
+        """Save model to file"""
         if self.model is None:
             raise ValueError("No model to save")
 
@@ -676,60 +696,40 @@ class MASTERModel:
             'model_state_dict': self.model.state_dict(),
             'config': {
                 'd_feat': self.d_feat,
+                'd_model': self.d_model,
+                't_nhead': self.t_nhead,
+                's_nhead': self.s_nhead,
                 'gate_input_start_index': self.gate_input_start_index,
                 'gate_input_end_index': self.gate_input_end_index,
-                'stock_feat_dim': self.stock_feat_dim,
-                'market_feat_dim': self.market_feat_dim,
-                'stock_hidden_dim': self.stock_hidden_dim,
-                'stock_emb_dim': self.stock_emb_dim,
-                'market_hidden_dim': self.market_hidden_dim,
-                'market_emb_dim': self.market_emb_dim,
-                'fusion_hidden_dim': self.fusion_hidden_dim,
-                'num_stock_layers': self.num_stock_layers,
-                'num_market_layers': self.num_market_layers,
-                'dropout': self.dropout,
-                'use_attention': self.use_attention,
+                'T_dropout_rate': self.T_dropout_rate,
+                'S_dropout_rate': self.S_dropout_rate,
+                'beta': self.beta,
+                'seq_len': self.seq_len,
             }
         }, path)
         print(f"    Model saved to: {path}")
 
     @classmethod
     def load(cls, path: str, GPU: int = 0) -> 'MASTERModel':
-        """加载模型"""
+        """Load model from file"""
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         config = checkpoint['config']
 
         instance = cls(
             d_feat=config['d_feat'],
+            d_model=config['d_model'],
+            t_nhead=config['t_nhead'],
+            s_nhead=config['s_nhead'],
             gate_input_start_index=config['gate_input_start_index'],
             gate_input_end_index=config['gate_input_end_index'],
-            stock_hidden_dim=config['stock_hidden_dim'],
-            stock_emb_dim=config['stock_emb_dim'],
-            market_hidden_dim=config['market_hidden_dim'],
-            market_emb_dim=config['market_emb_dim'],
-            fusion_hidden_dim=config['fusion_hidden_dim'],
-            num_stock_layers=config['num_stock_layers'],
-            num_market_layers=config['num_market_layers'],
-            dropout=config['dropout'],
-            use_attention=config['use_attention'],
+            T_dropout_rate=config['T_dropout_rate'],
+            S_dropout_rate=config['S_dropout_rate'],
+            beta=config['beta'],
+            seq_len=config.get('seq_len', 8),
             GPU=GPU,
         )
 
-        instance.model = MASTERNet(
-            d_feat=config['d_feat'],
-            stock_feat_dim=config['stock_feat_dim'],
-            market_feat_dim=config['market_feat_dim'],
-            stock_hidden_dim=config['stock_hidden_dim'],
-            stock_emb_dim=config['stock_emb_dim'],
-            market_hidden_dim=config['market_hidden_dim'],
-            market_emb_dim=config['market_emb_dim'],
-            fusion_hidden_dim=config['fusion_hidden_dim'],
-            num_stock_layers=config['num_stock_layers'],
-            num_market_layers=config['num_market_layers'],
-            dropout=config['dropout'],
-            use_attention=config['use_attention'],
-        ).to(instance.device)
-
+        instance._init_model()
         instance.model.load_state_dict(checkpoint['model_state_dict'])
         instance.fitted = True
 
@@ -737,55 +737,44 @@ class MASTERModel:
         return instance
 
 
-# 预设配置
+# =============================================================================
+# Preset Configurations
+# =============================================================================
+
 PRESET_CONFIGS = {
-    'alpha158_master': {
-        'd_feat': 221,
+    'default': {
+        'd_feat': 158,
+        'd_model': 256,
+        't_nhead': 4,
+        's_nhead': 2,
         'gate_input_start_index': 158,
         'gate_input_end_index': 221,
-        'stock_hidden_dim': 256,
-        'stock_emb_dim': 128,
-        'market_hidden_dim': 128,
-        'market_emb_dim': 64,
-        'fusion_hidden_dim': 128,
-        'num_stock_layers': 2,
-        'num_market_layers': 2,
-        'dropout': 0.1,
-        'use_attention': True,
+        'T_dropout_rate': 0.5,
+        'S_dropout_rate': 0.5,
+        'beta': 5.0,
+        'seq_len': 8,
+        'lr': 8e-6,
+        'n_epochs': 40,
     },
-    'alpha158_master_large': {
-        'd_feat': 221,
-        'gate_input_start_index': 158,
-        'gate_input_end_index': 221,
-        'stock_hidden_dim': 512,
-        'stock_emb_dim': 256,
-        'market_hidden_dim': 256,
-        'market_emb_dim': 128,
-        'fusion_hidden_dim': 256,
-        'num_stock_layers': 3,
-        'num_market_layers': 2,
-        'dropout': 0.1,
-        'use_attention': True,
-    },
-    'alpha158_master_lite': {
-        'd_feat': 221,
-        'gate_input_start_index': 158,
-        'gate_input_end_index': 221,
-        'stock_hidden_dim': 128,
-        'stock_emb_dim': 64,
-        'market_hidden_dim': 64,
-        'market_emb_dim': 32,
-        'fusion_hidden_dim': 64,
-        'num_stock_layers': 1,
-        'num_market_layers': 1,
-        'dropout': 0.1,
-        'use_attention': False,
+    'us_market': {
+        'd_feat': 142,  # Alpha158 without VMA/VSTD/WVMA
+        'd_model': 256,
+        't_nhead': 4,
+        's_nhead': 2,
+        'gate_input_start_index': 142,
+        'gate_input_end_index': 205,  # 142 + 63 market features
+        'T_dropout_rate': 0.5,
+        'S_dropout_rate': 0.5,
+        'beta': 5.0,
+        'seq_len': 8,
+        'lr': 8e-6,
+        'n_epochs': 40,
     },
 }
 
 
-def create_master_model(preset: str = 'alpha158_master', **kwargs) -> MASTERModel:
-    """根据预设创建 MASTER 模型"""
-    config = PRESET_CONFIGS.get(preset, PRESET_CONFIGS['alpha158_master']).copy()
+def create_master_model(preset: str = 'default', **kwargs) -> MASTERModel:
+    """Create MASTER model from preset configuration"""
+    config = PRESET_CONFIGS.get(preset, PRESET_CONFIGS['default']).copy()
     config.update(kwargs)
     return MASTERModel(**config)
