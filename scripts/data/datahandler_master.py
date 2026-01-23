@@ -247,17 +247,23 @@ class Alpha158_Master(DataHandlerLP):
         """
         Override process_data to add market info features AFTER processors run.
         """
+        print("[DEBUG] Alpha158_Master.process_data called")
         # First, call parent's process_data
         super().process_data(with_fit=with_fit)
 
         # Then add market info features to _learn and _infer
         if self._market_info_df is not None:
+            print("[DEBUG] Market info loaded, adding to processed data...")
             self._add_market_info_to_processed_data()
+        else:
+            print("[DEBUG] Market info NOT loaded (None)")
 
     def _add_market_info_to_processed_data(self):
         """Add market info features to _learn and _infer after processors run."""
+        print("[DEBUG] _add_market_info_to_processed_data called")
         try:
             available_cols = [c for c in MASTER_MARKET_INFO_FEATURES if c in self._market_info_df.columns]
+            print(f"[DEBUG] Available market info columns: {len(available_cols)}")
 
             if not available_cols:
                 print("Warning: No market info features available")
@@ -265,7 +271,11 @@ class Alpha158_Master(DataHandlerLP):
 
             # Add to _learn
             if hasattr(self, "_learn") and self._learn is not None:
+                print(f"[DEBUG] _learn shape before: {self._learn.shape}")
+                print(f"[DEBUG] _learn NaN before market info: {self._learn.isna().sum().sum()}")
                 self._learn = self._merge_market_info_to_df(self._learn, available_cols)
+                print(f"[DEBUG] _learn shape after: {self._learn.shape}")
+                print(f"[DEBUG] _learn NaN after market info: {self._learn.isna().sum().sum()}")
                 print(f"Added {len(available_cols)} market info features to learn data")
 
             # Add to _infer
@@ -313,6 +323,7 @@ class Alpha158_Master(DataHandlerLP):
             else:
                 market_data[col] = aligned_values
 
+        print(f"[DEBUG] Market info NaN filled: {nan_count}")
         if nan_count > 0:
             print(f"    Note: Filled {nan_count} NaN values in market info features with 0")
 
