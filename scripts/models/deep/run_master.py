@@ -224,9 +224,9 @@ def main():
                 print(f"    Data dtype: {data.dtype}")
                 print(f"    Label dtype: {label.dtype}")
 
-                # Overall data statistics
-                data_np = data.numpy()
-                label_np = label.numpy()
+                # Overall data statistics (move to CPU if on GPU)
+                data_np = data.cpu().numpy() if data.is_cuda else data.numpy()
+                label_np = label.cpu().numpy() if label.is_cuda else label.numpy()
                 print(f"\n    Data overall: mean={np.nanmean(data_np):.6f}, std={np.nanstd(data_np):.6f}, "
                       f"min={np.nanmin(data_np):.6f}, max={np.nanmax(data_np):.6f}")
                 print(f"    Data NaN%: {np.isnan(data_np).mean()*100:.2f}%")
@@ -256,9 +256,9 @@ def main():
                       f"min={np.nanmin(label_np):.6f}, max={np.nanmax(label_np):.6f}")
                 print(f"    Label NaN%: {np.isnan(label_np).mean()*100:.2f}%")
 
-            # Collect statistics for aggregation
-            data_np = data.numpy()
-            label_np = label.numpy()
+            # Collect statistics for aggregation (move to CPU if on GPU)
+            data_np = data.cpu().numpy() if data.is_cuda else data.numpy()
+            label_np = label.cpu().numpy() if label.is_cuda else label.numpy()
             all_data_stats['mean'].append(np.nanmean(data_np))
             all_data_stats['std'].append(np.nanstd(data_np))
             all_data_stats['nan_pct'].append(np.isnan(data_np).mean()*100)
