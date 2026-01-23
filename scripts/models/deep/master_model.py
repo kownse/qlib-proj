@@ -320,7 +320,9 @@ class MASTER(nn.Module):
         # Initialize decoder bias to 0 to prevent output shift
         # This is important because labels are centered at 0
         nn.init.zeros_(self.decoder.bias)
-        nn.init.xavier_uniform_(self.decoder.weight, gain=0.01)  # Small weights for stable output
+        # Use default xavier initialization (gain=1.0) to maintain output variance
+        # Input std ≈ 1.1, we want output std ≈ 1.0
+        nn.init.xavier_uniform_(self.decoder.weight)
 
     def forward(self, x, debug=False):
         """
