@@ -188,7 +188,7 @@ HANDLER_REGISTRY = {
     'alpha158-master': {
         'module': 'data.datahandler_master',
         'class_name': 'Alpha158_Master',
-        'description': 'Alpha158 + MASTER market info (221 features: 158 stock + 63 market)',
+        'description': 'Alpha158 + MASTER market info (205 features: 142 stock + 63 market)',
         'use_talib': False,
     },
     'alpha360-master': {

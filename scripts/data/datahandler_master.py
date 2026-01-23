@@ -40,6 +40,7 @@ script_dir = Path(__file__).parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 from qlib.contrib.data.handler import Alpha158, check_transform_proc, _DEFAULT_LEARN_PROCESSORS
+from qlib.contrib.data.loader import Alpha158DL
 from qlib.data.dataset.handler import DataHandlerLP
 
 # Project root
@@ -122,18 +123,19 @@ class Alpha158_Master(DataHandlerLP):
         )
     """
 
-    # Number of Alpha158 features (excluding VWAP-related problematic features)
-    N_STOCK_FEATURES = 158
+    # Number of Alpha158 features (excluding VWAP and volume-based problematic features)
+    # Original 158 - VWAP(1) - VMA(5) - VSTD(5) - WVMA(5) = 142
+    N_STOCK_FEATURES = 142
 
     # Number of market info features (21 per index × 3 indices)
     N_MARKET_FEATURES = 63
 
     # Total features
-    D_FEAT = N_STOCK_FEATURES + N_MARKET_FEATURES  # 221
+    D_FEAT = N_STOCK_FEATURES + N_MARKET_FEATURES  # 142 + 63 = 205
 
     # Gate input indices for MASTER model
-    GATE_INPUT_START_INDEX = N_STOCK_FEATURES  # 158
-    GATE_INPUT_END_INDEX = D_FEAT  # 221
+    GATE_INPUT_START_INDEX = N_STOCK_FEATURES  # 142
+    GATE_INPUT_END_INDEX = D_FEAT  # 205
 
     def __init__(
         self,
@@ -185,17 +187,21 @@ class Alpha158_Master(DataHandlerLP):
         learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
 
         # Use Alpha158 config (excluding problematic features)
+        # NOTE: Must use Alpha158DL.get_feature_config() which accepts config parameter
+        #       Alpha158.get_feature_config() is an instance method that ignores config!
         conf = {
             "kbar": {},
             "price": {
                 "windows": [0],
-                "feature": ["OPEN", "HIGH", "LOW"],  # Exclude VWAP
+                "feature": ["OPEN", "HIGH", "LOW"],  # Exclude VWAP (not available in US data)
             },
             "rolling": {
-                "exclude": ["VMA", "VSTD"],  # Exclude problematic volume features
+                # Exclude volume-based features that cause extreme values after CSZScoreNorm
+                # These features have very small std on some days, causing z-score explosion
+                "exclude": ["VMA", "VSTD", "WVMA"],
             },
         }
-        fields, names = Alpha158.get_feature_config(conf)
+        fields, names = Alpha158DL.get_feature_config(conf)
 
         data_loader = {
             "class": "QlibDataLoader",
