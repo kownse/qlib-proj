@@ -132,11 +132,13 @@ def prepare_data(stock_pool='test'):
     n_features = features.shape[1]
     print(f"Number of features: {n_features}")
 
-    return data, n_features, {
+    splits = {
         'train': (train_start, train_end),
         'valid': (valid_start, valid_end),
         'test': (test_start, test_end),
     }
+
+    return data, n_features, splits, labels.columns[0]  # 返回标签列名
 
 
 def main():
@@ -146,6 +148,7 @@ def main():
     parser.add_argument('--n-epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--early-stop', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--shuffle-labels', action='store_true', help='打乱标签以测试数据泄漏')
     args = parser.parse_args()
 
     # Init qlib
@@ -153,7 +156,33 @@ def main():
     qlib.init(provider_uri="./my_data/qlib_us", region=REG_US)
 
     # Prepare data
-    data, n_features, splits = prepare_data(args.stock_pool)
+    data, n_features, splits, label_col_name = prepare_data(args.stock_pool)
+
+    # 测试数据泄漏：打乱标签
+    if args.shuffle_labels:
+        print("\n⚠️  打乱标签顺序以测试数据泄漏...")
+        # 获取标签列
+        label_col = data[label_col_name].copy()
+        # 按日期分组打乱（保持同一天内股票的相对顺序，但打乱日期间的对应关系）
+        dates = data.index.get_level_values('datetime').unique()
+        np.random.seed(42)
+        shuffled_dates = np.random.permutation(dates)
+        date_mapping = dict(zip(dates, shuffled_dates))
+
+        # 创建打乱后的标签
+        new_label = pd.Series(index=label_col.index, dtype=float)
+        for date in dates:
+            mask = data.index.get_level_values('datetime') == date
+            target_date = date_mapping[date]
+            target_mask = data.index.get_level_values('datetime') == target_date
+            if mask.sum() == target_mask.sum():
+                new_label[mask] = label_col[target_mask].values
+            else:
+                # 如果股票数量不同，用随机值
+                new_label[mask] = np.random.randn(mask.sum()) * label_col.std()
+
+        data[label_col_name] = new_label.values
+        print(f"    标签已打乱！如果模型仍能学习，说明存在数据泄漏。")
 
     # Config
     step_len = 8  # time steps (official default)
@@ -197,12 +226,13 @@ def main():
     print(f"Test data:  {test_data.shape} ({len(test_dates)} days)")
 
     # Create TSDataSampler
+    # 注意：只用 ffill，不用 bfill，避免未来数据泄漏
     dl_train = TSDataSampler(
         data=train_data,
         start=train_start,
         end=train_end,
         step_len=step_len,
-        fillna_type="ffill+bfill",
+        fillna_type="ffill",  # 只用向前填充，避免数据泄漏
     )
 
     dl_valid = TSDataSampler(
@@ -210,7 +240,7 @@ def main():
         start=valid_start,
         end=valid_end,
         step_len=step_len,
-        fillna_type="ffill+bfill",
+        fillna_type="ffill",
     )
 
     dl_test = TSDataSampler(
@@ -218,7 +248,7 @@ def main():
         start=test_start,
         end=test_end,
         step_len=step_len,
-        fillna_type="ffill+bfill",
+        fillna_type="ffill",
     )
 
     print(f"Train samples: {len(dl_train)}")
@@ -236,19 +266,32 @@ def main():
 
     # Check data format
     print("\nChecking data format...")
-    for batch in train_loader:
+    nan_batch_count = 0
+    for i, batch in enumerate(train_loader):
         batch_data = torch.squeeze(batch, dim=0)
-        print(f"Batch shape: {batch_data.shape}")  # Should be (N, T, F+1) where +1 is label
 
-        # Extract feature and label (official format)
-        feature = batch_data[:, :, 0:-1]  # All except last column
-        label = batch_data[:, -1, -1]  # Last column, last timestep
+        # Check for NaN in batch
+        nan_count = torch.isnan(batch_data).sum().item()
+        if nan_count > 0:
+            nan_batch_count += 1
 
-        print(f"Feature shape: {feature.shape}")  # (N, T, F)
-        print(f"Label shape: {label.shape}")  # (N,)
-        print(f"Feature stats: mean={feature.mean():.4f}, std={feature.std():.4f}")
-        print(f"Label stats: mean={label.mean():.4f}, std={label.std():.4f}, nan={torch.isnan(label).sum()}")
-        break
+        if i == 0:
+            print(f"Batch shape: {batch_data.shape}")  # Should be (N, T, F+1) where +1 is label
+
+            # Extract feature and label (official format)
+            feature = batch_data[:, :, 0:-1]  # All except last column
+            label = batch_data[:, -1, -1]  # Last column, last timestep
+
+            print(f"Feature shape: {feature.shape}")  # (N, T, F)
+            print(f"Label shape: {label.shape}")  # (N,)
+            print(f"Feature stats: mean={feature.mean():.4f}, std={feature.std():.4f}")
+            print(f"Feature NaN count: {torch.isnan(feature).sum().item()}")
+            print(f"Label stats: mean={label.mean():.4f}, std={label.std():.4f}, nan={torch.isnan(label).sum()}")
+
+        if i >= 10:  # Check first 10 batches
+            break
+
+    print(f"Batches with NaN (first 10): {nan_batch_count}/10")
 
     # Create MASTER model
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -288,6 +331,11 @@ def main():
 
         for batch in train_loader:
             batch_data = torch.squeeze(batch, dim=0)
+
+            # 处理 NaN：将 NaN 替换为 0
+            if torch.isnan(batch_data).any():
+                batch_data = torch.nan_to_num(batch_data, nan=0.0)
+
             feature = batch_data[:, :, 0:-1].to(device)  # (N, T, F)
             label = batch_data[:, -1, -1].to(device)  # (N,)
 
@@ -298,8 +346,16 @@ def main():
             feature = feature[mask]
             label_clean = zscore(label_clean)
 
+            # 检查 zscore 后是否有 NaN（可能因为 std=0）
+            if torch.isnan(label_clean).any():
+                continue
+
             pred = model(feature.float())
             loss = ((pred - label_clean) ** 2).mean()
+
+            # 跳过 NaN loss
+            if torch.isnan(loss):
+                continue
 
             optimizer.zero_grad()
             loss.backward()
@@ -321,6 +377,11 @@ def main():
         with torch.no_grad():
             for batch in valid_loader:
                 batch_data = torch.squeeze(batch, dim=0)
+
+                # 处理 NaN
+                if torch.isnan(batch_data).any():
+                    batch_data = torch.nan_to_num(batch_data, nan=0.0)
+
                 feature = batch_data[:, :, 0:-1].to(device)
                 label = batch_data[:, -1, -1].to(device)
 
@@ -329,9 +390,14 @@ def main():
                     continue
                 label_clean = zscore(label_clean)
 
+                if torch.isnan(label_clean).any():
+                    continue
+
                 pred = model(feature.float())
                 loss = ((pred[mask] - label_clean) ** 2).mean()
-                valid_losses.append(loss.item())
+
+                if not torch.isnan(loss):
+                    valid_losses.append(loss.item())
 
                 ic, _ = calc_ic(pred[mask].cpu().numpy(), label_clean.cpu().numpy())
                 if not np.isnan(ic):
@@ -373,9 +439,16 @@ def main():
     all_preds = []
     all_labels = []
 
+    raw_labels_list = []  # 原始标签（用于真实 IC 计算）
+
     with torch.no_grad():
         for batch in test_loader:
             batch_data = torch.squeeze(batch, dim=0)
+
+            # 处理 NaN
+            if torch.isnan(batch_data).any():
+                batch_data = torch.nan_to_num(batch_data, nan=0.0)
+
             feature = batch_data[:, :, 0:-1].to(device)
             label = batch_data[:, -1, -1].to(device)
 
@@ -385,14 +458,18 @@ def main():
 
             pred = model(feature.float())
 
-            # Daily IC (before zscore for fair comparison)
-            ic, ric = calc_ic(pred[mask].cpu().numpy(), label[mask].cpu().numpy())
+            # Daily IC (with raw labels, not zscore)
+            raw_label = label[mask].cpu().numpy()
+            pred_np = pred[mask].cpu().numpy()
+
+            ic, ric = calc_ic(pred_np, raw_label)
             if not np.isnan(ic):
                 test_ics.append(ic)
                 test_rics.append(ric)
 
-            all_preds.extend(pred[mask].cpu().numpy().tolist())
-            all_labels.extend(label[mask].cpu().numpy().tolist())
+            all_preds.extend(pred_np.tolist())
+            all_labels.extend(raw_label.tolist())
+            raw_labels_list.extend(raw_label.tolist())
 
     # Calculate overall metrics
     mean_ic = np.mean(test_ics) if test_ics else 0
@@ -406,7 +483,7 @@ def main():
     # Overall IC
     overall_ic, overall_ric = calc_ic(np.array(all_preds), np.array(all_labels))
 
-    print(f"\nTest Set Results:")
+    print(f"\nTest Set Results (using RAW labels, not zscore-normalized):")
     print(f"  Daily IC:     {mean_ic:.4f} ± {std_ic:.4f}")
     print(f"  ICIR:         {icir:.4f}")
     print(f"  Daily RankIC: {mean_ric:.4f} ± {std_ric:.4f}")
@@ -414,6 +491,12 @@ def main():
     print(f"  Overall IC:   {overall_ic:.4f}")
     print(f"  Overall RIC:  {overall_ric:.4f}")
     print(f"  Test days:    {len(test_ics)}")
+
+    # 正常量化模型的 IC 应该在 0.02-0.06 之间
+    if abs(mean_ic) > 0.1:
+        print(f"\n  ⚠️ WARNING: IC={mean_ic:.4f} is abnormally high!")
+        print(f"     Normal quant models have IC in range 0.02-0.06")
+        print(f"     This may indicate data leakage.")
 
     print("="*80)
     print("Done!")
