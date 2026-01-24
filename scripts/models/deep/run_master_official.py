@@ -221,12 +221,13 @@ def main():
     assert len(valid_dates & test_dates) == 0, "Valid and test have overlapping dates!"
     print("\n✓ Verified: No overlapping dates between train/valid/test")
 
-    print(f"\nTrain data: {train_data.shape} ({len(train_dates)} days)")
-    print(f"Valid data: {valid_data.shape} ({len(valid_dates)} days)")
-    print(f"Test data:  {test_data.shape} ({len(test_dates)} days)")
+    print(f"\nTrain data: {train_data.shape} ({len(train_dates)} days)", flush=True)
+    print(f"Valid data: {valid_data.shape} ({len(valid_dates)} days)", flush=True)
+    print(f"Test data:  {test_data.shape} ({len(test_dates)} days)", flush=True)
 
     # Create TSDataSampler
     # 注意：只用 ffill，不用 bfill，避免未来数据泄漏
+    print("Creating TSDataSampler for train...", flush=True)
     dl_train = TSDataSampler(
         data=train_data,
         start=train_start,
@@ -234,7 +235,9 @@ def main():
         step_len=step_len,
         fillna_type="ffill",  # 只用向前填充，避免数据泄漏
     )
+    print(f"  Train samples: {len(dl_train)}", flush=True)
 
+    print("Creating TSDataSampler for valid...", flush=True)
     dl_valid = TSDataSampler(
         data=valid_data,
         start=valid_start,
@@ -242,7 +245,9 @@ def main():
         step_len=step_len,
         fillna_type="ffill",
     )
+    print(f"  Valid samples: {len(dl_valid)}", flush=True)
 
+    print("Creating TSDataSampler for test...", flush=True)
     dl_test = TSDataSampler(
         data=test_data,
         start=test_start,
@@ -250,22 +255,33 @@ def main():
         step_len=step_len,
         fillna_type="ffill",
     )
+    print(f"  Test samples: {len(dl_test)}", flush=True)
 
     print(f"Train samples: {len(dl_train)}")
     print(f"Valid samples: {len(dl_valid)}")
     print(f"Test samples:  {len(dl_test)}")
 
     # Create data loaders with daily batch sampler
+    print("\nCreating DailyBatchSampler for train...", flush=True)
     train_sampler = DailyBatchSamplerRandom(dl_train, shuffle=True)
-    valid_sampler = DailyBatchSamplerRandom(dl_valid, shuffle=False)
-    test_sampler = DailyBatchSamplerRandom(dl_test, shuffle=False)
+    print(f"  Train batches: {len(train_sampler)}", flush=True)
 
+    print("Creating DailyBatchSampler for valid...", flush=True)
+    valid_sampler = DailyBatchSamplerRandom(dl_valid, shuffle=False)
+    print(f"  Valid batches: {len(valid_sampler)}", flush=True)
+
+    print("Creating DailyBatchSampler for test...", flush=True)
+    test_sampler = DailyBatchSamplerRandom(dl_test, shuffle=False)
+    print(f"  Test batches: {len(test_sampler)}", flush=True)
+
+    print("Creating DataLoaders...", flush=True)
     train_loader = DataLoader(dl_train, sampler=train_sampler, drop_last=True)
     valid_loader = DataLoader(dl_valid, sampler=valid_sampler, drop_last=False)
     test_loader = DataLoader(dl_test, sampler=test_sampler, drop_last=False)
+    print("  Done.", flush=True)
 
     # Check data format
-    print("\nChecking data format...")
+    print("\nChecking data format...", flush=True)
     nan_batch_count = 0
     for i, batch in enumerate(train_loader):
         batch_data = torch.squeeze(batch, dim=0)
@@ -313,11 +329,11 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     # Training with early stopping
-    print("\n" + "="*80)
-    print("Training MASTER with official data format")
-    print("="*80)
-    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Train IC':>9} | {'Val Loss':>11} | {'Val IC':>9}")
-    print("-" * 80)
+    print("\n" + "="*80, flush=True)
+    print("Training MASTER with official data format", flush=True)
+    print("="*80, flush=True)
+    print(f"{'Epoch':>6} | {'Train Loss':>11} | {'Train IC':>9} | {'Val Loss':>11} | {'Val IC':>9}", flush=True)
+    print("-" * 80, flush=True)
 
     best_val_loss = float('inf')
     best_model_state = None
@@ -328,8 +344,11 @@ def main():
         model.train()
         train_losses = []
         train_ics = []
+        n_batches = len(train_loader)
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx % 500 == 0:
+                print(f"  Epoch {epoch+1} batch {batch_idx}/{n_batches}...", flush=True)
             batch_data = torch.squeeze(batch, dim=0)
 
             # 处理 NaN：将 NaN 替换为 0
@@ -408,7 +427,7 @@ def main():
         val_loss = np.mean(valid_losses) if valid_losses else float('nan')
         val_ic = np.mean(valid_ics) if valid_ics else 0
 
-        print(f"{epoch+1:>6} | {train_loss:>11.6f} | {train_ic:>9.4f} | {val_loss:>11.6f} | {val_ic:>9.4f}")
+        print(f"{epoch+1:>6} | {train_loss:>11.6f} | {train_ic:>9.4f} | {val_loss:>11.6f} | {val_ic:>9.4f}", flush=True)
 
         # Early stopping based on val_loss
         if val_loss < best_val_loss:
