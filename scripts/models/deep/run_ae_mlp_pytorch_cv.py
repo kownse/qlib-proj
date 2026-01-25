@@ -1,5 +1,5 @@
 """
-AE-MLP 交叉验证训练和评估脚本
+AE-MLP PyTorch 交叉验证训练和评估脚本
 
 支持两种模式:
 1. 训练模式: 使用预先搜索好的超参数进行训练
@@ -13,52 +13,40 @@ AE-MLP 交叉验证训练和评估脚本
 
 使用方法:
     # ===== 评估模式 (加载已训练模型) =====
-    python scripts/models/deep/run_ae_mlp_cv.py \
+    python scripts/models/deep/run_ae_mlp_pytorch_cv.py \
         --eval-only \
-        --model-path my_models/ae_mlp_cv_alpha158-enhanced-v7_sp500_5d_best.keras \
+        --model-path my_models/ae_mlp_pytorch_cv_xxx.pt \
         --handler alpha158-enhanced-v7
 
     # ===== 训练模式 =====
     # 使用参数文件训练
-    python scripts/models/deep/run_ae_mlp_cv.py \
+    python scripts/models/deep/run_ae_mlp_pytorch_cv.py \
         --params-file outputs/hyperopt_cv/ae_mlp_cv_best_params_20260117_151024.json
 
     # 只运行 CV 训练，不训练最终模型
-    python scripts/models/deep/run_ae_mlp_cv.py \
+    python scripts/models/deep/run_ae_mlp_pytorch_cv.py \
         --params-file outputs/hyperopt_cv/ae_mlp_cv_best_params_20260117_151024.json \
         --cv-only
 
     # 多种子训练，寻找最佳结果
-    python scripts/models/deep/run_ae_mlp_cv.py \
+    python scripts/models/deep/run_ae_mlp_pytorch_cv.py \
         --params-file outputs/hyperopt_cv/ae_mlp_cv_best_params_20260117_151024.json \
         --cv-only --num-seeds 10
 
     # 训练最终模型并回测
-    python scripts/models/deep/run_ae_mlp_cv.py \
+    python scripts/models/deep/run_ae_mlp_pytorch_cv.py \
         --params-file outputs/hyperopt_cv/ae_mlp_cv_best_params_20260117_151024.json \
         --backtest
 """
 
 # ============================================================================
-# 重要: 以下代码必须在任何其他导入之前执行
+# 设置环境变量
 # ============================================================================
 
 import os
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 抑制 TensorFlow 日志
 os.environ['OMP_NUM_THREADS'] = '4'
 os.environ['MKL_NUM_THREADS'] = '4'
-os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'  # 优化 GPU 线程
-
-# 设置 GPU 内存增长（必须在导入 TensorFlow 之前或刚导入后立即设置）
-import tensorflow as tf
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    for gpu in gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError:
-            pass  # 已经初始化
 
 import random
 import sys
@@ -84,15 +72,16 @@ qlib.init(
 # ============================================================================
 
 import argparse
+import copy
 import json
 from datetime import datetime
 import numpy as np
 import pandas as pd
 
-# tensorflow 已在文件开头导入
-from tensorflow import keras
-from tensorflow.keras import layers, Model, callbacks
-from tensorflow.keras import mixed_precision
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
@@ -118,13 +107,20 @@ from models.common import (
     compute_ic,
 )
 
+# 导入 PyTorch AE-MLP 模型
+from ae_mlp_model_pytorch import AEMLPNetwork, EarlyStopping
+
 
 def set_random_seed(seed: int):
     """设置随机种子以提高可复现性"""
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
-    # 设置 Python hash seed
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
     print(f"    Random seed set to: {seed}")
 
@@ -155,112 +151,208 @@ def load_params_from_json(params_file: str) -> dict:
     return params, cv_results
 
 
-def create_tf_dataset(X, y, batch_size, shuffle=True, prefetch=True):
-    """创建优化的 tf.data.Dataset，数据保持在 CPU 上"""
-    # 强制在 CPU 上创建数据集，避免 GPU 内存不足
-    with tf.device('/CPU:0'):
-        outputs = {
-            'decoder': X.astype(np.float32),
-            'ae_action': y.astype(np.float32),
-            'action': y.astype(np.float32),
-        }
-
-        dataset = tf.data.Dataset.from_tensor_slices((X.astype(np.float32), outputs))
-
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=min(len(X), 50000))
-
-        dataset = dataset.batch(batch_size)
-
-        if prefetch:
-            dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    return dataset
+def setup_device(gpu: int) -> torch.device:
+    """配置 GPU/CPU"""
+    if gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f'cuda:{gpu}')
+        print(f"    Using GPU: cuda:{gpu}")
+        # 打印 GPU 信息
+        print(f"    GPU Name: {torch.cuda.get_device_name(gpu)}")
+        print(f"    GPU Memory: {torch.cuda.get_device_properties(gpu).total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device('cpu')
+        print("    Using CPU")
+    return device
 
 
-def build_ae_mlp_model(params: dict) -> Model:
-    """构建 AE-MLP 模型"""
-    num_columns = params['num_columns']
-    hidden_units = params['hidden_units']
-    dropout_rates = params['dropout_rates']
-    lr = params['lr']
-    loss_weights = params['loss_weights']
+def create_dataloader(
+    X: np.ndarray,
+    y: np.ndarray = None,
+    batch_size: int = 4096,
+    shuffle: bool = True,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """创建 DataLoader"""
+    X_tensor = torch.FloatTensor(X)
 
-    inp = layers.Input(shape=(num_columns,), name='input')
+    if y is not None:
+        y_tensor = torch.FloatTensor(y).unsqueeze(1)
+        dataset = TensorDataset(X_tensor, y_tensor)
+    else:
+        dataset = TensorDataset(X_tensor)
 
-    # 输入标准化
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    # Decoder (重建原始输入)
-    decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
-
-    # 辅助预测分支 (基于 decoder 输出)
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-    x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-    x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-    x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, dtype='float32', name='ae_action')(x_ae)
-
-    # 主分支: 原始特征 + encoder 特征
-    x = layers.Concatenate(name='concat')([x0, encoder])
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    # MLP 主体
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    # 主输出 (使用 float32 确保数值稳定性)
-    out = layers.Dense(1, dtype='float32', name='action')(x)
-
-    model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={
-            'decoder': 'mse',
-            'ae_action': 'mse',
-            'action': 'mse',
-        },
-        loss_weights=loss_weights,
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        pin_memory=pin_memory,
     )
 
-    return model
+
+def build_ae_mlp_model(params: dict, device: torch.device) -> AEMLPNetwork:
+    """构建 AE-MLP 模型"""
+    model = AEMLPNetwork(
+        num_columns=params['num_columns'],
+        hidden_units=params['hidden_units'],
+        dropout_rates=params['dropout_rates'],
+    )
+    return model.to(device)
 
 
-def setup_gpu(gpu: int, use_mixed_precision: bool = False):
-    """配置 GPU (内存增长已在模块级别设置)"""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpu >= 0 and gpus:
-        try:
-            tf.config.set_visible_devices(gpus[gpu], 'GPU')
-            print(f"    Using GPU: {gpus[gpu]}")
+def train_one_epoch(
+    model: AEMLPNetwork,
+    train_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    loss_weights: dict,
+    device: torch.device,
+) -> dict:
+    """训练一个 epoch"""
+    model.train()
+    mse_loss = nn.MSELoss()
+    losses = {'decoder': 0, 'ae_action': 0, 'action': 0, 'total': 0}
+    num_batches = 0
 
-            if use_mixed_precision:
-                mixed_precision.set_global_policy('mixed_float16')
-                print("    Mixed precision (FP16) enabled")
-        except RuntimeError as e:
-            print(f"    GPU setup error: {e}")
-    else:
-        tf.config.set_visible_devices([], 'GPU')
-        print("    Using CPU")
+    for batch_X, batch_y in train_loader:
+        batch_X = batch_X.to(device)
+        batch_y = batch_y.to(device)
+
+        optimizer.zero_grad()
+
+        # 前向传播
+        decoder_out, ae_action_out, action_out = model(batch_X)
+
+        # 计算损失
+        loss_decoder = mse_loss(decoder_out, batch_X)
+        loss_ae_action = mse_loss(ae_action_out, batch_y)
+        loss_action = mse_loss(action_out, batch_y)
+
+        # 加权总损失
+        total_loss = (
+            loss_weights['decoder'] * loss_decoder +
+            loss_weights['ae_action'] * loss_ae_action +
+            loss_weights['action'] * loss_action
+        )
+
+        # 反向传播
+        total_loss.backward()
+        optimizer.step()
+
+        losses['decoder'] += loss_decoder.item()
+        losses['ae_action'] += loss_ae_action.item()
+        losses['action'] += loss_action.item()
+        losses['total'] += total_loss.item()
+        num_batches += 1
+
+    # 计算平均损失
+    for key in losses:
+        losses[key] /= num_batches
+
+    return losses
 
 
-def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_precision=False):
+def validate(
+    model: AEMLPNetwork,
+    valid_loader: DataLoader,
+    loss_weights: dict,
+    device: torch.device,
+) -> dict:
+    """验证模型"""
+    model.eval()
+    mse_loss = nn.MSELoss()
+    losses = {'decoder': 0, 'ae_action': 0, 'action': 0, 'total': 0}
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch_X, batch_y in valid_loader:
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+
+            decoder_out, ae_action_out, action_out = model(batch_X)
+
+            loss_decoder = mse_loss(decoder_out, batch_X)
+            loss_ae_action = mse_loss(ae_action_out, batch_y)
+            loss_action = mse_loss(action_out, batch_y)
+
+            total_loss = (
+                loss_weights['decoder'] * loss_decoder +
+                loss_weights['ae_action'] * loss_ae_action +
+                loss_weights['action'] * loss_action
+            )
+
+            losses['decoder'] += loss_decoder.item()
+            losses['ae_action'] += loss_ae_action.item()
+            losses['action'] += loss_action.item()
+            losses['total'] += total_loss.item()
+            num_batches += 1
+
+    for key in losses:
+        losses[key] /= num_batches
+
+    return losses
+
+
+def predict_batch(
+    model: AEMLPNetwork,
+    X: np.ndarray,
+    device: torch.device,
+    batch_size: int = 4096,
+) -> np.ndarray:
+    """批量预测"""
+    model.eval()
+    X_tensor = torch.FloatTensor(X).to(device)
+
+    predictions = []
+    with torch.no_grad():
+        for i in range(0, len(X_tensor), batch_size):
+            batch = X_tensor[i:i+batch_size]
+            _, _, pred = model(batch)
+            predictions.append(pred.cpu().numpy())
+
+    return np.concatenate(predictions, axis=0).flatten()
+
+
+def save_pytorch_model(model: AEMLPNetwork, params: dict, path: str):
+    """保存 PyTorch 模型"""
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'num_columns': params['num_columns'],
+        'hidden_units': params['hidden_units'],
+        'dropout_rates': params['dropout_rates'],
+        'loss_weights': params['loss_weights'],
+    }
+    torch.save(save_dict, path)
+    print(f"    Model saved to: {path}")
+
+
+def load_pytorch_model(path: str, device: torch.device) -> tuple:
+    """加载 PyTorch 模型"""
+    checkpoint = torch.load(path, map_location=device)
+
+    model = AEMLPNetwork(
+        num_columns=checkpoint['num_columns'],
+        hidden_units=checkpoint['hidden_units'],
+        dropout_rates=checkpoint['dropout_rates'],
+    ).to(device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    params = {
+        'num_columns': checkpoint['num_columns'],
+        'hidden_units': checkpoint['hidden_units'],
+        'dropout_rates': checkpoint['dropout_rates'],
+        'loss_weights': checkpoint['loss_weights'],
+    }
+
+    print(f"    Model loaded from: {path}")
+    return model, params
+
+
+def run_cv_evaluation(args, handler_config, symbols, model_path):
     """加载预训练模型并在 CV folds 和2025测试集上评估 IC"""
     print("\n" + "=" * 70)
-    print("CROSS-VALIDATION EVALUATION (AE-MLP)")
+    print("CROSS-VALIDATION EVALUATION (AE-MLP PyTorch)")
     print("=" * 70)
     print(f"Model: {model_path}")
     print(f"CV Folds: {len(CV_FOLDS)}")
@@ -269,13 +361,13 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
     print(f"Test Set: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']} (2025)")
     print("=" * 70)
 
-    # 设置 GPU
-    setup_gpu(args.gpu, use_mixed_precision)
+    # 设置设备
+    device = setup_device(args.gpu)
 
     # 加载模型
     print(f"\n[*] Loading model from: {model_path}")
-    model = keras.models.load_model(model_path)
-    print(f"    Model input shape: {model.input_shape}")
+    model, params = load_pytorch_model(model_path, device)
+    print(f"    Model input shape: {params['num_columns']}")
     print(f"    Model loaded successfully")
 
     # 预先准备2025测试集数据
@@ -288,7 +380,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
     fold_results = []
     fold_ics = []
     fold_test_ics = []
-    batch_size = 4096  # 使用较大的 batch size 加速预测
+    batch_size = 4096
 
     for fold_idx, fold in enumerate(CV_FOLDS):
         print(f"\n[*] Evaluating on {fold['name']}...")
@@ -302,23 +394,13 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
         print(f"    Valid: {X_valid.shape}")
 
         # 预测验证集
-        outputs = model.predict(X_valid, batch_size=batch_size, verbose=0)
-
-        # AE-MLP 有 3 个输出: [decoder, ae_action, action]
-        if isinstance(outputs, list) and len(outputs) == 3:
-            valid_pred = outputs[2].flatten()  # action 输出
-        else:
-            valid_pred = outputs.flatten()
+        valid_pred = predict_batch(model, X_valid, device, batch_size)
 
         # 计算验证集 IC
         mean_ic, ic_std, icir = compute_ic(valid_pred, y_valid, valid_index)
 
         # ========== 2025 测试集评估 ==========
-        test_outputs = model.predict(X_test, batch_size=batch_size, verbose=0)
-        if isinstance(test_outputs, list) and len(test_outputs) == 3:
-            test_pred = test_outputs[2].flatten()
-        else:
-            test_pred = test_outputs.flatten()
+        test_pred = predict_batch(model, X_test, device, batch_size)
         test_ic, test_ic_std, test_icir = compute_ic(test_pred, y_test, test_index)
 
         fold_ics.append(mean_ic)
@@ -352,15 +434,16 @@ def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_preci
     print("=" * 70)
 
     # 返回测试集预测（用于backtest）
-    test_pred_series = pd.Series(test_pred, index=test_index, name='score')
+    test_pred_final = predict_batch(model, X_test, device, batch_size)
+    test_pred_series = pd.Series(test_pred_final, index=test_index, name='score')
 
     return fold_results, mean_ic_all, std_ic_all, test_pred_series, test_dataset
 
 
-def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=False):
+def run_cv_training(args, handler_config, symbols, params):
     """运行 CV 训练以复现 IC，同时在2025测试集上评估"""
     print("\n" + "=" * 70)
-    print("CROSS-VALIDATION TRAINING (AE-MLP)")
+    print("CROSS-VALIDATION TRAINING (AE-MLP PyTorch)")
     print("=" * 70)
     print(f"CV Folds: {len(CV_FOLDS)}")
     for fold in CV_FOLDS:
@@ -373,8 +456,8 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
         print(f"Random seed: {args.seed}")
     print("=" * 70)
 
-    # 设置 GPU
-    setup_gpu(args.gpu, use_mixed_precision)
+    # 设置设备
+    device = setup_device(args.gpu)
 
     # 预先准备2025测试集数据（只需准备一次）
     print("\n[*] Preparing 2025 test data for evaluation...")
@@ -390,7 +473,7 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
     for fold_idx, fold in enumerate(CV_FOLDS):
         print(f"\n[*] Training {fold['name']}...")
 
-        # 为每个 fold 设置随机种子（使用 base_seed + fold_idx 确保每个 fold 有不同但确定的种子）
+        # 为每个 fold 设置随机种子
         if args.seed is not None:
             set_random_seed(args.seed + fold_idx)
 
@@ -407,55 +490,65 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
         fold_params = params.copy()
         fold_params['num_columns'] = X_train.shape[1]
 
-        # 清理并构建模型
-        tf.keras.backend.clear_session()
+        # 构建模型
+        model = build_ae_mlp_model(fold_params, device)
 
-        if use_mixed_precision:
-            mixed_precision.set_global_policy('mixed_float16')
+        # 打印模型信息
+        if fold_idx == 0:
+            total_params = sum(p.numel() for p in model.parameters())
+            print(f"    Total parameters: {total_params:,}")
 
-        model = build_ae_mlp_model(fold_params)
-
-        # 创建数据集
+        # 创建 DataLoader
         batch_size = params['batch_size']
-        train_dataset = create_tf_dataset(X_train, y_train, batch_size, shuffle=True, prefetch=True)
-        valid_dataset = create_tf_dataset(X_valid, y_valid, batch_size, shuffle=False, prefetch=True)
+        pin_memory = device.type == 'cuda'
+        train_loader = create_dataloader(X_train, y_train, batch_size, shuffle=True, pin_memory=pin_memory)
+        valid_loader = create_dataloader(X_valid, y_valid, batch_size, shuffle=False, pin_memory=pin_memory)
 
-        # 回调
-        cb_list = [
-            callbacks.EarlyStopping(
-                monitor='val_action_loss',
-                patience=args.cv_early_stop,
-                min_delta=1e-5,
-                restore_best_weights=True,
-                verbose=0,
-                mode='min'
-            ),
-        ]
-
-        # 训练
-        history = model.fit(
-            train_dataset,
-            validation_data=valid_dataset,
-            epochs=args.cv_epochs,
-            callbacks=cb_list,
-            verbose=1 if args.verbose else 0,
+        # 优化器和调度器
+        optimizer = optim.Adam(model.parameters(), lr=params['lr'])
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
         )
 
+        # 早停
+        early_stopping = EarlyStopping(
+            patience=args.cv_early_stop,
+            min_delta=1e-5,
+            restore_best=True,
+        )
+
+        # 训练循环
+        loss_weights = params['loss_weights']
+        best_epoch = 0
+
+        for epoch in range(args.cv_epochs):
+            train_losses = train_one_epoch(model, train_loader, optimizer, loss_weights, device)
+            val_losses = validate(model, valid_loader, loss_weights, device)
+
+            scheduler.step(val_losses['action'])
+
+            if args.verbose:
+                print(f"      Epoch {epoch+1:3d}: train_loss={train_losses['total']:.4f}, "
+                      f"val_action_loss={val_losses['action']:.4f}")
+
+            if early_stopping(val_losses['action'], model):
+                best_epoch = epoch + 1 - args.cv_early_stop
+                break
+            else:
+                best_epoch = epoch + 1
+
+        # 恢复最佳模型
+        early_stopping.restore(model)
+
         # 验证集预测
-        _, _, valid_pred = model.predict(X_valid, batch_size=batch_size, verbose=0)
-        valid_pred = valid_pred.flatten()
+        valid_pred = predict_batch(model, X_valid, device, batch_size)
 
         # 计算验证集 IC
         mean_ic, ic_std, icir = compute_ic(valid_pred, y_valid, valid_index)
 
         # ========== 2025 测试集评估 ==========
-        _, _, test_pred = model.predict(X_test, batch_size=batch_size, verbose=0)
-        test_pred = test_pred.flatten()
+        test_pred = predict_batch(model, X_test, device, batch_size)
         test_ic, test_ic_std, test_icir = compute_ic(test_pred, y_test, test_index)
-
-        best_epoch = len(history.history['loss']) - args.cv_early_stop
-        if best_epoch < 1:
-            best_epoch = len(history.history['loss'])
 
         fold_ics.append(mean_ic)
         fold_test_ics.append(test_ic)
@@ -491,7 +584,7 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
     return fold_results, mean_ic_all, std_ic_all
 
 
-def train_final_model(args, handler_config, symbols, params, use_mixed_precision=False):
+def train_final_model(args, handler_config, symbols, params):
     """使用参数在完整数据上训练最终模型"""
     print("\n[*] Training final model on full data...")
     print("    Parameters:")
@@ -499,12 +592,15 @@ def train_final_model(args, handler_config, symbols, params, use_mixed_precision
     print(f"      learning_rate: {params['lr']:.6f}")
     print(f"      batch_size: {params['batch_size']}")
 
+    # 设置设备
+    device = setup_device(args.gpu)
+
     # 创建最终数据集
     handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
     X_train, y_train, _ = prepare_data_from_dataset(dataset, "train")
-    X_valid, y_valid, _ = prepare_data_from_dataset(dataset, "valid")
+    X_valid, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
     X_test, _, test_index = prepare_data_from_dataset(dataset, "test")
 
     print(f"\n    Final training data:")
@@ -516,77 +612,80 @@ def train_final_model(args, handler_config, symbols, params, use_mixed_precision
     final_params = params.copy()
     final_params['num_columns'] = X_train.shape[1]
 
-    # 清理并构建模型
-    tf.keras.backend.clear_session()
-
     # 设置随机种子
     if args.seed is not None:
         set_random_seed(args.seed + 100)  # 使用不同于 CV 的种子
 
-    if use_mixed_precision:
-        mixed_precision.set_global_policy('mixed_float16')
+    # 构建模型
+    model = build_ae_mlp_model(final_params, device)
 
-    model = build_ae_mlp_model(final_params)
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"    Total parameters: {total_params:,}")
 
-    # 回调
-    cb_list = [
-        callbacks.EarlyStopping(
-            monitor='val_action_loss',
-            patience=args.early_stop,
-            min_delta=1e-5,
-            restore_best_weights=True,
-            verbose=1,
-            mode='min'
-        ),
-        callbacks.ReduceLROnPlateau(
-            monitor='val_action_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1,
-            mode='min'
-        ),
-    ]
-
-    # 创建数据集
+    # 创建 DataLoader
     batch_size = params['batch_size']
-    train_dataset = create_tf_dataset(X_train, y_train, batch_size, shuffle=True, prefetch=True)
-    valid_dataset = create_tf_dataset(X_valid, y_valid, batch_size, shuffle=False, prefetch=True)
+    pin_memory = device.type == 'cuda'
+    train_loader = create_dataloader(X_train, y_train, batch_size, shuffle=True, pin_memory=pin_memory)
+    valid_loader = create_dataloader(X_valid, y_valid, batch_size, shuffle=False, pin_memory=pin_memory)
 
-    # 训练
-    print("\n    Training progress:")
-    model.fit(
-        train_dataset,
-        validation_data=valid_dataset,
-        epochs=args.n_epochs,
-        callbacks=cb_list,
-        verbose=1,
+    # 优化器和调度器
+    optimizer = optim.Adam(model.parameters(), lr=params['lr'])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
     )
+
+    # 早停
+    early_stopping = EarlyStopping(
+        patience=args.early_stop,
+        min_delta=1e-5,
+        restore_best=True,
+    )
+
+    # 训练循环
+    loss_weights = params['loss_weights']
+    print("\n    Training progress:")
+
+    for epoch in range(args.n_epochs):
+        train_losses = train_one_epoch(model, train_loader, optimizer, loss_weights, device)
+        val_losses = validate(model, valid_loader, loss_weights, device)
+
+        current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(val_losses['action'])
+
+        print(f"    Epoch {epoch+1:3d}/{args.n_epochs}: "
+              f"train_loss={train_losses['total']:.4f}, "
+              f"val_loss={val_losses['total']:.4f}, "
+              f"val_action_loss={val_losses['action']:.4f}, "
+              f"lr={current_lr:.2e}")
+
+        if early_stopping(val_losses['action'], model):
+            print(f"    Early stopping at epoch {epoch+1}")
+            break
+
+    # 恢复最佳模型
+    early_stopping.restore(model)
 
     # 验证集 IC
-    _, _, valid_pred = model.predict(X_valid, batch_size=batch_size, verbose=0)
-    valid_pred = valid_pred.flatten()
-    valid_ic, valid_ic_std, valid_icir = compute_ic(
-        valid_pred, y_valid,
-        dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L).index
-    )
+    valid_pred = predict_batch(model, X_valid, device, batch_size)
+    valid_ic, valid_ic_std, valid_icir = compute_ic(valid_pred, y_valid, valid_index)
     print(f"\n    [Validation Set - for reference]")
     print(f"    Valid IC:   {valid_ic:.4f}")
     print(f"    Valid ICIR: {valid_icir:.4f}")
 
     # 测试集预测
-    _, _, test_pred_values = model.predict(X_test, batch_size=batch_size, verbose=0)
-    test_pred = pd.Series(test_pred_values.flatten(), index=test_index, name='score')
+    test_pred_values = predict_batch(model, X_test, device, batch_size)
+    test_pred = pd.Series(test_pred_values, index=test_index, name='score')
 
     print(f"\n    Test prediction shape: {test_pred.shape}")
     print(f"    Test prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
 
-    return model, test_pred, dataset
+    return model, final_params, test_pred, dataset
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='AE-MLP Cross-Validation Training with Loaded Parameters',
+        description='AE-MLP PyTorch Cross-Validation Training with Loaded Parameters',
     )
 
     # 参数文件
@@ -595,7 +694,7 @@ def main():
 
     # 模型评估模式
     parser.add_argument('--model-path', type=str, default=None,
-                        help='Path to pre-trained model for evaluation (e.g., my_models/ae_mlp_cv_xxx.keras)')
+                        help='Path to pre-trained model for evaluation (e.g., my_models/ae_mlp_pytorch_cv_xxx.pt)')
     parser.add_argument('--eval-only', action='store_true',
                         help='Only evaluate pre-trained model on CV folds, no training')
 
@@ -626,9 +725,7 @@ def main():
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
 
-    # GPU 优化参数
-    parser.add_argument('--mixed-precision', action='store_true',
-                        help='Enable mixed precision (FP16) training')
+    # 训练参数
     parser.add_argument('--verbose', action='store_true',
                         help='Show training progress for each fold')
 
@@ -653,16 +750,13 @@ def main():
     handler_config = HANDLER_CONFIG[args.handler]
     symbols = STOCK_POOLS[args.stock_pool]
 
-    # GPU 优化设置
-    use_mixed_precision = args.mixed_precision and args.gpu >= 0
-
     # 初始化
     init_qlib(handler_config['use_talib'])
 
     # ========== 评估模式 ==========
     if args.eval_only:
         print("\n" + "=" * 70)
-        print("AE-MLP Cross-Validation EVALUATION Mode")
+        print("AE-MLP PyTorch Cross-Validation EVALUATION Mode")
         print("=" * 70)
         print(f"Model: {args.model_path}")
         print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
@@ -673,8 +767,7 @@ def main():
         print("=" * 70)
 
         fold_results, mean_ic, std_ic, test_pred, test_dataset = run_cv_evaluation(
-            args, handler_config, symbols, args.model_path,
-            use_mixed_precision=use_mixed_precision
+            args, handler_config, symbols, args.model_path
         )
 
         # 回测（评估模式）
@@ -691,15 +784,18 @@ def main():
                 'test_end': FINAL_TEST['test_end'],
             }
 
+            device = setup_device(args.gpu)
+
             def load_model_func(path):
-                return keras.models.load_model(str(path))
+                model, _ = load_pytorch_model(str(path), device)
+                return model
 
             def get_feature_count_func(m):
-                return m.input_shape[1]
+                return m.num_columns
 
             run_backtest(
                 args.model_path, test_dataset, pred_df, args, time_splits,
-                model_name="AE-MLP (CV Eval)",
+                model_name="AE-MLP PyTorch (CV Eval)",
                 load_model_func=load_model_func,
                 get_feature_count_func=get_feature_count_func
             )
@@ -712,7 +808,7 @@ def main():
 
     # 打印头部
     print("\n" + "=" * 70)
-    print("AE-MLP Cross-Validation Training")
+    print("AE-MLP PyTorch Cross-Validation Training")
     print("=" * 70)
     print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
     print(f"Handler: {args.handler}")
@@ -720,7 +816,6 @@ def main():
     print(f"CV epochs: {args.cv_epochs}")
     print(f"CV Folds: {len(CV_FOLDS)}")
     print(f"GPU: {args.gpu}")
-    print(f"Mixed precision: {'ON' if use_mixed_precision else 'OFF'}")
     if args.num_seeds > 1:
         print(f"Num seeds: {args.num_seeds}")
     print("=" * 70)
@@ -740,8 +835,7 @@ def main():
             print(f"{'='*70}")
 
             fold_results, mean_ic, std_ic = run_cv_training(
-                args, handler_config, symbols, params,
-                use_mixed_precision=use_mixed_precision
+                args, handler_config, symbols, params
             )
             # 计算测试集平均IC
             mean_test_ic = np.mean([r['test_ic'] for r in fold_results])
@@ -768,16 +862,15 @@ def main():
         print(f"  {'Seed':<10s} {'Valid IC':>12s} {'Test IC (2025)':>16s}")
         print(f"  {'-'*10} {'-'*12} {'-'*16}")
         for r in all_results:
-            valid_marker = " ★" if r['seed'] == best_result['seed'] else ""
-            test_marker = " ◆" if r['seed'] == best_test_result['seed'] else ""
+            valid_marker = " *" if r['seed'] == best_result['seed'] else ""
+            test_marker = " #" if r['seed'] == best_test_result['seed'] else ""
             print(f"  {r['seed']:<10d} {r['mean_ic']:>10.4f}{valid_marker:<2s} {r['mean_test_ic']:>14.4f}{test_marker:<2s}")
-        print(f"\n★ Best valid seed: {best_result['seed']} (Valid IC={best_result['mean_ic']:.4f}, Test IC={best_result['mean_test_ic']:.4f})")
-        print(f"◆ Best test seed:  {best_test_result['seed']} (Valid IC={best_test_result['mean_ic']:.4f}, Test IC={best_test_result['mean_test_ic']:.4f})")
+        print(f"\n* Best valid seed: {best_result['seed']} (Valid IC={best_result['mean_ic']:.4f}, Test IC={best_result['mean_test_ic']:.4f})")
+        print(f"# Best test seed:  {best_test_result['seed']} (Valid IC={best_test_result['mean_ic']:.4f}, Test IC={best_test_result['mean_test_ic']:.4f})")
         print("=" * 70)
     else:
         fold_results, mean_ic, std_ic = run_cv_training(
-            args, handler_config, symbols, params,
-            use_mixed_precision=use_mixed_precision
+            args, handler_config, symbols, params
         )
 
     # 比较结果
@@ -793,9 +886,8 @@ def main():
         return
 
     # 训练最终模型
-    model, test_pred, dataset = train_final_model(
-        args, handler_config, symbols, params,
-        use_mixed_precision=use_mixed_precision
+    model, final_params, test_pred, dataset = train_final_model(
+        args, handler_config, symbols, params
     )
 
     # 评估
@@ -806,9 +898,8 @@ def main():
     print("\n[*] Saving model...")
     MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = MODEL_SAVE_PATH / f"ae_mlp_cv_{args.handler}_{args.stock_pool}_{args.nday}d_{timestamp}.keras"
-    model.save(str(model_path))
-    print(f"    Model saved to: {model_path}")
+    model_path = MODEL_SAVE_PATH / f"ae_mlp_pytorch_cv_{args.handler}_{args.stock_pool}_{args.nday}d_{timestamp}.pt"
+    save_pytorch_model(model, final_params, str(model_path))
 
     # 回测
     if args.backtest:
@@ -823,15 +914,18 @@ def main():
             'test_end': FINAL_TEST['test_end'],
         }
 
+        device = setup_device(args.gpu)
+
         def load_model(path):
-            return keras.models.load_model(str(path))
+            m, _ = load_pytorch_model(str(path), device)
+            return m
 
         def get_feature_count(m):
-            return m.input_shape[1]
+            return m.num_columns
 
         run_backtest(
             model_path, dataset, pred_df, args, time_splits,
-            model_name="AE-MLP (CV)",
+            model_name="AE-MLP PyTorch (CV)",
             load_model_func=load_model,
             get_feature_count_func=get_feature_count
         )
