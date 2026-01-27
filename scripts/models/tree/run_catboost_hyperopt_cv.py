@@ -83,46 +83,13 @@ from models.common import (
     create_meta_data,
     generate_model_filename,
     run_backtest,
+    # CV utilities
+    CV_FOLDS,
+    FINAL_TEST,
+    create_data_handler_for_fold,
+    create_dataset_for_fold,
+    compute_ic,
 )
-
-
-# ============================================================================
-# 时间序列交叉验证的 Fold 配置
-# ============================================================================
-
-CV_FOLDS = [
-    {
-        'name': 'Fold 1 (valid 2022)',
-        'train_start': '2000-01-01',
-        'train_end': '2021-12-31',
-        'valid_start': '2022-01-01',
-        'valid_end': '2022-12-31',
-    },
-    {
-        'name': 'Fold 2 (valid 2023)',
-        'train_start': '2000-01-01',
-        'train_end': '2022-12-31',
-        'valid_start': '2023-01-01',
-        'valid_end': '2023-12-31',
-    },
-    {
-        'name': 'Fold 3 (valid 2024)',
-        'train_start': '2000-01-01',
-        'train_end': '2023-12-31',
-        'valid_start': '2024-01-01',
-        'valid_end': '2024-12-31',
-    },
-]
-
-# 最终测试集 (完全独立)
-FINAL_TEST = {
-    'train_start': '2000-01-01',
-    'train_end': '2024-09-30',    # 修复：避免与验证集重叠
-    'valid_start': '2024-10-01',  # 验证集（无重叠）
-    'valid_end': '2024-12-31',
-    'test_start': '2025-01-01',
-    'test_end': '2025-12-31',
-}
 
 
 # ============================================================================
@@ -158,59 +125,6 @@ def create_catboost_params(hyperparams: dict) -> dict:
         'verbose': False,
         'random_seed': 42,
     }
-
-
-def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
-    """为特定 fold 创建 DataHandler"""
-    from models.common.handlers import get_handler_class
-
-    HandlerClass = get_handler_class(args.handler)
-
-    # 确定数据的结束时间
-    if 'test_end' in fold_config:
-        end_time = fold_config['test_end']
-    else:
-        end_time = fold_config['valid_end']
-
-    handler = HandlerClass(
-        volatility_window=args.nday,
-        instruments=symbols,
-        start_time=fold_config['train_start'],
-        end_time=end_time,
-        fit_start_time=fold_config['train_start'],
-        fit_end_time=fold_config['train_end'],
-        infer_processors=[],
-    )
-
-    return handler
-
-
-def create_dataset_for_fold(handler, fold_config):
-    """为特定 fold 创建 Dataset"""
-    segments = {
-        "train": (fold_config['train_start'], fold_config['train_end']),
-        "valid": (fold_config['valid_start'], fold_config['valid_end']),
-    }
-
-    if 'test_start' in fold_config:
-        segments["test"] = (fold_config['test_start'], fold_config['test_end'])
-
-    return DatasetH(handler=handler, segments=segments)
-
-
-def compute_ic(pred, label, index):
-    """计算 IC (按日期分组的相关系数平均值)"""
-    df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
-    ic_by_date = df.groupby(level='datetime').apply(
-        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
-    )
-    ic_by_date = ic_by_date.dropna()
-    if len(ic_by_date) == 0:
-        return 0.0, 0.0, 0.0
-    mean_ic = ic_by_date.mean()
-    ic_std = ic_by_date.std()
-    icir = mean_ic / ic_std if ic_std > 0 else 0
-    return mean_ic, ic_std, icir
 
 
 class CVHyperoptObjective:
