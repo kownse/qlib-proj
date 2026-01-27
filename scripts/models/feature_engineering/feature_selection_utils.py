@@ -488,6 +488,7 @@ class ForwardSelectionBase(ABC):
         output_dir: Path = None,
         checkpoint_name: str = "forward_selection_checkpoint",
         result_prefix: str = "forward_selection",
+        quiet: bool = False,
     ):
         self.symbols = symbols
         self.nday = nday
@@ -496,6 +497,7 @@ class ForwardSelectionBase(ABC):
         self.output_dir = output_dir
         self.checkpoint_name = checkpoint_name
         self.result_prefix = result_prefix
+        self.quiet = quiet
 
         self.excluded_features: Set[str] = set()
         self.history: List[Dict] = []
@@ -583,7 +585,7 @@ class ForwardSelectionBase(ABC):
         print(f"Inner CV Folds: {len(INNER_CV_FOLDS)}")
         print("=" * 70)
 
-        if self.excluded_features:
+        if self.excluded_features and not self.quiet:
             print(f"\nExcluded features from previous runs: {len(self.excluded_features)}")
             for f in sorted(self.excluded_features):
                 print(f"  - {f}")
@@ -594,7 +596,8 @@ class ForwardSelectionBase(ABC):
         self.current_ic = self.baseline_ic
 
         print(f"    Baseline Inner CV IC: {self.baseline_ic:.4f}")
-        print(f"    Fold ICs: {[f'{ic:.4f}' for ic in baseline_fold_ics]}")
+        if not self.quiet:
+            print(f"    Fold ICs: {[f'{ic:.4f}' for ic in baseline_fold_ics]}")
 
         counts = self.get_feature_counts()
         self.history.append({
@@ -622,9 +625,9 @@ class ForwardSelectionBase(ABC):
 
             counts = self.get_feature_counts()
             counts_str = " + ".join([f"{v} {k}" for k, v in counts.items()])
-            print(f"\n[Round {round_num}] Current IC: {self.current_ic:.4f}, Features: {counts_str}")
-            print(f"    Excluded features: {len(self.excluded_features)} (will skip)")
-            print(f"    Testing {len(testable_features)} feature + {len(testable_macro)} macro candidates...")
+            print(f"\n[Round {round_num}] IC: {self.current_ic:.4f}, Features: {counts_str}")
+            if not self.quiet:
+                print(f"    Excluded: {len(self.excluded_features)}, Testing: {len(testable_features)} feature + {len(testable_macro)} macro")
 
             candidates = []
             newly_excluded = []
@@ -654,12 +657,14 @@ class ForwardSelectionBase(ABC):
                         else:
                             symbol = "+" if ic_change >= self.min_improvement else ""
 
-                        print(f"      +{name}: IC={ic:.4f} ({symbol}{ic_change:+.4f})")
+                        if not self.quiet:
+                            print(f"      +{name}: IC={ic:.4f} ({symbol}{ic_change:+.4f})")
                         break
 
                     except Exception as e:
                         if attempt < 2:
-                            print(f"      +{name}: Retry {attempt+1}/3 after error...")
+                            if not self.quiet:
+                                print(f"      +{name}: Retry {attempt+1}/3 after error...")
                             self.cleanup_after_evaluation()
                         else:
                             print(f"      +{name}: ERROR - {e}")
@@ -689,19 +694,21 @@ class ForwardSelectionBase(ABC):
                         else:
                             symbol = "+" if ic_change >= self.min_improvement else ""
 
-                        print(f"      +{name}: IC={ic:.4f} ({symbol}{ic_change:+.4f})")
+                        if not self.quiet:
+                            print(f"      +{name}: IC={ic:.4f} ({symbol}{ic_change:+.4f})")
                         break
 
                     except Exception as e:
                         if attempt < 2:
-                            print(f"      +{name}: Retry {attempt+1}/3 after error...")
+                            if not self.quiet:
+                                print(f"      +{name}: Retry {attempt+1}/3 after error...")
                             self.cleanup_after_evaluation()
                         else:
                             print(f"      +{name}: ERROR - {e}")
 
             # 打印本轮新排除的特征
-            if newly_excluded:
-                print(f"\n    X Newly excluded features (IC dropped):")
+            if newly_excluded and not self.quiet:
+                print(f"\n    X Newly excluded ({len(newly_excluded)}):")
                 for f in newly_excluded:
                     print(f"       - {f}")
 
@@ -738,13 +745,10 @@ class ForwardSelectionBase(ABC):
             })
 
             counts_str = " + ".join([f"{v} {k}" for k, v in counts.items()])
-            print(f"\n    + Added {best['name']} ({best['type']})")
-            print(f"      IC: {best['ic']:.4f} (+{best['ic_change']:.4f})")
-            print(f"      Features: {counts_str}")
+            print(f"    + Added {best['name']}: IC={best['ic']:.4f} (+{best['ic_change']:.4f})")
 
             # 保存 checkpoint
             self._save_checkpoint(round_num)
-            print(f"      Checkpoint saved (excluded: {len(self.excluded_features)} features)")
 
         # 打印最终结果
         self._print_final_result()
@@ -814,6 +818,8 @@ def add_common_args(parser):
     parser.add_argument('--batch-size', type=int, default=2048)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--no-countdown', action='store_true')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Reduce output verbosity')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from checkpoint file')
     parser.add_argument('--resume-from', type=str, default=None,

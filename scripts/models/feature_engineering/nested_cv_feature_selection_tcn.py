@@ -46,7 +46,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 
 import torch
 
-from qlib.contrib.model.pytorch_tcn import TCN
+from models.deep.tcn_model import TCN
 
 from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
@@ -139,15 +139,12 @@ def normalize_data(X, fit_stats=None):
     return X_values, (means, stds)
 
 
-def print_data_quality(X, name="Data"):
+def print_data_quality(X, name="Data", quiet=False):
     """打印数据质量诊断信息"""
+    if quiet:
+        return
     nan_count = np.isnan(X).sum()
-    inf_count = np.isinf(X).sum()
-    print(f"      {name} shape: {X.shape}")
-    print(f"      {name} NaN: {nan_count} ({nan_count / X.size * 100:.2f}%)")
-    valid_values = X[~np.isnan(X) & ~np.isinf(X)]
-    if len(valid_values) > 0:
-        print(f"      {name} range: [{valid_values.min():.4f}, {valid_values.max():.4e}]")
+    print(f"      {name} shape: {X.shape}, NaN: {nan_count / X.size * 100:.1f}%")
 
 
 # ============================================================================
@@ -360,6 +357,7 @@ class TCNForwardSelection(ForwardSelectionBase):
         params: dict = None,
         output_dir: Path = None,
         gpu: int = 0,
+        quiet: bool = False,
     ):
         super().__init__(
             symbols=symbols,
@@ -369,6 +367,7 @@ class TCNForwardSelection(ForwardSelectionBase):
             output_dir=output_dir,
             checkpoint_name="forward_selection_tcn_checkpoint",
             result_prefix="forward_selection_tcn",
+            quiet=quiet,
         )
 
         self.current_talib = dict(baseline_talib)
@@ -379,7 +378,7 @@ class TCNForwardSelection(ForwardSelectionBase):
         self.epochs = epochs
         self.early_stop = early_stop
         self.params = params or DEFAULT_TCN_PARAMS
-        self.gpu = gpu  # GPU ID for qlib TCN
+        self.gpu = gpu
 
     def prepare_fold_data(self, fold_config: Dict) -> Tuple:
         """准备单个fold的数据"""
@@ -433,7 +432,7 @@ class TCNForwardSelection(ForwardSelectionBase):
         talib_features: Dict[str, str],
         macro_features: List[str],
     ) -> Tuple[float, List[float]]:
-        """使用指定特征集评估（使用 qlib TCN 实现）"""
+        """使用指定特征集评估"""
         fold_ics = []
 
         # 临时保存当前特征
@@ -451,10 +450,8 @@ class TCNForwardSelection(ForwardSelectionBase):
                 X_train, y_train, X_valid, y_valid, valid_index = self.prepare_fold_data(fold)
 
                 total_features = X_train.shape[1]
-                # d_feat = number of features per timestep (total / 60 timesteps)
                 d_feat = total_features // ALPHA300_SEQ_LEN
 
-                # 使用 qlib 的 TCN 实现（和 run_tcn.py 一样）
                 gpu_id = self.gpu if torch.cuda.is_available() else -1
                 model = TCN(
                     d_feat=d_feat,
@@ -469,81 +466,21 @@ class TCNForwardSelection(ForwardSelectionBase):
                     metric="loss",
                     loss="mse",
                     GPU=gpu_id,
+                    verbose=0,  # Silent mode
                 )
 
-                batch_size = self.params['batch_size']
+                # 使用新的 fit_numpy 接口
+                model.fit_numpy(X_train, y_train, X_valid, y_valid)
 
-                # 使用 qlib TCN 内部模型进行训练（手动训练循环以使用归一化后的数据）
-                tcn_model = model.tcn_model
-                optimizer = model.train_optimizer
-
-                best_loss = float('inf')
-                best_state = None
-                stop_steps = 0
-
-                for epoch in range(self.epochs):
-                    tcn_model.train()
-                    indices = np.arange(len(X_train))
-                    np.random.shuffle(indices)
-
-                    for i in range(0, len(indices), batch_size):
-                        if len(indices) - i < batch_size:
-                            break
-                        batch_idx = indices[i:i + batch_size]
-                        feature = torch.from_numpy(X_train[batch_idx]).float().to(model.device)
-                        label = torch.from_numpy(y_train[batch_idx]).float().to(model.device)
-
-                        pred = tcn_model(feature).squeeze()
-                        loss = torch.mean((pred - label) ** 2)
-
-                        optimizer.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_value_(tcn_model.parameters(), 3.0)
-                        optimizer.step()
-
-                    # Validation
-                    tcn_model.eval()
-                    with torch.no_grad():
-                        val_preds = []
-                        for i in range(0, len(X_valid), batch_size):
-                            end = min(i + batch_size, len(X_valid))
-                            feature = torch.from_numpy(X_valid[i:end]).float().to(model.device)
-                            pred = tcn_model(feature).squeeze()
-                            val_preds.append(pred.cpu().numpy())
-                        val_pred = np.concatenate(val_preds)
-                        val_loss = np.mean((val_pred - y_valid) ** 2)
-
-                    if val_loss < best_loss:
-                        best_loss = val_loss
-                        best_state = {k: v.cpu().clone() for k, v in tcn_model.state_dict().items()}
-                        stop_steps = 0
-                    else:
-                        stop_steps += 1
-                        if stop_steps >= self.early_stop:
-                            break
-
-                # Load best model and compute IC
-                if best_state is not None:
-                    tcn_model.load_state_dict(best_state)
-
-                tcn_model.eval()
-                with torch.no_grad():
-                    val_preds = []
-                    for i in range(0, len(X_valid), batch_size):
-                        end = min(i + batch_size, len(X_valid))
-                        feature = torch.from_numpy(X_valid[i:end]).float().to(model.device)
-                        pred = tcn_model(feature).squeeze()
-                        val_preds.append(pred.cpu().numpy())
-                    val_pred = np.concatenate(val_preds)
-
+                # 预测并计算 IC
+                val_pred = model.predict_numpy(X_valid)
                 ic = compute_ic(val_pred, y_valid, valid_index)
                 fold_ics.append(ic)
 
-                del X_train, y_train, X_valid, y_valid, valid_index, model, tcn_model
+                del X_train, y_train, X_valid, y_valid, valid_index, model
                 gc.collect()
 
         finally:
-            # 恢复原特征
             self.current_talib = orig_talib
             self.current_macro = orig_macro
 
@@ -689,21 +626,15 @@ def main():
             print("No checkpoint file found, starting fresh")
 
     # 获取候选特征（不在 baseline 中的特征）
-    print("\n[*] Preparing candidate features...")
-
     candidate_talib = {k: v for k, v in ALL_TALIB_FEATURES.items()
                        if k not in baseline_talib}
     candidate_macro = [m for m in ALL_MACRO_FEATURES
                        if m not in baseline_macro]
 
     # 验证候选特征
-    print(f"    Validating {len(candidate_talib)} TALib candidates...")
     candidate_talib = validate_qlib_features(symbols, candidate_talib)
-    print(f"    Valid: {len(candidate_talib)}")
-
-    print(f"    Validating {len(candidate_macro)} macro candidates...")
     candidate_macro = validate_macro_features(candidate_macro)
-    print(f"    Valid: {len(candidate_macro)}")
+    print(f"\n[*] Candidates: {len(candidate_talib)} TALib + {len(candidate_macro)} macro")
 
     # TCN 参数
     params = dict(DEFAULT_TCN_PARAMS)
@@ -729,6 +660,7 @@ def main():
         params=params,
         output_dir=output_dir,
         gpu=args.gpu,
+        quiet=args.quiet,
     )
 
     final_features, history, final_excluded = selector.run(
