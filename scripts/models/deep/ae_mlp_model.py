@@ -90,6 +90,7 @@ class AEMLP:
         loss_weights: Dict[str, float] = None,
         GPU: int = 0,
         seed: int = 42,
+        verbose: int = 1,
     ):
         self.num_columns = num_columns
         self.hidden_units = hidden_units or [96, 96, 512, 256, 128]
@@ -101,6 +102,7 @@ class AEMLP:
         self.loss_weights = loss_weights or {'decoder': 0.1, 'ae_action': 0.1, 'action': 1.0}
         self.GPU = GPU
         self.seed = seed
+        self.verbose = verbose
 
         self.model = None
         self.fitted = False
@@ -121,12 +123,15 @@ class AEMLP:
                 tf.config.set_visible_devices(gpus[self.GPU], 'GPU')
                 # 允许显存按需增长
                 tf.config.experimental.set_memory_growth(gpus[self.GPU], True)
-                print(f"    Using GPU: {gpus[self.GPU]}")
+                if self.verbose > 0:
+                    print(f"    Using GPU: {gpus[self.GPU]}")
             except RuntimeError as e:
-                print(f"    GPU setup error: {e}")
+                if self.verbose > 0:
+                    print(f"    GPU setup error: {e}")
         else:
             tf.config.set_visible_devices([], 'GPU')
-            print("    Using CPU")
+            if self.verbose > 0:
+                print("    Using CPU")
 
     def _build_model(self) -> Model:
         """
@@ -246,22 +251,27 @@ class AEMLP:
         dataset : DatasetH
             Qlib 数据集
         """
-        print("\n    Preparing training data...")
+        if self.verbose > 0:
+            print("\n    Preparing training data...")
         X_train, y_train = self._prepare_data(dataset, "train")
         X_valid, y_valid = self._prepare_data(dataset, "valid")
 
-        print(f"    Train shape: {X_train.shape}, Valid shape: {X_valid.shape}")
+        if self.verbose > 0:
+            print(f"    Train shape: {X_train.shape}, Valid shape: {X_valid.shape}")
 
         # 更新输入维度
         actual_features = X_train.shape[1]
         if actual_features != self.num_columns:
-            print(f"    Updating num_columns: {self.num_columns} -> {actual_features}")
+            if self.verbose > 0:
+                print(f"    Updating num_columns: {self.num_columns} -> {actual_features}")
             self.num_columns = actual_features
 
         # 构建模型
-        print("\n    Building AE-MLP model...")
+        if self.verbose > 0:
+            print("\n    Building AE-MLP model...")
         self.model = self._build_model()
-        self.model.summary(print_fn=lambda x: print(f"    {x}"))
+        if self.verbose > 1:
+            self.model.summary(print_fn=lambda x: print(f"    {x}"))
 
         # 回调函数
         cb_list = [
@@ -269,7 +279,7 @@ class AEMLP:
                 monitor='val_action_loss',
                 patience=self.early_stop,
                 restore_best_weights=True,
-                verbose=1,
+                verbose=self.verbose,
                 mode='min'  # 监控损失，越小越好
             ),
             callbacks.ReduceLROnPlateau(
@@ -277,7 +287,7 @@ class AEMLP:
                 factor=0.5,
                 patience=5,
                 min_lr=1e-6,
-                verbose=1,
+                verbose=self.verbose,
                 mode='min'
             ),
         ]
@@ -297,7 +307,8 @@ class AEMLP:
         }
 
         # 训练
-        print("\n    Training...")
+        if self.verbose > 0:
+            print("\n    Training...")
         history = self.model.fit(
             X_train,
             train_outputs,
@@ -305,11 +316,12 @@ class AEMLP:
             epochs=self.n_epochs,
             batch_size=self.batch_size,
             callbacks=cb_list,
-            verbose=1,
+            verbose=self.verbose,
         )
 
         self.fitted = True
-        print("\n    ✓ Training completed")
+        if self.verbose > 0:
+            print("\n    ✓ Training completed")
 
         return history
 
@@ -347,12 +359,13 @@ class AEMLP:
 
         return pred_series
 
-    def save(self, path: str):
+    def save(self, path: str, verbose: bool = True):
         """保存模型"""
         if self.model is None:
             raise ValueError("No model to save")
         self.model.save(path)
-        print(f"    ✓ Model saved to: {path}")
+        if verbose:
+            print(f"    ✓ Model saved to: {path}")
 
     @classmethod
     def load(cls, path: str, **kwargs) -> 'AEMLP':
