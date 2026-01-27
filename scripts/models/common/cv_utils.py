@@ -42,8 +42,8 @@ CV_FOLDS = [
 # 最终测试集 (完全独立)
 FINAL_TEST = {
     'train_start': '2000-01-01',
-    'train_end': '2024-09-30',
-    'valid_start': '2024-10-01',
+    'train_end': '2023-12-31',
+    'valid_start': '2024-01-01',
     'valid_end': '2024-12-31',
     'test_start': '2025-01-01',
     'test_end': '2025-12-31',
