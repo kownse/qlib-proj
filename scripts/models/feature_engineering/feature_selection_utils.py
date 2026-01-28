@@ -73,61 +73,272 @@ INNER_CV_FOLDS = [
 # 候选特征池
 # ============================================================================
 
-# 所有可能的股票特征 (用于 AE-MLP 等非时序模型)
-ALL_STOCK_FEATURES = {
-    # 动量特征
-    "MOMENTUM_QUALITY": "($close/Ref($close, 20) - 1) / (Std($close/Ref($close,1)-1, 20) + 1e-12)",
+# Alpha158 特征 (来自 Qlib)
+ALPHA158_FEATURES = {
+    # KBAR 特征
+    "KMID": "($close-$open)/$open",
+    "KLEN": "($high-$low)/$open",
+    "KMID2": "($close-$open)/($high-$low+1e-12)",
+    "KUP": "($high-Greater($open, $close))/$open",
+    "KUP2": "($high-Greater($open, $close))/($high-$low+1e-12)",
+    "KLOW": "(Less($open, $close)-$low)/$open",
+    "KLOW2": "(Less($open, $close)-$low)/($high-$low+1e-12)",
+    "KSFT": "(2*$close-$high-$low)/$open",
+    "KSFT2": "(2*$close-$high-$low)/($high-$low+1e-12)",
+
+    # Price 特征
+    "OPEN0": "$open/$close",
+    "HIGH0": "$high/$close",
+    "LOW0": "$low/$close",
+
+    # ROC 特征
     "ROC5": "Ref($close, 5)/$close",
+    "ROC10": "Ref($close, 10)/$close",
     "ROC20": "Ref($close, 20)/$close",
+    "ROC30": "Ref($close, 30)/$close",
     "ROC60": "Ref($close, 60)/$close",
-    "TALIB_RSI14": "TALIB_RSI($close, 14)",
-    "TALIB_WILLR14": "TALIB_WILLR($high, $low, $close, 14)",
 
-    # 波动率特征
-    "TALIB_NATR14": "TALIB_NATR($high, $low, $close, 14)",
+    # MA 特征
+    "MA5": "Mean($close, 5)/$close",
+    "MA10": "Mean($close, 10)/$close",
+    "MA20": "Mean($close, 20)/$close",
+    "MA30": "Mean($close, 30)/$close",
+    "MA60": "Mean($close, 60)/$close",
+
+    # STD 特征
+    "STD5": "Std($close, 5)/$close",
+    "STD10": "Std($close, 10)/$close",
     "STD20": "Std($close, 20)/$close",
+    "STD30": "Std($close, 30)/$close",
     "STD60": "Std($close, 60)/$close",
-    "TALIB_ATR14": "TALIB_ATR($high, $low, $close, 14)/$close",
 
-    # 价格位置特征
+    # BETA 特征
+    "BETA5": "Slope($close, 5)/$close",
+    "BETA10": "Slope($close, 10)/$close",
+    "BETA20": "Slope($close, 20)/$close",
+    "BETA30": "Slope($close, 30)/$close",
+    "BETA60": "Slope($close, 60)/$close",
+
+    # RSQR 特征
+    "RSQR5": "Rsquare($close, 5)",
+    "RSQR10": "Rsquare($close, 10)",
+    "RSQR20": "Rsquare($close, 20)",
+    "RSQR30": "Rsquare($close, 30)",
+    "RSQR60": "Rsquare($close, 60)",
+
+    # RESI 特征
+    "RESI5": "Resi($close, 5)/$close",
+    "RESI10": "Resi($close, 10)/$close",
+    "RESI20": "Resi($close, 20)/$close",
+    "RESI30": "Resi($close, 30)/$close",
+    "RESI60": "Resi($close, 60)/$close",
+
+    # MAX 特征
+    "MAX5": "Max($high, 5)/$close",
+    "MAX10": "Max($high, 10)/$close",
+    "MAX20": "Max($high, 20)/$close",
+    "MAX30": "Max($high, 30)/$close",
+    "MAX60": "Max($high, 60)/$close",
+
+    # MIN 特征
+    "MIN5": "Min($low, 5)/$close",
+    "MIN10": "Min($low, 10)/$close",
+    "MIN20": "Min($low, 20)/$close",
+    "MIN30": "Min($low, 30)/$close",
+    "MIN60": "Min($low, 60)/$close",
+
+    # QTLU 特征
+    "QTLU5": "Quantile($close, 5, 0.8)/$close",
+    "QTLU10": "Quantile($close, 10, 0.8)/$close",
+    "QTLU20": "Quantile($close, 20, 0.8)/$close",
+    "QTLU30": "Quantile($close, 30, 0.8)/$close",
+    "QTLU60": "Quantile($close, 60, 0.8)/$close",
+
+    # QTLD 特征
+    "QTLD5": "Quantile($close, 5, 0.2)/$close",
+    "QTLD10": "Quantile($close, 10, 0.2)/$close",
+    "QTLD20": "Quantile($close, 20, 0.2)/$close",
+    "QTLD30": "Quantile($close, 30, 0.2)/$close",
+    "QTLD60": "Quantile($close, 60, 0.2)/$close",
+
+    # RANK 特征
+    "RANK5": "Rank($close, 5)",
+    "RANK10": "Rank($close, 10)",
+    "RANK20": "Rank($close, 20)",
+    "RANK30": "Rank($close, 30)",
+    "RANK60": "Rank($close, 60)",
+
+    # RSV 特征
+    "RSV5": "($close-Min($low, 5))/(Max($high, 5)-Min($low, 5)+1e-12)",
+    "RSV10": "($close-Min($low, 10))/(Max($high, 10)-Min($low, 10)+1e-12)",
+    "RSV20": "($close-Min($low, 20))/(Max($high, 20)-Min($low, 20)+1e-12)",
+    "RSV30": "($close-Min($low, 30))/(Max($high, 30)-Min($low, 30)+1e-12)",
+    "RSV60": "($close-Min($low, 60))/(Max($high, 60)-Min($low, 60)+1e-12)",
+
+    # IMAX 特征
+    "IMAX5": "IdxMax($high, 5)/5",
+    "IMAX10": "IdxMax($high, 10)/10",
+    "IMAX20": "IdxMax($high, 20)/20",
+    "IMAX30": "IdxMax($high, 30)/30",
+    "IMAX60": "IdxMax($high, 60)/60",
+
+    # IMIN 特征
+    "IMIN5": "IdxMin($low, 5)/5",
+    "IMIN10": "IdxMin($low, 10)/10",
+    "IMIN20": "IdxMin($low, 20)/20",
+    "IMIN30": "IdxMin($low, 30)/30",
+    "IMIN60": "IdxMin($low, 60)/60",
+
+    # IMXD 特征
+    "IMXD5": "(IdxMax($high, 5)-IdxMin($low, 5))/5",
+    "IMXD10": "(IdxMax($high, 10)-IdxMin($low, 10))/10",
+    "IMXD20": "(IdxMax($high, 20)-IdxMin($low, 20))/20",
+    "IMXD30": "(IdxMax($high, 30)-IdxMin($low, 30))/30",
+    "IMXD60": "(IdxMax($high, 60)-IdxMin($low, 60))/60",
+
+    # CORR 特征
+    "CORR5": "Corr($close, Log($volume+1), 5)",
+    "CORR10": "Corr($close, Log($volume+1), 10)",
+    "CORR20": "Corr($close, Log($volume+1), 20)",
+    "CORR30": "Corr($close, Log($volume+1), 30)",
+    "CORR60": "Corr($close, Log($volume+1), 60)",
+
+    # CORD 特征
+    "CORD5": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 5)",
+    "CORD10": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 10)",
+    "CORD20": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 20)",
+    "CORD30": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 30)",
+    "CORD60": "Corr($close/Ref($close,1), Log($volume/Ref($volume, 1)+1), 60)",
+
+    # CNTP 特征
+    "CNTP5": "Mean($close>Ref($close, 1), 5)",
+    "CNTP10": "Mean($close>Ref($close, 1), 10)",
+    "CNTP20": "Mean($close>Ref($close, 1), 20)",
+    "CNTP30": "Mean($close>Ref($close, 1), 30)",
+    "CNTP60": "Mean($close>Ref($close, 1), 60)",
+
+    # CNTN 特征
+    "CNTN5": "Mean($close<Ref($close, 1), 5)",
+    "CNTN10": "Mean($close<Ref($close, 1), 10)",
+    "CNTN20": "Mean($close<Ref($close, 1), 20)",
+    "CNTN30": "Mean($close<Ref($close, 1), 30)",
+    "CNTN60": "Mean($close<Ref($close, 1), 60)",
+
+    # CNTD 特征
+    "CNTD5": "Mean($close>Ref($close, 1), 5)-Mean($close<Ref($close, 1), 5)",
+    "CNTD10": "Mean($close>Ref($close, 1), 10)-Mean($close<Ref($close, 1), 10)",
+    "CNTD20": "Mean($close>Ref($close, 1), 20)-Mean($close<Ref($close, 1), 20)",
+    "CNTD30": "Mean($close>Ref($close, 1), 30)-Mean($close<Ref($close, 1), 30)",
+    "CNTD60": "Mean($close>Ref($close, 1), 60)-Mean($close<Ref($close, 1), 60)",
+
+    # SUMP 特征
+    "SUMP5": "Sum(Greater($close-Ref($close, 1), 0), 5)/(Sum(Abs($close-Ref($close, 1)), 5)+1e-12)",
+    "SUMP10": "Sum(Greater($close-Ref($close, 1), 0), 10)/(Sum(Abs($close-Ref($close, 1)), 10)+1e-12)",
+    "SUMP20": "Sum(Greater($close-Ref($close, 1), 0), 20)/(Sum(Abs($close-Ref($close, 1)), 20)+1e-12)",
+    "SUMP30": "Sum(Greater($close-Ref($close, 1), 0), 30)/(Sum(Abs($close-Ref($close, 1)), 30)+1e-12)",
+    "SUMP60": "Sum(Greater($close-Ref($close, 1), 0), 60)/(Sum(Abs($close-Ref($close, 1)), 60)+1e-12)",
+
+    # SUMN 特征
+    "SUMN5": "Sum(Greater(Ref($close, 1)-$close, 0), 5)/(Sum(Abs($close-Ref($close, 1)), 5)+1e-12)",
+    "SUMN10": "Sum(Greater(Ref($close, 1)-$close, 0), 10)/(Sum(Abs($close-Ref($close, 1)), 10)+1e-12)",
+    "SUMN20": "Sum(Greater(Ref($close, 1)-$close, 0), 20)/(Sum(Abs($close-Ref($close, 1)), 20)+1e-12)",
+    "SUMN30": "Sum(Greater(Ref($close, 1)-$close, 0), 30)/(Sum(Abs($close-Ref($close, 1)), 30)+1e-12)",
+    "SUMN60": "Sum(Greater(Ref($close, 1)-$close, 0), 60)/(Sum(Abs($close-Ref($close, 1)), 60)+1e-12)",
+
+    # SUMD 特征
+    "SUMD5": "(Sum(Greater($close-Ref($close, 1), 0), 5)-Sum(Greater(Ref($close, 1)-$close, 0), 5))/(Sum(Abs($close-Ref($close, 1)), 5)+1e-12)",
+    "SUMD10": "(Sum(Greater($close-Ref($close, 1), 0), 10)-Sum(Greater(Ref($close, 1)-$close, 0), 10))/(Sum(Abs($close-Ref($close, 1)), 10)+1e-12)",
+    "SUMD20": "(Sum(Greater($close-Ref($close, 1), 0), 20)-Sum(Greater(Ref($close, 1)-$close, 0), 20))/(Sum(Abs($close-Ref($close, 1)), 20)+1e-12)",
+    "SUMD30": "(Sum(Greater($close-Ref($close, 1), 0), 30)-Sum(Greater(Ref($close, 1)-$close, 0), 30))/(Sum(Abs($close-Ref($close, 1)), 30)+1e-12)",
+    "SUMD60": "(Sum(Greater($close-Ref($close, 1), 0), 60)-Sum(Greater(Ref($close, 1)-$close, 0), 60))/(Sum(Abs($close-Ref($close, 1)), 60)+1e-12)",
+
+    # WVMA 特征
+    "WVMA5": "Std(Abs($close/Ref($close, 1)-1)*$volume, 5)/(Mean(Abs($close/Ref($close, 1)-1)*$volume, 5)+1e-12)",
+    "WVMA10": "Std(Abs($close/Ref($close, 1)-1)*$volume, 10)/(Mean(Abs($close/Ref($close, 1)-1)*$volume, 10)+1e-12)",
+    "WVMA20": "Std(Abs($close/Ref($close, 1)-1)*$volume, 20)/(Mean(Abs($close/Ref($close, 1)-1)*$volume, 20)+1e-12)",
+    "WVMA30": "Std(Abs($close/Ref($close, 1)-1)*$volume, 30)/(Mean(Abs($close/Ref($close, 1)-1)*$volume, 30)+1e-12)",
+    "WVMA60": "Std(Abs($close/Ref($close, 1)-1)*$volume, 60)/(Mean(Abs($close/Ref($close, 1)-1)*$volume, 60)+1e-12)",
+
+    # VSUMP 特征
+    "VSUMP5": "Sum(Greater($volume-Ref($volume, 1), 0), 5)/(Sum(Abs($volume-Ref($volume, 1)), 5)+1e-12)",
+    "VSUMP10": "Sum(Greater($volume-Ref($volume, 1), 0), 10)/(Sum(Abs($volume-Ref($volume, 1)), 10)+1e-12)",
+    "VSUMP20": "Sum(Greater($volume-Ref($volume, 1), 0), 20)/(Sum(Abs($volume-Ref($volume, 1)), 20)+1e-12)",
+    "VSUMP30": "Sum(Greater($volume-Ref($volume, 1), 0), 30)/(Sum(Abs($volume-Ref($volume, 1)), 30)+1e-12)",
+    "VSUMP60": "Sum(Greater($volume-Ref($volume, 1), 0), 60)/(Sum(Abs($volume-Ref($volume, 1)), 60)+1e-12)",
+
+    # VSUMN 特征
+    "VSUMN5": "Sum(Greater(Ref($volume, 1)-$volume, 0), 5)/(Sum(Abs($volume-Ref($volume, 1)), 5)+1e-12)",
+    "VSUMN10": "Sum(Greater(Ref($volume, 1)-$volume, 0), 10)/(Sum(Abs($volume-Ref($volume, 1)), 10)+1e-12)",
+    "VSUMN20": "Sum(Greater(Ref($volume, 1)-$volume, 0), 20)/(Sum(Abs($volume-Ref($volume, 1)), 20)+1e-12)",
+    "VSUMN30": "Sum(Greater(Ref($volume, 1)-$volume, 0), 30)/(Sum(Abs($volume-Ref($volume, 1)), 30)+1e-12)",
+    "VSUMN60": "Sum(Greater(Ref($volume, 1)-$volume, 0), 60)/(Sum(Abs($volume-Ref($volume, 1)), 60)+1e-12)",
+
+    # VSUMD 特征
+    "VSUMD5": "(Sum(Greater($volume-Ref($volume, 1), 0), 5)-Sum(Greater(Ref($volume, 1)-$volume, 0), 5))/(Sum(Abs($volume-Ref($volume, 1)), 5)+1e-12)",
+    "VSUMD10": "(Sum(Greater($volume-Ref($volume, 1), 0), 10)-Sum(Greater(Ref($volume, 1)-$volume, 0), 10))/(Sum(Abs($volume-Ref($volume, 1)), 10)+1e-12)",
+    "VSUMD20": "(Sum(Greater($volume-Ref($volume, 1), 0), 20)-Sum(Greater(Ref($volume, 1)-$volume, 0), 20))/(Sum(Abs($volume-Ref($volume, 1)), 20)+1e-12)",
+    "VSUMD30": "(Sum(Greater($volume-Ref($volume, 1), 0), 30)-Sum(Greater(Ref($volume, 1)-$volume, 0), 30))/(Sum(Abs($volume-Ref($volume, 1)), 30)+1e-12)",
+    "VSUMD60": "(Sum(Greater($volume-Ref($volume, 1), 0), 60)-Sum(Greater(Ref($volume, 1)-$volume, 0), 60))/(Sum(Abs($volume-Ref($volume, 1)), 60)+1e-12)",
+}
+
+# 额外的自定义特征
+EXTRA_STOCK_FEATURES = {
+    # 动量质量
+    "MOMENTUM_QUALITY": "($close/Ref($close, 20) - 1) / (Std($close/Ref($close,1)-1, 20) + 1e-12)",
+
+    # 价格位置
     "PCT_FROM_52W_HIGH": "($close - Max($high, 252)) / (Max($high, 252) + 1e-12)",
     "PCT_FROM_52W_LOW": "($close - Min($low, 252)) / (Min($low, 252) + 1e-12)",
-    "MAX60": "Max($high, 60)/$close",
-    "MIN60": "Min($low, 60)/$close",
     "CLOSE_POSITION_60": "($close - Min($low, 60))/(Max($high, 60) - Min($low, 60) + 1e-12)",
     "CLOSE_POSITION_20": "($close - Min($low, 20))/(Max($high, 20) - Min($low, 20) + 1e-12)",
 
     # 均值回归
-    "RESI5": "Resi($close, 5)/$close",
-    "RESI10": "Resi($close, 10)/$close",
-    "RESI20": "Resi($close, 20)/$close",
     "MA_RATIO_5_20": "Mean($close, 5)/Mean($close, 20)",
     "MA_RATIO_20_60": "Mean($close, 20)/Mean($close, 60)",
 
     # 成交量
     "VOLUME_RATIO_5_20": "Mean($volume, 5)/(Mean($volume, 20)+1e-12)",
     "VOLUME_STD_20": "Std($volume, 20)/(Mean($volume, 20)+1e-12)",
-    "VWAP_BIAS": "($close*$volume)/Sum($volume, 20) - Mean($close, 20)",
-
-    # 趋势
-    "TALIB_ADX14": "TALIB_ADX($high, $low, $close, 14)",
-    "SLOPE20": "Slope($close, 20)/$close",
-    "SLOPE60": "Slope($close, 60)/$close",
 
     # Drawdown
     "MAX_DRAWDOWN_20": "(Min($close, 20) - Max($high, 20)) / (Max($high, 20) + 1e-12)",
     "MAX_DRAWDOWN_60": "(Min($close, 60) - Max($high, 60)) / (Max($high, 60) + 1e-12)",
 
-    # 技术指标
+    # 价格比率
+    "HIGH_LOW_RATIO": "$high/$low",
+    "CLOSE_OPEN_RATIO": "$close/$open",
+}
+
+# TALib 技术指标特征
+TALIB_STOCK_FEATURES = {
+    "TALIB_RSI14": "TALIB_RSI($close, 14)",
+    "TALIB_WILLR14": "TALIB_WILLR($high, $low, $close, 14)",
+    "TALIB_NATR14": "TALIB_NATR($high, $low, $close, 14)",
+    "TALIB_ATR14": "TALIB_ATR($high, $low, $close, 14)/$close",
+    "TALIB_ADX14": "TALIB_ADX($high, $low, $close, 14)",
     "TALIB_CCI14": "TALIB_CCI($high, $low, $close, 14)",
     "TALIB_MFI14": "TALIB_MFI($high, $low, $close, $volume, 14)",
-
-    # 额外候选特征
     "TALIB_MACD_HIST": "TALIB_MACD_HIST($close, 12, 26, 9)",
     "TALIB_BBANDS_UPPER": "TALIB_BBANDS_UPPER($close, 20, 2, 2)/$close",
     "TALIB_BBANDS_LOWER": "TALIB_BBANDS_LOWER($close, 20, 2, 2)/$close",
-    "HIGH_LOW_RATIO": "$high/$low",
-    "CLOSE_OPEN_RATIO": "$close/$open",
+    "TALIB_MACD": "TALIB_MACD_MACD($close, 12, 26, 9)/$close",
+    "TALIB_MACD_SIGNAL": "TALIB_MACD_SIGNAL($close, 12, 26, 9)/$close",
+    "TALIB_EMA20": "TALIB_EMA($close, 20)/$close",
+    "TALIB_SMA20": "TALIB_SMA($close, 20)/$close",
+    "TALIB_PLUS_DI14": "TALIB_PLUS_DI($high, $low, $close, 14)",
+    "TALIB_MINUS_DI14": "TALIB_MINUS_DI($high, $low, $close, 14)",
+    "TALIB_STOCH_K": "TALIB_STOCH_K($high, $low, $close, 5, 3, 3)",
+    "TALIB_STOCH_D": "TALIB_STOCH_D($high, $low, $close, 5, 3, 3)",
+    "TALIB_CMO14": "TALIB_CMO($close, 14)",
+    "TALIB_MOM10": "TALIB_MOM($close, 10)/$close",
+    "TALIB_ROC10": "TALIB_ROC($close, 10)",
+}
+
+# 合并所有股票特征 (用于 CatBoost 等非时序模型)
+ALL_STOCK_FEATURES = {
+    **ALPHA158_FEATURES,
+    **EXTRA_STOCK_FEATURES,
+    **TALIB_STOCK_FEATURES,
 }
 
 # 所有可能的 TALib 特征 (用于 TCN 等时序模型，每个会扩展为多天历史)
