@@ -124,24 +124,24 @@ def create_dataset(handler, time_splits: dict) -> DatasetH:
     )
 
 
-def predict_with_ae_mlp(model: AEMLP, dataset: DatasetH) -> pd.Series:
+def predict_with_ae_mlp(model: AEMLP, dataset: DatasetH, segment: str = "test") -> pd.Series:
     """Generate predictions with AE-MLP model"""
-    pred = model.predict(dataset, segment="test")
+    pred = model.predict(dataset, segment=segment)
     pred.name = 'score'
     return pred
 
 
-def predict_with_catboost(model: CatBoostRegressor, dataset: DatasetH) -> pd.Series:
+def predict_with_catboost(model: CatBoostRegressor, dataset: DatasetH, segment: str = "test") -> pd.Series:
     """Generate predictions with CatBoost model"""
-    # Get test data with DK_L for consistent preprocessing
-    test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
+    # Get data with DK_L for consistent preprocessing
+    data = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
 
     # Fill NaN and handle inf values
-    test_data = test_data.fillna(0).replace([np.inf, -np.inf], 0)
+    data = data.fillna(0).replace([np.inf, -np.inf], 0)
 
     # Predict
-    pred_values = model.predict(test_data.values)
-    pred = pd.Series(pred_values, index=test_data.index, name='score')
+    pred_values = model.predict(data.values)
+    pred = pd.Series(pred_values, index=data.index, name='score')
 
     return pred
 
@@ -166,6 +166,194 @@ def calculate_correlation(pred1: pd.Series, pred2: pd.Series) -> tuple:
     std_daily_corr = daily_corr.std()
 
     return overall_corr, mean_daily_corr, std_daily_corr, daily_corr
+
+
+def learn_optimal_weights(pred1: pd.Series, pred2: pd.Series, label: pd.Series,
+                          method: str = 'grid_search', use_zscore: bool = True,
+                          min_weight: float = 0.1, diversity_bonus: float = 0.1) -> tuple:
+    """
+    Learn optimal ensemble weights using validation data (Stacking).
+
+    Parameters
+    ----------
+    pred1, pred2 : pd.Series
+        Prediction series from each model on validation set
+    label : pd.Series
+        True labels on validation set
+    method : str
+        Learning method: 'grid_search', 'grid_search_icir', 'regression', 'ridge', 'analytical'
+    use_zscore : bool
+        Whether to zscore normalize predictions before learning weights
+    min_weight : float
+        Minimum weight for each model (prevents extreme weights, default 0.1)
+    diversity_bonus : float
+        Bonus for balanced weights to encourage diversity (default 0.1)
+        Final score = IC + diversity_bonus * (1 - |w1 - 0.5| * 2)
+
+    Returns
+    -------
+    tuple
+        (weight1, weight2) optimal weights
+    """
+    # Align all series
+    common_idx = pred1.index.intersection(pred2.index).intersection(label.index)
+    p1 = pred1.loc[common_idx]
+    p2 = pred2.loc[common_idx]
+    y = label.loc[common_idx]
+
+    # Remove NaN
+    valid_mask = ~(p1.isna() | p2.isna() | y.isna())
+    p1 = p1[valid_mask]
+    p2 = p2[valid_mask]
+    y = y[valid_mask]
+
+    # Optionally zscore normalize within each day
+    if use_zscore:
+        def zscore_by_day(x):
+            mean = x.groupby(level='datetime').transform('mean')
+            std = x.groupby(level='datetime').transform('std')
+            return (x - mean) / (std + 1e-8)
+        p1 = zscore_by_day(p1)
+        p2 = zscore_by_day(p2)
+
+    if method == 'grid_search':
+        # Grid search to maximize IC with diversity bonus
+        # Prevents overfitting to one model by encouraging balanced weights
+        best_score = -np.inf
+        best_w1 = 0.5
+        best_ic = 0
+
+        for w1 in np.arange(min_weight, 1.0 - min_weight + 0.01, 0.05):
+            w2 = 1 - w1
+            ensemble = p1 * w1 + p2 * w2
+
+            # Calculate daily IC
+            df = pd.DataFrame({'pred': ensemble, 'label': y})
+            ic_by_date = df.groupby(level='datetime').apply(
+                lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+            )
+            mean_ic = ic_by_date.dropna().mean()
+
+            # Diversity bonus: highest when w1 = 0.5, zero when w1 = 0 or 1
+            diversity = 1 - abs(w1 - 0.5) * 2
+            score = mean_ic + diversity_bonus * diversity
+
+            if score > best_score:
+                best_score = score
+                best_w1 = w1
+                best_ic = mean_ic
+
+        return (best_w1, 1 - best_w1), {
+            'method': 'grid_search',
+            'best_ic': best_ic,
+            'diversity_bonus': diversity_bonus
+        }
+
+    elif method == 'grid_search_icir':
+        # Grid search to maximize ICIR (more stable than IC)
+        best_icir = -np.inf
+        best_w1 = 0.5
+        best_ic = 0
+
+        for w1 in np.arange(min_weight, 1.0 - min_weight + 0.01, 0.05):
+            w2 = 1 - w1
+            ensemble = p1 * w1 + p2 * w2
+
+            # Calculate daily IC
+            df = pd.DataFrame({'pred': ensemble, 'label': y})
+            ic_by_date = df.groupby(level='datetime').apply(
+                lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+            )
+            ic_series = ic_by_date.dropna()
+            mean_ic = ic_series.mean()
+            ic_std = ic_series.std()
+            icir = mean_ic / ic_std if ic_std > 0 else 0
+
+            if icir > best_icir:
+                best_icir = icir
+                best_w1 = w1
+                best_ic = mean_ic
+
+        return (best_w1, 1 - best_w1), {
+            'method': 'grid_search_icir',
+            'best_ic': best_ic,
+            'best_icir': best_icir
+        }
+
+    elif method == 'regression':
+        # Linear regression: y = w1*p1 + w2*p2
+        from sklearn.linear_model import LinearRegression
+
+        X = np.column_stack([p1.values, p2.values])
+        reg = LinearRegression(fit_intercept=False, positive=True)
+        reg.fit(X, y.values)
+
+        w1, w2 = reg.coef_
+        # Normalize weights to sum to 1
+        total = w1 + w2
+        if total > 0:
+            w1, w2 = w1 / total, w2 / total
+        else:
+            w1, w2 = 0.5, 0.5
+
+        return (w1, w2), {'method': 'regression', 'r2': reg.score(X, y.values)}
+
+    elif method == 'ridge':
+        # Ridge regression with regularization
+        from sklearn.linear_model import Ridge
+
+        X = np.column_stack([p1.values, p2.values])
+        reg = Ridge(alpha=1.0, fit_intercept=False)
+        reg.fit(X, y.values)
+
+        w1, w2 = reg.coef_
+        # Normalize weights to sum to 1
+        total = abs(w1) + abs(w2)
+        if total > 0:
+            w1, w2 = w1 / total, w2 / total
+        else:
+            w1, w2 = 0.5, 0.5
+
+        return (w1, w2), {'method': 'ridge', 'r2': reg.score(X, y.values)}
+
+    elif method == 'analytical':
+        # Analytical solution considering correlation
+        # Maximize IC of ensemble: w1*IC1 + w2*IC2 considering covariance
+        # This is similar to Markowitz portfolio optimization
+
+        # Calculate daily ICs for each model
+        df = pd.DataFrame({'p1': p1, 'p2': p2, 'label': y})
+        daily_stats = df.groupby(level='datetime').apply(
+            lambda x: pd.Series({
+                'ic1': x['p1'].corr(x['label']),
+                'ic2': x['p2'].corr(x['label']),
+                'corr': x['p1'].corr(x['p2'])
+            })
+        ).dropna()
+
+        ic1 = daily_stats['ic1'].mean()
+        ic2 = daily_stats['ic2'].mean()
+        var1 = daily_stats['ic1'].var()
+        var2 = daily_stats['ic2'].var()
+        cov12 = daily_stats['ic1'].cov(daily_stats['ic2'])
+
+        # Optimal weight for maximum Sharpe-like ratio
+        # w1 = (ic1*var2 - ic2*cov12) / (ic1*var2 + ic2*var1 - (ic1+ic2)*cov12)
+        denom = ic1 * var2 + ic2 * var1 - (ic1 + ic2) * cov12
+        if abs(denom) > 1e-8:
+            w1 = (ic1 * var2 - ic2 * cov12) / denom
+            w1 = np.clip(w1, 0, 1)
+        else:
+            w1 = 0.5
+
+        return (w1, 1 - w1), {
+            'method': 'analytical',
+            'ic1': ic1, 'ic2': ic2,
+            'corr': daily_stats['corr'].mean()
+        }
+
+    else:
+        raise ValueError(f"Unknown weight learning method: {method}")
 
 
 def ensemble_predictions(pred1: pd.Series, pred2: pd.Series,
@@ -470,6 +658,17 @@ def main():
     parser.add_argument('--cb-weight', type=float, default=0.5,
                         help='CatBoost weight for weighted ensemble (default: 0.5)')
 
+    # Stacking parameters
+    parser.add_argument('--stacking', action='store_true',
+                        help='Learn optimal weights from validation set (Stacking)')
+    parser.add_argument('--stacking-method', type=str, default='grid_search',
+                        choices=['grid_search', 'grid_search_icir', 'regression', 'ridge', 'analytical'],
+                        help='Stacking weight learning method (default: grid_search)')
+    parser.add_argument('--min-weight', type=float, default=0.1,
+                        help='Minimum weight for each model (default: 0.1, prevents extreme weights)')
+    parser.add_argument('--diversity-bonus', type=float, default=0.1,
+                        help='Bonus for balanced weights (default: 0.1, set to 0 to disable)')
+
     # Data parameters
     parser.add_argument('--nday', type=int, default=5,
                         help='Prediction horizon (default: 5)')
@@ -644,14 +843,59 @@ def main():
     print(f"    Std Daily Correlation:   {std_daily_corr:>10.4f}")
     print(f"    " + "-" * 50)
 
+    # Stacking: Learn optimal weights from validation set
+    learned_weights = None
+    if args.stacking:
+        print(f"\n[8] Stacking: Learning optimal weights from validation set...")
+        print(f"    Method: {args.stacking_method}")
+
+        # Generate predictions on validation set
+        print("    Generating validation predictions...")
+        val_pred_ae = predict_with_ae_mlp(ae_model, ae_dataset, segment="valid")
+        val_pred_cb = predict_with_catboost(cb_model, cb_dataset, segment="valid")
+        print(f"      AE-MLP valid: {len(val_pred_ae)} samples")
+        print(f"      CatBoost valid: {len(val_pred_cb)} samples")
+
+        # Get validation labels
+        val_label = ae_dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
+        if isinstance(val_label, pd.DataFrame):
+            val_label = val_label.iloc[:, 0]
+
+        # Learn optimal weights
+        learned_weights, learn_info = learn_optimal_weights(
+            val_pred_ae, val_pred_cb, val_label,
+            method=args.stacking_method,
+            use_zscore=True,  # Always zscore for fair comparison
+            min_weight=args.min_weight,
+            diversity_bonus=args.diversity_bonus
+        )
+
+        print(f"\n    Learned Weights:")
+        print(f"    " + "-" * 50)
+        print(f"    AE-MLP weight:   {learned_weights[0]:>10.4f}")
+        print(f"    CatBoost weight: {learned_weights[1]:>10.4f}")
+        print(f"    " + "-" * 50)
+
+        # Print additional info from learning
+        for k, v in learn_info.items():
+            if k != 'method':
+                print(f"    {k}: {v:.4f}" if isinstance(v, float) else f"    {k}: {v}")
+
+        # Override ensemble method to use learned weights
+        args.ensemble_method = 'zscore_weighted'
+        args.ae_weight, args.cb_weight = learned_weights
+        print(f"\n    Using zscore_weighted ensemble with learned weights")
+
     # Ensemble predictions
-    print(f"\n[8] Ensembling predictions ({args.ensemble_method})...")
-    weights = (args.ae_weight, args.cb_weight) if args.ensemble_method == 'weighted' else None
+    step_num = 9 if args.stacking else 8
+    print(f"\n[{step_num}] Ensembling predictions ({args.ensemble_method})...")
+    weights = (args.ae_weight, args.cb_weight) if args.ensemble_method in ['weighted', 'zscore_weighted'] else None
     pred_ensemble = ensemble_predictions(pred_ae, pred_cb, args.ensemble_method, weights)
     print(f"    Ensemble shape: {len(pred_ensemble)}, Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
     # Get labels (use AE-MLP dataset's label as reference)
-    print("\n[9] Calculating IC metrics...")
+    step_num += 1
+    print(f"\n[{step_num}] Calculating IC metrics...")
     test_label = ae_dataset.prepare("test", col_set="label", data_key=DataHandlerLP.DK_L)
     if isinstance(test_label, pd.DataFrame):
         label = test_label.iloc[:, 0]
@@ -697,6 +941,8 @@ def main():
     print("ENSEMBLE ANALYSIS COMPLETE")
     print("=" * 70)
     print(f"Prediction Correlation: {overall_corr:.4f} (daily mean: {mean_daily_corr:.4f})")
+    if learned_weights:
+        print(f"Stacking Weights: AE-MLP={learned_weights[0]:.3f}, CatBoost={learned_weights[1]:.3f}")
     print(f"AE-MLP IC:     {ae_ic:.4f} (ICIR: {ae_icir:.4f})")
     print(f"CatBoost IC:   {cb_ic:.4f} (ICIR: {cb_icir:.4f})")
     print(f"Ensemble IC:   {ens_ic:.4f} (ICIR: {ens_icir:.4f})")
