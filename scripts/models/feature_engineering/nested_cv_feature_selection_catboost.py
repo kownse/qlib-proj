@@ -62,12 +62,12 @@ from models.feature_engineering.feature_selection_utils import (
     compute_ic,
     validate_qlib_features,
     validate_macro_features,
-    load_macro_data,
     load_checkpoint,
     ForwardSelectionBase,
     add_common_args,
     countdown,
 )
+from models.common.dynamic_handlers import DynamicTabularHandler
 
 
 # ============================================================================
@@ -110,124 +110,7 @@ BASELINE_MACRO_FEATURES = [
 ]
 
 
-# ============================================================================
-# Dynamic Handler for CatBoost
-# ============================================================================
-
-class DynamicCatBoostHandler(DataHandlerLP):
-    """
-    动态 CatBoost Handler，支持增量添加 Stock 和 Macro 特征。
-
-    与 TCN 不同，CatBoost 不需要时序结构，每个特征只是一个值。
-    """
-
-    def __init__(
-        self,
-        stock_features: Dict[str, str] = None,  # {name: expression}
-        macro_features: List[str] = None,
-        volatility_window: int = 5,
-        instruments="csi500",
-        start_time=None,
-        end_time=None,
-        freq: str = "day",
-        infer_processors=[],
-        learn_processors=None,
-        fit_start_time=None,
-        fit_end_time=None,
-        process_type=DataHandlerLP.PTYPE_A,
-        filter_pipe=None,
-        inst_processors=None,
-        **kwargs,
-    ):
-        self.stock_features = stock_features or {}
-        self.macro_features = macro_features or []
-        self.volatility_window = volatility_window
-
-        self._macro_df = load_macro_data() if self.macro_features else None
-
-        from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
-
-        if learn_processors is None:
-            learn_processors = _DEFAULT_LEARN_PROCESSORS
-
-        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
-        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
-
-        data_loader = {
-            "class": "QlibDataLoader",
-            "kwargs": {
-                "config": {
-                    "feature": self._get_feature_config(),
-                    "label": kwargs.pop("label", self._get_label_config()),
-                },
-                "filter_pipe": filter_pipe,
-                "freq": freq,
-                "inst_processors": inst_processors,
-            },
-        }
-
-        super().__init__(
-            instruments=instruments,
-            start_time=start_time,
-            end_time=end_time,
-            data_loader=data_loader,
-            infer_processors=infer_processors,
-            learn_processors=learn_processors,
-            process_type=process_type,
-            **kwargs,
-        )
-
-    def _get_feature_config(self):
-        """获取特征配置"""
-        fields = []
-        names = []
-
-        for feat_name, expr in self.stock_features.items():
-            fields.append(expr)
-            names.append(feat_name)
-
-        return fields, names
-
-    def _get_label_config(self):
-        """返回N天波动率标签"""
-        label_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
-        return [label_expr], ["LABEL0"]
-
-    def process_data(self, with_fit: bool = False):
-        """处理数据，添加 macro 特征"""
-        super().process_data(with_fit=with_fit)
-        if self._macro_df is not None and self.macro_features:
-            self._add_macro_features()
-
-    def _add_macro_features(self):
-        """添加时间对齐的 macro 特征"""
-        available_cols = [c for c in self.macro_features if c in self._macro_df.columns]
-        if not available_cols:
-            return
-
-        for attr in ['_learn', '_infer']:
-            df = getattr(self, attr, None)
-            if df is None:
-                continue
-
-            datetime_col = df.index.names[0]
-            main_datetimes = df.index.get_level_values(datetime_col)
-            has_multi_columns = isinstance(df.columns, pd.MultiIndex)
-
-            macro_data = {}
-            for col in available_cols:
-                base_series = self._macro_df[col]
-                # +1 lag to prevent look-ahead bias
-                shifted = base_series.shift(1)
-                aligned_values = shifted.reindex(main_datetimes).values
-                if has_multi_columns:
-                    macro_data[('feature', col)] = aligned_values
-                else:
-                    macro_data[col] = aligned_values
-
-            macro_df = pd.DataFrame(macro_data, index=df.index)
-            merged = pd.concat([df, macro_df], axis=1, copy=False)
-            setattr(self, attr, merged.copy())
+# 使用共享的 DynamicTabularHandler (从 models.common.dynamic_handlers 导入)
 
 
 # ============================================================================
@@ -271,7 +154,7 @@ class CatBoostForwardSelection(ForwardSelectionBase):
 
     def prepare_fold_data(self, fold_config: Dict) -> Tuple:
         """准备单个fold的数据"""
-        handler = DynamicCatBoostHandler(
+        handler = DynamicTabularHandler(
             stock_features=self.current_stock,
             macro_features=self.current_macro,
             volatility_window=self.nday,

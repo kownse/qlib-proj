@@ -1,11 +1,11 @@
 """
-TCN 嵌套交叉验证 Forward Selection - 基于 Alpha300 逐步添加 Macro 和 TALib 特征
+LightGBM 嵌套交叉验证 Forward Selection
 
 设计原理:
-- 从 Alpha300 (5 OHLCV × 60 days = 300 features) 作为基线 (去掉了全是NaN的VWAP)
-- 逐个测试候选特征（macro 和 TALib），每个特征加入过去60天的值
-- 如果某特征加入后导致 IC 变差，则加入排除列表
+- 从用户指定的初始特征集开始（基于 importance 分析）
+- 逐个测试候选特征（stock 和 macro），如果某特征加入后导致 IC 变差则排除
 - 后续轮次跳过被排除的特征
+- 每轮只添加 1 个 IC 提升最大的特征（贪婪策略，与 CatBoost 版本一致）
 
 内层CV (只用2000-2024年数据):
   Fold 1: train 2000-2020, valid 2021
@@ -14,27 +14,33 @@ TCN 嵌套交叉验证 Forward Selection - 基于 Alpha300 逐步添加 Macro �
   Fold 4: train 2000-2023, valid 2024
 
 使用方法:
-    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --stock-pool sp500
-    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --resume
-    python scripts/models/feature_engineering/nested_cv_feature_selection_tcn.py --resume-from forward_selection_tcn_xxx.json
+    python scripts/models/feature_engineering/nested_cv_feature_selection_lightgbm.py --stock-pool sp500
+    python scripts/models/feature_engineering/nested_cv_feature_selection_lightgbm.py --resume
+    python scripts/models/feature_engineering/nested_cv_feature_selection_lightgbm.py --resume-from forward_selection_lightgbm_xxx.json
 """
 
 import os
 import logging
-import gc
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMBA_NUM_THREADS'] = '1'
+
 logging.getLogger('qlib').setLevel(logging.WARNING)
 
 import sys
 from pathlib import Path
+import gc
 
 script_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(script_dir))
 project_root = script_dir.parent
 
 import argparse
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -44,17 +50,14 @@ from qlib.constant import REG_US
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
-import torch
-
-from models.deep.tcn_model import TCN
+import lightgbm as lgb
 
 from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
 
-# 导入共享工具
 from models.feature_engineering.feature_selection_utils import (
     INNER_CV_FOLDS,
-    ALL_TALIB_FEATURES,
+    ALL_STOCK_FEATURES,
     ALL_MACRO_FEATURES,
     PROJECT_ROOT,
     compute_ic,
@@ -65,63 +68,78 @@ from models.feature_engineering.feature_selection_utils import (
     add_common_args,
     countdown,
 )
-from models.common.dynamic_handlers import (
-    DynamicTimeSeriesHandler,
-    normalize_data,
-    DEFAULT_SEQ_LEN,
-    ALPHA300_BASE_FEATURES,
-)
+from models.common.dynamic_handlers import DynamicTabularHandler
 
 
 # ============================================================================
-# TCN 模型配置
+# LightGBM 模型配置
 # ============================================================================
 
-# TCN 默认参数（和 run_tcn.py 保持一致）
-DEFAULT_TCN_PARAMS = {
-    "n_chans": 128,      # qlib TCN 默认值
-    "num_layers": 5,     # qlib TCN 默认值
-    "kernel_size": 5,    # qlib TCN 默认值
-    "dropout": 0.5,      # qlib TCN 默认值
-    "lr": 0.0001,        # qlib TCN 默认值
-    "batch_size": 2000,  # qlib TCN 默认值
+DEFAULT_LIGHTGBM_PARAMS = {
+    'objective': 'regression',
+    'metric': 'mse',
+    'boosting_type': 'gbdt',
+    'num_iterations': 500,
+    'learning_rate': 0.05,
+    'max_depth': 8,
+    'num_leaves': 128,
+    'min_data_in_leaf': 50,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'lambda_l1': 0.0,
+    'lambda_l2': 1.0,
+    'num_threads': 8,
+    'verbose': -1,
+    'seed': 42,
 }
 
-# 兼容性别名
-ALPHA300_SEQ_LEN = DEFAULT_SEQ_LEN
-DynamicAlpha300Handler = DynamicTimeSeriesHandler
+
+# ============================================================================
+# 初始特征集 (基于 importance 分析)
+# ============================================================================
+
+# 初始股票/TALib 特征
+BASELINE_STOCK_FEATURES = {
+    "TALIB_ATR14": "TALIB_ATR($high, $low, $close, 14)/$close",
+}
+
+# 初始宏观特征
+BASELINE_MACRO_FEATURES = [
+    "macro_vix_term_structure",
+    "macro_gld_vol20",
+    "macro_vix_level",
+    "macro_xly_pct_20d",
+    "macro_uso_pct_20d",
+    "macro_hy_spread",
+    "macro_gld_pct_20d",
+    "macro_vix_term_zscore",
+    "macro_uup_ma20_ratio",
+]
 
 
-def print_data_quality(X, name="Data", quiet=False):
-    """打印数据质量诊断信息"""
-    if quiet:
-        return
-    nan_count = np.isnan(X).sum()
-    print(f"      {name} shape: {X.shape}, NaN: {nan_count / X.size * 100:.1f}%")
+# 使用共享的 DynamicTabularHandler (从 models.common.dynamic_handlers 导入)
 
 
 # ============================================================================
-# TCN Forward Selection 实现
+# LightGBM Forward Selection 实现
 # ============================================================================
 
-class TCNForwardSelection(ForwardSelectionBase):
-    """TCN 模型的 Forward Selection 实现"""
+class LightGBMForwardSelection(ForwardSelectionBase):
+    """LightGBM 模型的 Forward Selection 实现"""
 
     def __init__(
         self,
         symbols: List[str],
-        baseline_talib: Dict[str, str],
+        baseline_stock: Dict[str, str],
         baseline_macro: List[str],
-        candidate_talib: Dict[str, str],
+        candidate_stock: Dict[str, str],
         candidate_macro: List[str],
         nday: int = 5,
         max_features: int = 30,
         min_improvement: float = 0.0005,
-        epochs: int = 20,
-        early_stop: int = 8,
         params: dict = None,
         output_dir: Path = None,
-        gpu: int = 0,
         quiet: bool = False,
     ):
         super().__init__(
@@ -130,25 +148,22 @@ class TCNForwardSelection(ForwardSelectionBase):
             max_features=max_features,
             min_improvement=min_improvement,
             output_dir=output_dir,
-            checkpoint_name="forward_selection_tcn_checkpoint",
-            result_prefix="forward_selection_tcn",
+            checkpoint_name="forward_selection_lightgbm_checkpoint",
+            result_prefix="forward_selection_lightgbm",
             quiet=quiet,
         )
 
-        self.current_talib = dict(baseline_talib)
+        self.current_stock = dict(baseline_stock)
         self.current_macro = list(baseline_macro)
-        self.candidate_talib = candidate_talib
+        self.candidate_stock = candidate_stock
         self.candidate_macro = candidate_macro
 
-        self.epochs = epochs
-        self.early_stop = early_stop
-        self.params = params or DEFAULT_TCN_PARAMS
-        self.gpu = gpu
+        self.params = params or DEFAULT_LIGHTGBM_PARAMS
 
     def prepare_fold_data(self, fold_config: Dict) -> Tuple:
         """准备单个fold的数据"""
-        handler = DynamicAlpha300Handler(
-            talib_features=self.current_talib,
+        handler = DynamicTabularHandler(
+            stock_features=self.current_stock,
             macro_features=self.current_macro,
             volatility_window=self.nday,
             instruments=self.symbols,
@@ -166,150 +181,151 @@ class TCNForwardSelection(ForwardSelectionBase):
 
         dataset = DatasetH(handler=handler, segments=segments)
 
-        # 获取原始数据
-        X_train_raw = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
+        # 获取数据 - LightGBM 需要填充 NaN
+        X_train = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
+        X_train = X_train.fillna(0).replace([np.inf, -np.inf], 0)
 
         y_train = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
         if isinstance(y_train, pd.DataFrame):
             y_train = y_train.iloc[:, 0]
         y_train = y_train.fillna(0).values
 
-        X_valid_raw = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-        valid_index = X_valid_raw.index
+        X_valid = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
+        X_valid = X_valid.fillna(0).replace([np.inf, -np.inf], 0)
+        valid_index = X_valid.index
 
         y_valid = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
         if isinstance(y_valid, pd.DataFrame):
             y_valid = y_valid.iloc[:, 0]
         y_valid = y_valid.fillna(0).values
 
-        # 使用 3σ clip + zscore 归一化 (借鉴 run_tcn.py)
-        X_train, train_stats = normalize_data(X_train_raw)
-        X_valid, _ = normalize_data(X_valid_raw, fit_stats=train_stats)
-
         return X_train, y_train, X_valid, y_valid, valid_index
 
     def evaluate_feature_set(self) -> Tuple[float, List[float]]:
         """在内层CV上评估特征集"""
-        return self._evaluate_with_features(self.current_talib, self.current_macro)
+        return self._evaluate_with_features(self.current_stock, self.current_macro)
 
     def _evaluate_with_features(
         self,
-        talib_features: Dict[str, str],
+        stock_features: Dict[str, str],
         macro_features: List[str],
     ) -> Tuple[float, List[float]]:
         """使用指定特征集评估"""
         fold_ics = []
 
         # 临时保存当前特征
-        orig_talib = self.current_talib
+        orig_stock = self.current_stock
         orig_macro = self.current_macro
-        self.current_talib = talib_features
+        self.current_stock = stock_features
         self.current_macro = macro_features
 
         try:
             for fold in INNER_CV_FOLDS:
                 gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 X_train, y_train, X_valid, y_valid, valid_index = self.prepare_fold_data(fold)
 
-                total_features = X_train.shape[1]
-                d_feat = total_features // ALPHA300_SEQ_LEN
+                # 创建 LightGBM Dataset
+                train_set = lgb.Dataset(X_train, label=y_train)
+                valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set)
 
-                gpu_id = self.gpu if torch.cuda.is_available() else -1
-                model = TCN(
-                    d_feat=d_feat,
-                    n_chans=self.params['n_chans'],
-                    kernel_size=self.params['kernel_size'],
-                    num_layers=self.params['num_layers'],
-                    dropout=self.params['dropout'],
-                    n_epochs=self.epochs,
-                    lr=self.params['lr'],
-                    early_stop=self.early_stop,
-                    batch_size=self.params['batch_size'],
-                    metric="loss",
-                    loss="mse",
-                    GPU=gpu_id,
-                    verbose=0,  # Silent mode
+                # 训练参数
+                lgb_params = {
+                    'objective': self.params.get('objective', 'regression'),
+                    'metric': self.params.get('metric', 'mse'),
+                    'boosting_type': self.params.get('boosting_type', 'gbdt'),
+                    'learning_rate': self.params.get('learning_rate', 0.05),
+                    'max_depth': int(self.params.get('max_depth', 8)),
+                    'num_leaves': int(self.params.get('num_leaves', 128)),
+                    'min_data_in_leaf': int(self.params.get('min_data_in_leaf', 50)),
+                    'feature_fraction': self.params.get('feature_fraction', 0.8),
+                    'bagging_fraction': self.params.get('bagging_fraction', 0.8),
+                    'bagging_freq': int(self.params.get('bagging_freq', 5)),
+                    'lambda_l1': self.params.get('lambda_l1', 0.0),
+                    'lambda_l2': self.params.get('lambda_l2', 1.0),
+                    'num_threads': int(self.params.get('num_threads', 8)),
+                    'verbose': -1,
+                    'seed': self.params.get('seed', 42),
+                }
+
+                # 训练模型
+                model = lgb.train(
+                    lgb_params,
+                    train_set,
+                    num_boost_round=self.params.get('num_iterations', 500),
+                    valid_sets=[valid_set],
+                    valid_names=['valid'],
+                    callbacks=[
+                        lgb.early_stopping(stopping_rounds=50, verbose=False),
+                    ],
                 )
 
-                # 使用新的 fit_numpy 接口
-                model.fit_numpy(X_train, y_train, X_valid, y_valid)
-
                 # 预测并计算 IC
-                val_pred = model.predict_numpy(X_valid)
+                val_pred = model.predict(X_valid)
                 ic = compute_ic(val_pred, y_valid, valid_index)
                 fold_ics.append(ic)
 
-                del X_train, y_train, X_valid, y_valid, valid_index, model
+                del X_train, y_train, X_valid, y_valid, valid_index, model, train_set, valid_set
                 gc.collect()
 
         finally:
-            self.current_talib = orig_talib
+            self.current_stock = orig_stock
             self.current_macro = orig_macro
 
         return np.mean(fold_ics), fold_ics
 
     def get_feature_counts(self) -> Dict[str, int]:
         return {
-            'base': ALPHA300_BASE_FEATURES,  # Alpha300: 5 OHLCV features (no VWAP)
-            'talib': len(self.current_talib),
+            'stock': len(self.current_stock),
             'macro': len(self.current_macro),
         }
 
     def add_feature(self, name: str, feature_type: str, expr: str = None):
         if feature_type == 'feature':
-            self.current_talib[name] = expr
+            self.current_stock[name] = expr
         else:
             self.current_macro.append(name)
 
     def get_current_features_dict(self) -> Dict[str, Any]:
         return {
-            'current_talib_features': self.current_talib,
+            'current_stock_features': self.current_stock,
             'current_macro_features': self.current_macro,
         }
 
     def get_testable_candidates(self) -> Tuple[Dict[str, str], List[str]]:
-        testable_talib = {k: v for k, v in self.candidate_talib.items()
-                         if k not in self.current_talib and k not in self.excluded_features}
+        testable_stock = {k: v for k, v in self.candidate_stock.items()
+                         if k not in self.current_stock and k not in self.excluded_features}
         testable_macro = [m for m in self.candidate_macro
                          if m not in self.current_macro and m not in self.excluded_features]
-        return testable_talib, testable_macro
+        return testable_stock, testable_macro
 
     def test_feature(
         self, name: str, feature_type: str, expr: str = None
     ) -> Tuple[float, List[float]]:
         if feature_type == 'feature':
-            test_talib = dict(self.current_talib)
-            test_talib[name] = expr
-            return self._evaluate_with_features(test_talib, self.current_macro)
+            test_stock = dict(self.current_stock)
+            test_stock[name] = expr
+            return self._evaluate_with_features(test_stock, self.current_macro)
         else:
             test_macro = self.current_macro + [name]
-            return self._evaluate_with_features(self.current_talib, test_macro)
+            return self._evaluate_with_features(self.current_stock, test_macro)
 
     def cleanup_after_evaluation(self):
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     def _print_final_result(self):
-        """打印最终结果（覆盖基类方法，添加 TCN 特有信息）"""
+        """打印最终结果"""
         print("\n" + "=" * 70)
-        print("TCN FORWARD SELECTION COMPLETE")
+        print("LIGHTGBM FORWARD SELECTION COMPLETE")
         print("=" * 70)
-        d_feat = ALPHA300_BASE_FEATURES + len(self.current_talib) + len(self.current_macro)
-        total_features = d_feat * ALPHA300_SEQ_LEN
-        print(f"Baseline: Alpha300 ({ALPHA300_BASE_FEATURES} features × {ALPHA300_SEQ_LEN} days, no VWAP)")
-        print(f"Final: Alpha300 + {len(self.current_talib)} TALib + {len(self.current_macro)} macro")
-        print(f"Final d_feat: {d_feat}")
-        print(f"Total features: {total_features}")
+        total_features = len(self.current_stock) + len(self.current_macro)
+        print(f"Final: {len(self.current_stock)} stock + {len(self.current_macro)} macro = {total_features} features")
         print(f"Baseline IC: {self.baseline_ic:.4f}")
         ic_diff = self.current_ic - self.baseline_ic
         print(f"Final IC:    {self.current_ic:.4f} ({'+' if ic_diff >= 0 else ''}{ic_diff:.4f})")
 
-        print(f"\nFinal TALib Features ({len(self.current_talib)}):")
-        for name in sorted(self.current_talib.keys()):
+        print(f"\nFinal Stock Features ({len(self.current_stock)}):")
+        for name in sorted(self.current_stock.keys()):
             print(f"  - {name}")
 
         print(f"\nFinal Macro Features ({len(self.current_macro)}):")
@@ -326,16 +342,10 @@ class TCNForwardSelection(ForwardSelectionBase):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='TCN Nested CV Forward Feature Selection')
+    parser = argparse.ArgumentParser(description='LightGBM Nested CV Forward Feature Selection')
     add_common_args(parser)
 
     args = parser.parse_args()
-
-    # GPU 设置
-    if args.gpu >= 0 and torch.cuda.is_available():
-        print(f"Using GPU: cuda:{args.gpu}")
-    else:
-        print("Using CPU")
 
     # Qlib 初始化
     qlib_data_path = PROJECT_ROOT / "my_data" / "qlib_us"
@@ -343,6 +353,8 @@ def main():
         provider_uri=str(qlib_data_path),
         region=REG_US,
         custom_ops=TALIB_OPS,
+        kernels=1,
+        joblib_backend=None,
     )
 
     symbols = STOCK_POOLS[args.stock_pool]
@@ -352,8 +364,8 @@ def main():
 
     # 加载 baseline 或从 checkpoint 恢复
     excluded_features = set()
-    baseline_talib = {}
-    baseline_macro = []
+    baseline_stock = dict(BASELINE_STOCK_FEATURES)
+    baseline_macro = list(BASELINE_MACRO_FEATURES)
 
     if args.resume_from:
         # 从指定文件恢复
@@ -364,46 +376,46 @@ def main():
         print(f"\n[*] Resuming from: {resume_path}")
         checkpoint = load_checkpoint(resume_path)
 
-        if 'current_talib_features' in checkpoint:
-            baseline_talib = checkpoint['current_talib_features']
+        if 'current_stock_features' in checkpoint:
+            baseline_stock = checkpoint['current_stock_features']
             baseline_macro = checkpoint['current_macro_features']
         else:
-            baseline_talib = checkpoint.get('final_talib_features', {})
-            baseline_macro = checkpoint.get('final_macro_features', [])
+            baseline_stock = checkpoint.get('final_stock_features', dict(BASELINE_STOCK_FEATURES))
+            baseline_macro = checkpoint.get('final_macro_features', list(BASELINE_MACRO_FEATURES))
 
         excluded_features = set(checkpoint.get('excluded_features', []))
-        print(f"    Features: {len(baseline_talib)} TALib + {len(baseline_macro)} macro")
+        print(f"    Features: {len(baseline_stock)} stock + {len(baseline_macro)} macro")
         print(f"    Excluded: {len(excluded_features)}")
 
     elif args.resume:
         # 从默认 checkpoint 恢复
-        checkpoint_file = output_dir / "forward_selection_tcn_checkpoint.json"
+        checkpoint_file = output_dir / "forward_selection_lightgbm_checkpoint.json"
         if checkpoint_file.exists():
             print(f"\n[*] Resuming from checkpoint")
             checkpoint = load_checkpoint(checkpoint_file)
 
-            baseline_talib = checkpoint['current_talib_features']
+            baseline_stock = checkpoint['current_stock_features']
             baseline_macro = checkpoint['current_macro_features']
             excluded_features = set(checkpoint.get('excluded_features', []))
-            print(f"    Features: {len(baseline_talib)} TALib + {len(baseline_macro)} macro")
+            print(f"    Features: {len(baseline_stock)} stock + {len(baseline_macro)} macro")
             print(f"    Excluded: {len(excluded_features)}")
         else:
             print("No checkpoint file found, starting fresh")
 
     # 获取候选特征（不在 baseline 中的特征）
-    candidate_talib = {k: v for k, v in ALL_TALIB_FEATURES.items()
-                       if k not in baseline_talib}
+    candidate_stock = {k: v for k, v in ALL_STOCK_FEATURES.items()
+                       if k not in baseline_stock}
     candidate_macro = [m for m in ALL_MACRO_FEATURES
                        if m not in baseline_macro]
 
     # 验证候选特征
-    candidate_talib = validate_qlib_features(symbols, candidate_talib)
+    candidate_stock = validate_qlib_features(symbols, candidate_stock)
     candidate_macro = validate_macro_features(candidate_macro)
-    print(f"\n[*] Candidates: {len(candidate_talib)} TALib + {len(candidate_macro)} macro")
+    print(f"\n[*] Baseline: {len(baseline_stock)} stock + {len(baseline_macro)} macro")
+    print(f"[*] Candidates: {len(candidate_stock)} stock + {len(candidate_macro)} macro")
 
-    # TCN 参数
-    params = dict(DEFAULT_TCN_PARAMS)
-    params['batch_size'] = args.batch_size
+    # LightGBM 参数
+    params = dict(DEFAULT_LIGHTGBM_PARAMS)
 
     # 倒计时
     if not args.no_countdown:
@@ -411,32 +423,28 @@ def main():
             return
 
     # 创建 Forward Selection 实例并运行
-    selector = TCNForwardSelection(
+    selector = LightGBMForwardSelection(
         symbols=symbols,
-        baseline_talib=baseline_talib,
+        baseline_stock=baseline_stock,
         baseline_macro=baseline_macro,
-        candidate_talib=candidate_talib,
+        candidate_stock=candidate_stock,
         candidate_macro=candidate_macro,
         nday=args.nday,
         max_features=args.max_features,
         min_improvement=args.min_improvement,
-        epochs=args.epochs,
-        early_stop=args.early_stop,
         params=params,
         output_dir=output_dir,
-        gpu=args.gpu,
         quiet=args.quiet,
     )
 
     final_features, history, final_excluded = selector.run(
         excluded_features=excluded_features,
-        method_name='nested_cv_tcn_forward_selection',
+        method_name='nested_cv_lightgbm_forward_selection',
     )
 
     print(f"\n[+] Forward selection complete")
-    d_feat = ALPHA300_BASE_FEATURES + len(final_features.get('current_talib_features', {})) + len(final_features.get('current_macro_features', []))
-    print(f"  Final d_feat: {d_feat}")
-    print(f"  Total features: {d_feat * ALPHA300_SEQ_LEN}")
+    print(f"  Final stock features: {len(final_features.get('current_stock_features', {}))}")
+    print(f"  Final macro features: {len(final_features.get('current_macro_features', []))}")
     print(f"  Excluded features: {len(final_excluded)}")
 
 
