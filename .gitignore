@@ -47,3 +47,6 @@ catboost_info/
 # Qlib cache
 .qlib_cache/
 qlib/qlib/_version.py
+
+# node modules
+node_modules/
