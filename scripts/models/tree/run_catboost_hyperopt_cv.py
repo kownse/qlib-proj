@@ -155,8 +155,21 @@ class CVHyperoptObjective:
                 train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
                 valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
 
-            train_label = dataset.prepare("train", col_set="label").values.ravel()
-            valid_label = dataset.prepare("valid", col_set="label").values.ravel()
+            # Preprocess features to match feature selection script
+            train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
+            valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
+
+            # Use DK_L for labels to ensure consistent processing with feature selection
+            train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
+            valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
+            if isinstance(train_label_df, pd.DataFrame):
+                train_label = train_label_df.iloc[:, 0].fillna(0).values
+            else:
+                train_label = train_label_df.fillna(0).values
+            if isinstance(valid_label_df, pd.DataFrame):
+                valid_label = valid_label_df.iloc[:, 0].fillna(0).values
+            else:
+                valid_label = valid_label_df.fillna(0).values
 
             # Debug: Print data statistics for first fold
             if len(self.fold_data) == 0:
@@ -306,8 +319,22 @@ def first_pass_feature_selection(args, handler_config, symbols):
 
     train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
     valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-    train_label = dataset.prepare("train", col_set="label").values.ravel()
-    valid_label = dataset.prepare("valid", col_set="label").values.ravel()
+
+    # Preprocess features
+    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
+    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
+
+    # Use DK_L for labels
+    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
+    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
+    if isinstance(train_label_df, pd.DataFrame):
+        train_label = train_label_df.iloc[:, 0].fillna(0).values
+    else:
+        train_label = train_label_df.fillna(0).values
+    if isinstance(valid_label_df, pd.DataFrame):
+        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
+    else:
+        valid_label = valid_label_df.fillna(0).values
 
     train_pool = Pool(train_data, label=train_label)
     valid_pool = Pool(valid_data, label=valid_label)
@@ -418,8 +445,22 @@ def train_final_model(args, handler_config, symbols, best_params, top_features=N
         test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
         feature_names = train_data.columns.tolist()
 
-    train_label = dataset.prepare("train", col_set="label").values.ravel()
-    valid_label = dataset.prepare("valid", col_set="label").values.ravel()
+    # Preprocess features to match feature selection script
+    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
+    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
+    test_data = test_data.fillna(0).replace([np.inf, -np.inf], 0)
+
+    # Use DK_L for labels to ensure consistent processing
+    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
+    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
+    if isinstance(train_label_df, pd.DataFrame):
+        train_label = train_label_df.iloc[:, 0].fillna(0).values
+    else:
+        train_label = train_label_df.fillna(0).values
+    if isinstance(valid_label_df, pd.DataFrame):
+        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
+    else:
+        valid_label = valid_label_df.fillna(0).values
 
     print(f"\n    Final training data:")
     print(f"      Train: {train_data.shape} ({FINAL_TEST['train_start']} ~ {FINAL_TEST['train_end']})")

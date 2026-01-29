@@ -15,23 +15,32 @@ from qlib.data.dataset.handler import DataHandlerLP
 # 时间序列交叉验证的 Fold 配置
 # ============================================================================
 
+# 4-fold CV 配置（与特征选择脚本一致）
+# 包含 2021-2024 四年的验证集
 CV_FOLDS = [
     {
-        'name': 'Fold 1 (valid 2022)',
+        'name': 'Fold 1 (valid 2021)',
+        'train_start': '2000-01-01',
+        'train_end': '2020-12-31',
+        'valid_start': '2021-01-01',
+        'valid_end': '2021-12-31',
+    },
+    {
+        'name': 'Fold 2 (valid 2022)',
         'train_start': '2000-01-01',
         'train_end': '2021-12-31',
         'valid_start': '2022-01-01',
         'valid_end': '2022-12-31',
     },
     {
-        'name': 'Fold 2 (valid 2023)',
+        'name': 'Fold 3 (valid 2023)',
         'train_start': '2000-01-01',
         'train_end': '2022-12-31',
         'valid_start': '2023-01-01',
         'valid_end': '2023-12-31',
     },
     {
-        'name': 'Fold 3 (valid 2024)',
+        'name': 'Fold 4 (valid 2024)',
         'train_start': '2000-01-01',
         'train_end': '2023-12-31',
         'valid_start': '2024-01-01',

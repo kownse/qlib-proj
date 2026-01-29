@@ -184,6 +184,14 @@ HANDLER_REGISTRY = {
         'use_talib': True,
     },
 
+    # CatBoost optimized handlers
+    'catboost-v1': {
+        'module': 'data.datahandler_catboost_v1',
+        'class_name': 'Alpha158_CatBoost_V1',
+        'description': 'CatBoost V1 (~14 features: nested CV forward selection for CatBoost)',
+        'use_talib': True,
+    },
+
     # MASTER model handlers
     'alpha158-master': {
         'module': 'data.datahandler_master',
