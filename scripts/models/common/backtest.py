@@ -156,7 +156,7 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
         "start_time": time_splits['test_start'],
         "end_time": time_splits['test_end'],
         "account": args.account,
-        "benchmark": pool_symbols,
+        "benchmark": "SPY",  # Use SPY as benchmark instead of pool (better for US stocks)
         "exchange_kwargs": {
             "freq": "day",
             "limit_threshold": None,
@@ -164,6 +164,8 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
             "open_cost": 0.0005,
             "close_cost": 0.0005,
             "min_cost": 1,
+            "trade_unit": None,  # Enable fractional shares for US stocks
+            "codes": pool_symbols,  # Specify tradable stock codes
         },
     }
 

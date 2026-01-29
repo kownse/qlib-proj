@@ -5,15 +5,20 @@ CatBoost 超参数搜索 - 时间序列交叉验证版本
 避免在单一验证集上过拟合。
 
 时间窗口设计:
-  Fold 1: train 2000-2021, valid 2022
-  Fold 2: train 2000-2022, valid 2023
-  Fold 3: train 2000-2023, valid 2024
+  Fold 1: train 2000-2020, valid 2021
+  Fold 2: train 2000-2021, valid 2022
+  Fold 3: train 2000-2022, valid 2023
+  Fold 4: train 2000-2023, valid 2024
   Test:   2025 (完全独立，不参与超参数选择)
 
 使用方法:
+    # 完整训练流程 (hyperopt + train + backtest)
     python scripts/models/tree/run_catboost_hyperopt_cv.py
     python scripts/models/tree/run_catboost_hyperopt_cv.py --max-evals 50
     python scripts/models/tree/run_catboost_hyperopt_cv.py --backtest
+
+    # 仅加载已有模型并回测
+    python scripts/models/tree/run_catboost_hyperopt_cv.py --model-path ./my_models/catboost_cv_xxx.cbm
 """
 
 # ============================================================================
@@ -61,6 +66,7 @@ qlib.init(
 
 import argparse
 import json
+import pickle
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -541,11 +547,137 @@ def main():
     parser.add_argument('--verbose', action='store_true',
                         help='Show detailed training logs for each trial')
 
+    # 模型加载（跳过训练，直接回测）
+    parser.add_argument('--model-path', type=str, default=None,
+                        help='Path to existing model file (.cbm) for backtest-only mode')
+
     args = parser.parse_args()
 
     # 获取配置
     handler_config = HANDLER_CONFIG[args.handler]
     symbols = STOCK_POOLS[args.stock_pool]
+
+    # =========================================================================
+    # Model-path mode: Load existing model and run backtest only
+    # =========================================================================
+    if args.model_path:
+        model_path = Path(args.model_path)
+        if not model_path.exists():
+            print(f"Error: Model file not found: {model_path}")
+            sys.exit(1)
+
+        print("=" * 70)
+        print("CatBoost Backtest-Only Mode (Loading Existing Model)")
+        print("=" * 70)
+        print(f"Model: {model_path}")
+        print(f"Stock Pool: {args.stock_pool} ({len(symbols)} stocks)")
+        print("=" * 70)
+
+        # Load model
+        print("\n[*] Loading model...")
+        model = CatBoostRegressor()
+        model.load_model(str(model_path))
+        print(f"    ✓ Model loaded successfully")
+
+        # Load metadata if available
+        meta_path = model_path.with_suffix('.meta.pkl')
+        meta_data = {}
+        if meta_path.exists():
+            with open(meta_path, 'rb') as f:
+                meta_data = pickle.load(f)
+            print(f"    ✓ Metadata loaded")
+            # Override args from metadata if available
+            if 'handler' in meta_data:
+                args.handler = meta_data['handler']
+                handler_config = HANDLER_CONFIG[args.handler]
+                print(f"    Using handler from metadata: {args.handler}")
+            if 'nday' in meta_data:
+                args.nday = meta_data['nday']
+                print(f"    Using nday from metadata: {args.nday}")
+        else:
+            print(f"    ⚠ Metadata file not found, using command-line args")
+
+        # Initialize qlib
+        init_qlib(handler_config['use_talib'])
+
+        # Create dataset for test period
+        print("\n[*] Preparing test data...")
+        from models.common.handlers import get_handler_class
+        HandlerClass = get_handler_class(args.handler)
+
+        handler = HandlerClass(
+            volatility_window=args.nday,
+            instruments=symbols,
+            start_time=FINAL_TEST['train_start'],
+            end_time=FINAL_TEST['test_end'],
+            fit_start_time=FINAL_TEST['train_start'],
+            fit_end_time=FINAL_TEST['train_end'],
+            infer_processors=[],
+        )
+
+        dataset = DatasetH(
+            handler=handler,
+            segments={
+                "train": (FINAL_TEST['train_start'], FINAL_TEST['train_end']),
+                "valid": (FINAL_TEST['valid_start'], FINAL_TEST['valid_end']),
+                "test": (FINAL_TEST['test_start'], FINAL_TEST['test_end']),
+            }
+        )
+
+        # Prepare test data
+        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
+        test_data = test_data.fillna(0).replace([np.inf, -np.inf], 0)
+
+        print(f"    Test data shape: {test_data.shape}")
+        print(f"    Test period: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']}")
+
+        # Make predictions
+        print("\n[*] Generating predictions...")
+        test_pred_values = model.predict(test_data)
+        test_pred = pd.Series(test_pred_values, index=test_data.index, name='score')
+        print(f"    Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+
+        # Evaluate
+        print("\n[*] Evaluation on Test Set...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+
+        # Run backtest
+        time_splits = {
+            'train_start': FINAL_TEST['train_start'],
+            'train_end': FINAL_TEST['train_end'],
+            'valid_start': FINAL_TEST['valid_start'],
+            'valid_end': FINAL_TEST['valid_end'],
+            'test_start': FINAL_TEST['test_start'],
+            'test_end': FINAL_TEST['test_end'],
+        }
+
+        def load_catboost_model(path):
+            m = CatBoostRegressor()
+            m.load_model(str(path))
+            return m
+
+        def get_catboost_feature_count(m):
+            if hasattr(m, 'get_feature_count'):
+                return m.get_feature_count()
+            elif m.feature_names_:
+                return len(m.feature_names_)
+            return "N/A"
+
+        run_backtest(
+            model_path, dataset, test_pred, args, time_splits,
+            model_name="CatBoost (Loaded Model)",
+            load_model_func=load_catboost_model,
+            get_feature_count_func=get_catboost_feature_count
+        )
+
+        print("\n" + "=" * 70)
+        print("BACKTEST COMPLETE")
+        print("=" * 70)
+        return
+
+    # =========================================================================
+    # Normal mode: Hyperopt search + Training + Backtest
+    # =========================================================================
 
     # 打印头部
     print("=" * 70)
