@@ -72,43 +72,54 @@ from models.common.handlers import get_handler_class
 # Handler 配置 - 为不同 handler 设置合适的 d_feat 和 step_len
 # ============================================================================
 
-# 针对 TSDatasetH 的 handler 配置
+# 针对 TCN 的 handler 配置
 # d_feat: 每个时间步的特征数
 # step_len: 时间序列长度
+# use_ts_dataset: 是否使用 TSDatasetH（True）还是普通 DatasetH + reshape（False）
 TS_HANDLER_CONFIG = {
+    # ===== 使用 TSDatasetH 的 handler（特征本身不含时序结构）=====
     'tcn-v1': {
         'd_feat': 20,
         'step_len': 20,
+        'use_ts_dataset': True,
         'description': 'Qlib benchmark 20 features (from Alpha158)',
     },
+
+    # ===== 使用 DatasetH + reshape 的 handler（特征已含时序结构）=====
     'alpha360': {
         'd_feat': 6,
         'step_len': 60,
+        'use_ts_dataset': False,
         'description': 'Alpha360: 6 OHLCV features × 60 days (includes VWAP)',
     },
     'alpha300': {
         'd_feat': 5,
         'step_len': 60,
+        'use_ts_dataset': False,
         'description': 'Alpha300: 5 OHLC+V features × 60 days (no VWAP, for US)',
     },
     'alpha300-ts': {
         'd_feat': 5,
         'step_len': 60,
+        'use_ts_dataset': False,
         'description': 'Alpha300 with time-series normalization',
     },
     'alpha180': {
         'd_feat': 6,
         'step_len': 30,
+        'use_ts_dataset': False,
         'description': 'Alpha180: 6 OHLCV features × 30 days',
     },
     'alpha360-macro': {
         'd_feat': 29,  # 6 OHLCV + 23 core macro
         'step_len': 60,
+        'use_ts_dataset': False,
         'description': 'Alpha360 + 23 core macro features',
     },
     'alpha180-macro': {
         'd_feat': 29,  # 6 OHLCV + 23 core macro
         'step_len': 30,
+        'use_ts_dataset': False,
         'description': 'Alpha180 + 23 core macro features',
     },
 }
@@ -197,22 +208,26 @@ class TCNTrainer:
             return torch.tensor(0.0, device=self.device)
         return ((pred[mask] - label[mask]) ** 2).mean()
 
-    def _train_epoch(self, data_loader):
+    def _train_epoch(self, data_loader, use_ts_dataset=True):
         """训练一个 epoch"""
         self.model.train()
         total_loss = 0
         n_batches = 0
 
-        for data in data_loader:
-            # data shape: (batch, step_len, features+1)  最后一列是 label
-            data = data.to(self.device).float()
-
-            # 转置为 (batch, features+1, step_len)
-            data = torch.transpose(data, 1, 2)
-
-            # 分离特征和标签
-            feature = data[:, :-1, :]  # (batch, features, step_len)
-            label = data[:, -1, -1]    # 最后一个时间步的 label
+        for batch_data in data_loader:
+            if use_ts_dataset:
+                # TSDatasetH 格式: data shape (batch, step_len, features+1)
+                data = batch_data.to(self.device).float()
+                # 转置为 (batch, features+1, step_len)
+                data = torch.transpose(data, 1, 2)
+                # 分离特征和标签
+                feature = data[:, :-1, :]  # (batch, features, step_len)
+                label = data[:, -1, -1]    # 最后一个时间步的 label
+            else:
+                # ReshapedTCNDataset 格式: (features, labels) tuple
+                feature, label = batch_data
+                feature = feature.to(self.device)  # (batch, d_feat, step_len)
+                label = label.to(self.device)
 
             pred = self.model(feature)
             loss = self._mse_loss(pred, label)
@@ -227,19 +242,23 @@ class TCNTrainer:
 
         return total_loss / max(n_batches, 1)
 
-    def _eval_epoch(self, data_loader):
+    def _eval_epoch(self, data_loader, use_ts_dataset=True):
         """评估一个 epoch"""
         self.model.eval()
         preds = []
         labels = []
 
         with torch.no_grad():
-            for data in data_loader:
-                data = data.to(self.device).float()
-                data = torch.transpose(data, 1, 2)
-
-                feature = data[:, :-1, :]
-                label = data[:, -1, -1]
+            for batch_data in data_loader:
+                if use_ts_dataset:
+                    data = batch_data.to(self.device).float()
+                    data = torch.transpose(data, 1, 2)
+                    feature = data[:, :-1, :]
+                    label = data[:, -1, -1]
+                else:
+                    feature, label = batch_data
+                    feature = feature.to(self.device)
+                    label = label.to(self.device)
 
                 pred = self.model(feature)
                 preds.append(pred.cpu().numpy())
@@ -256,7 +275,7 @@ class TCNTrainer:
         loss = np.mean((preds[mask] - labels[mask]) ** 2)
         return loss, preds
 
-    def fit(self, train_loader, valid_loader, verbose=True):
+    def fit(self, train_loader, valid_loader, use_ts_dataset=True, verbose=True):
         """训练模型"""
         self._init_model()
 
@@ -266,8 +285,8 @@ class TCNTrainer:
         stop_steps = 0
 
         for epoch in range(self.n_epochs):
-            train_loss = self._train_epoch(train_loader)
-            valid_loss, _ = self._eval_epoch(valid_loader)
+            train_loss = self._train_epoch(train_loader, use_ts_dataset)
+            valid_loss, _ = self._eval_epoch(valid_loader, use_ts_dataset)
 
             if verbose:
                 print(f"    Epoch {epoch+1:3d}: train_loss={train_loss:.6f}, valid_loss={valid_loss:.6f}")
@@ -290,7 +309,7 @@ class TCNTrainer:
         self.fitted = True
         return best_epoch + 1, best_loss
 
-    def predict(self, data_loader):
+    def predict(self, data_loader, use_ts_dataset=True):
         """预测"""
         if not self.fitted:
             raise ValueError("Model not fitted yet")
@@ -299,10 +318,15 @@ class TCNTrainer:
         preds = []
 
         with torch.no_grad():
-            for data in data_loader:
-                data = data.to(self.device).float()
-                data = torch.transpose(data, 1, 2)
-                feature = data[:, :-1, :]
+            for batch_data in data_loader:
+                if use_ts_dataset:
+                    data = batch_data.to(self.device).float()
+                    data = torch.transpose(data, 1, 2)
+                    feature = data[:, :-1, :]
+                else:
+                    feature, _ = batch_data
+                    feature = feature.to(self.device)
+
                 pred = self.model(feature)
                 preds.append(pred.cpu().numpy())
 
@@ -341,8 +365,54 @@ class TCNTrainer:
 # 数据准备函数
 # ============================================================================
 
-def create_ts_handler_for_fold(args, fold_config):
-    """为特定 fold 创建 TSDatasetH 的 Handler"""
+class ReshapedTCNDataset(torch.utils.data.Dataset):
+    """
+    用于 Alpha300/Alpha360 等已含时序结构的 handler。
+
+    将扁平化的特征 (N, d_feat * step_len) reshape 为 TCN 需要的格式 (N, d_feat, step_len)。
+    """
+
+    def __init__(self, features, labels, d_feat, step_len):
+        """
+        Args:
+            features: numpy array of shape (N, d_feat * step_len)
+            labels: numpy array of shape (N,)
+            d_feat: 每个时间步的特征数
+            step_len: 时间序列长度
+        """
+        self.features = features
+        self.labels = labels
+        self.d_feat = d_feat
+        self.step_len = step_len
+
+        # 验证维度
+        expected_features = d_feat * step_len
+        if features.shape[1] != expected_features:
+            raise ValueError(
+                f"Feature dimension mismatch: got {features.shape[1]}, "
+                f"expected {expected_features} (d_feat={d_feat} × step_len={step_len})"
+            )
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        # 获取扁平特征并 reshape
+        # 原始格式: [CLOSE0, CLOSE1, ..., CLOSE59, OPEN0, OPEN1, ..., VOLUME59]
+        # 目标格式: (d_feat, step_len) = (5, 60) 用于 TCN
+        feat = self.features[idx]
+
+        # Reshape: (d_feat * step_len,) -> (d_feat, step_len)
+        # Alpha300/360 的特征顺序是按特征类型排列的（所有 CLOSE，然后所有 OPEN，...）
+        feat_reshaped = feat.reshape(self.d_feat, self.step_len)
+
+        label = self.labels[idx] if self.labels is not None else 0.0
+
+        return torch.tensor(feat_reshaped, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+
+
+def create_handler_for_fold(args, fold_config):
+    """为特定 fold 创建 Handler"""
     end_time = fold_config.get('test_end', fold_config['valid_end'])
 
     # 根据 handler 类型选择不同的创建方式
@@ -365,14 +435,13 @@ def create_ts_handler_for_fold(args, fold_config):
             end_time=end_time,
             fit_start_time=fold_config['train_start'],
             fit_end_time=fold_config['train_end'],
-            infer_processors=[],  # TSDatasetH 需要原始数据
         )
 
     return handler
 
 
-def create_ts_dataset_for_fold(handler, fold_config, step_len=20):
-    """为特定 fold 创建 TSDatasetH"""
+def create_dataset_for_fold(handler, fold_config, use_ts_dataset=True, step_len=20):
+    """为特定 fold 创建 Dataset"""
     segments = {
         "train": (fold_config['train_start'], fold_config['train_end']),
         "valid": (fold_config['valid_start'], fold_config['valid_end']),
@@ -381,15 +450,63 @@ def create_ts_dataset_for_fold(handler, fold_config, step_len=20):
     if 'test_start' in fold_config:
         segments["test"] = (fold_config['test_start'], fold_config['test_end'])
 
-    return TSDatasetH(
-        handler=handler,
-        segments=segments,
-        step_len=step_len,
-    )
+    if use_ts_dataset:
+        # 使用 TSDatasetH（用于 tcn-v1 等）
+        from qlib.data.dataset import TSDatasetH
+        return TSDatasetH(
+            handler=handler,
+            segments=segments,
+            step_len=step_len,
+        )
+    else:
+        # 使用普通 DatasetH（用于 alpha300/alpha360 等）
+        from qlib.data.dataset import DatasetH
+        return DatasetH(
+            handler=handler,
+            segments=segments,
+        )
+
+
+def prepare_data_for_tcn(dataset, segment, d_feat, step_len, use_ts_dataset):
+    """
+    准备 TCN 训练数据。
+
+    Returns:
+        如果 use_ts_dataset=True: (TSDataSampler, index)
+        如果 use_ts_dataset=False: (ReshapedTCNDataset, index, labels)
+    """
+    if use_ts_dataset:
+        # TSDatasetH 模式
+        dl = dataset.prepare(segment, col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+        dl.config(fillna_type="ffill+bfill")
+        index = dl.get_index()
+        return dl, index, None
+    else:
+        # DatasetH + reshape 模式
+        features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
+        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
+
+        # 处理 NaN
+        features = features.fillna(0).replace([np.inf, -np.inf], 0)
+        if isinstance(labels, pd.DataFrame):
+            labels = labels.iloc[:, 0]
+        labels = labels.fillna(0)
+
+        index = features.index
+
+        # 创建 ReshapedTCNDataset
+        tcn_dataset = ReshapedTCNDataset(
+            features.values,
+            labels.values,
+            d_feat=d_feat,
+            step_len=step_len,
+        )
+
+        return tcn_dataset, index, labels.values
 
 
 def compute_ic_from_pred(pred, dataset, segment):
-    """从预测结果计算 IC"""
+    """从 TSDatasetH 预测结果计算 IC"""
     # 获取标签
     dl = dataset.prepare(segment, col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
     dl.config(fillna_type="ffill+bfill")
@@ -423,6 +540,74 @@ def compute_ic_from_pred(pred, dataset, segment):
     icir = mean_ic / ic_std if ic_std > 0 else 0
 
     return mean_ic, ic_std, icir
+
+
+def compute_ic_from_arrays(pred, labels, index):
+    """从数组计算 IC（用于 DatasetH + reshape 模式）"""
+    df = pd.DataFrame({'pred': pred, 'label': labels}, index=index)
+
+    # 按日期计算 IC
+    ic_by_date = df.groupby(level='datetime').apply(
+        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+    )
+    ic_by_date = ic_by_date.dropna()
+
+    if len(ic_by_date) == 0:
+        return 0.0, 0.0, 0.0
+
+    mean_ic = ic_by_date.mean()
+    ic_std = ic_by_date.std()
+    icir = mean_ic / ic_std if ic_std > 0 else 0
+
+    return mean_ic, ic_std, icir
+
+
+def evaluate_simple_model(test_pred, test_labels, test_index):
+    """
+    评估 DatasetH 模式的模型性能
+
+    Args:
+        test_pred: 预测结果数组
+        test_labels: 真实标签数组
+        test_index: 索引
+    """
+    # 创建 DataFrame
+    df = pd.DataFrame({'pred': test_pred, 'label': test_labels}, index=test_index)
+
+    # 去除 NaN 值
+    valid_idx = ~(np.isnan(df['pred']) | np.isnan(df['label']))
+    df_clean = df[valid_idx]
+
+    print(f"    Valid test samples: {len(df_clean)}")
+
+    # 计算 IC (Information Coefficient)
+    ic_by_date = df_clean.groupby(level='datetime').apply(
+        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+    )
+    ic_by_date = ic_by_date.dropna()
+
+    # 计算误差指标
+    mse = ((df_clean['pred'] - df_clean['label']) ** 2).mean()
+    mae = (df_clean['pred'] - df_clean['label']).abs().mean()
+    rmse = np.sqrt(mse)
+
+    print(f"\n    ╔════════════════════════════════════════╗")
+    print(f"    ║  Information Coefficient (IC)          ║")
+    print(f"    ╠════════════════════════════════════════╣")
+    print(f"    ║  Mean IC:   {ic_by_date.mean():>8.4f}                  ║")
+    print(f"    ║  IC Std:    {ic_by_date.std():>8.4f}                  ║")
+    print(f"    ║  ICIR:      {ic_by_date.mean() / ic_by_date.std() if ic_by_date.std() > 0 else 0:>8.4f}                  ║")
+    print(f"    ╚════════════════════════════════════════╝")
+
+    print(f"\n    ╔════════════════════════════════════════╗")
+    print(f"    ║  Prediction Error Metrics              ║")
+    print(f"    ╠════════════════════════════════════════╣")
+    print(f"    ║  MSE (Mean Squared Error):   {mse:>8.6f} ║")
+    print(f"    ║  MAE (Mean Absolute Error):  {mae:>8.6f} ║")
+    print(f"    ║  RMSE (Root Mean Sq Error):  {rmse:>8.6f} ║")
+    print(f"    ╚════════════════════════════════════════╝")
+
+    return ic_by_date.mean(), ic_by_date.std()
 
 
 def evaluate_ts_model(test_pred, test_index, dataset, segment="test"):
@@ -493,9 +678,14 @@ def evaluate_ts_model(test_pred, test_index, dataset, segment="test"):
 
 def run_cv_training(args):
     """运行 CV 训练"""
+    handler_cfg = TS_HANDLER_CONFIG[args.handler]
+    use_ts_dataset = handler_cfg['use_ts_dataset']
+
     print("\n" + "=" * 70)
-    print("TCN CROSS-VALIDATION TRAINING (Qlib Alpha158 Benchmark)")
+    print("TCN CROSS-VALIDATION TRAINING")
     print("=" * 70)
+    print(f"Handler: {args.handler}")
+    print(f"Data mode: {'TSDatasetH' if use_ts_dataset else 'DatasetH + reshape'}")
     print(f"Stock Pool: {args.stock_pool} ({len(STOCK_POOLS[args.stock_pool])} stocks)")
     print(f"N-day: {args.nday}")
     print(f"Step Length: {args.step_len}")
@@ -509,14 +699,24 @@ def run_cv_training(args):
 
     # 预先准备 2025 测试集
     print("\n[*] Preparing 2025 test data...")
-    test_handler = create_ts_handler_for_fold(args, FINAL_TEST)
-    test_dataset = create_ts_dataset_for_fold(test_handler, FINAL_TEST, step_len=args.step_len)
+    test_handler = create_handler_for_fold(args, FINAL_TEST)
+    test_dataset = create_dataset_for_fold(
+        test_handler, FINAL_TEST,
+        use_ts_dataset=use_ts_dataset,
+        step_len=args.step_len
+    )
 
-    test_dl = test_dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-    test_dl.config(fillna_type="ffill+bfill")
-    test_loader = DataLoader(test_dl, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_index = test_dl.get_index()
-    print(f"    Test samples: {len(test_dl)}")
+    test_data, test_index, test_labels = prepare_data_for_tcn(
+        test_dataset, "test", args.d_feat, args.step_len, use_ts_dataset
+    )
+
+    if use_ts_dataset:
+        test_data.config(fillna_type="ffill+bfill")
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    else:
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    print(f"    Test samples: {len(test_data)}")
 
     fold_results = []
     fold_ics = []
@@ -532,22 +732,31 @@ def run_cv_training(args):
             torch.manual_seed(seed)
 
         # 准备数据
-        handler = create_ts_handler_for_fold(args, fold)
-        dataset = create_ts_dataset_for_fold(handler, fold, step_len=args.step_len)
+        handler = create_handler_for_fold(args, fold)
+        dataset = create_dataset_for_fold(
+            handler, fold,
+            use_ts_dataset=use_ts_dataset,
+            step_len=args.step_len
+        )
 
-        train_dl = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-        train_dl.config(fillna_type="ffill+bfill")
+        train_data, train_index, train_labels = prepare_data_for_tcn(
+            dataset, "train", args.d_feat, args.step_len, use_ts_dataset
+        )
+        valid_data, valid_index, valid_labels = prepare_data_for_tcn(
+            dataset, "valid", args.d_feat, args.step_len, use_ts_dataset
+        )
 
-        valid_dl = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-        valid_dl.config(fillna_type="ffill+bfill")
+        if use_ts_dataset:
+            train_data.config(fillna_type="ffill+bfill")
+            valid_data.config(fillna_type="ffill+bfill")
 
-        print(f"    Train samples: {len(train_dl)}, Valid samples: {len(valid_dl)}")
+        print(f"    Train samples: {len(train_data)}, Valid samples: {len(valid_data)}")
 
         train_loader = DataLoader(
-            train_dl, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True
+            train_data, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True
         )
         valid_loader = DataLoader(
-            valid_dl, batch_size=args.batch_size, shuffle=False, num_workers=0
+            valid_data, batch_size=args.batch_size, shuffle=False, num_workers=0
         )
 
         # 创建并训练模型
@@ -565,15 +774,25 @@ def run_cv_training(args):
             seed=args.seed + fold_idx if args.seed else None,
         )
 
-        best_epoch, best_loss = trainer.fit(train_loader, valid_loader, verbose=args.verbose)
+        best_epoch, best_loss = trainer.fit(
+            train_loader, valid_loader,
+            use_ts_dataset=use_ts_dataset,
+            verbose=args.verbose
+        )
 
         # 验证集预测
-        valid_pred = trainer.predict(valid_loader)
-        valid_ic, valid_ic_std, valid_icir = compute_ic_from_pred(valid_pred, dataset, "valid")
+        valid_pred = trainer.predict(valid_loader, use_ts_dataset=use_ts_dataset)
+        if use_ts_dataset:
+            valid_ic, valid_ic_std, valid_icir = compute_ic_from_pred(valid_pred, dataset, "valid")
+        else:
+            valid_ic, valid_ic_std, valid_icir = compute_ic_from_arrays(valid_pred, valid_labels, valid_index)
 
         # 测试集预测
-        test_pred = trainer.predict(test_loader)
-        test_ic, test_ic_std, test_icir = compute_ic_from_pred(test_pred, test_dataset, "test")
+        test_pred = trainer.predict(test_loader, use_ts_dataset=use_ts_dataset)
+        if use_ts_dataset:
+            test_ic, test_ic_std, test_icir = compute_ic_from_pred(test_pred, test_dataset, "test")
+        else:
+            test_ic, test_ic_std, test_icir = compute_ic_from_arrays(test_pred, test_labels, test_index)
 
         fold_ics.append(valid_ic)
         fold_test_ics.append(test_ic)
@@ -613,24 +832,37 @@ def train_final_model(args, test_dataset):
     """训练最终模型"""
     print("\n[*] Training final model on full data...")
 
+    handler_cfg = TS_HANDLER_CONFIG[args.handler]
+    use_ts_dataset = handler_cfg['use_ts_dataset']
+
     # 准备数据
-    handler = create_ts_handler_for_fold(args, FINAL_TEST)
-    dataset = create_ts_dataset_for_fold(handler, FINAL_TEST, step_len=args.step_len)
+    handler = create_handler_for_fold(args, FINAL_TEST)
+    dataset = create_dataset_for_fold(
+        handler, FINAL_TEST,
+        use_ts_dataset=use_ts_dataset,
+        step_len=args.step_len
+    )
 
-    train_dl = dataset.prepare("train", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-    train_dl.config(fillna_type="ffill+bfill")
+    train_data, train_index, train_labels = prepare_data_for_tcn(
+        dataset, "train", args.d_feat, args.step_len, use_ts_dataset
+    )
+    valid_data, valid_index, valid_labels = prepare_data_for_tcn(
+        dataset, "valid", args.d_feat, args.step_len, use_ts_dataset
+    )
+    test_data, test_index, test_labels = prepare_data_for_tcn(
+        dataset, "test", args.d_feat, args.step_len, use_ts_dataset
+    )
 
-    valid_dl = dataset.prepare("valid", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-    valid_dl.config(fillna_type="ffill+bfill")
+    if use_ts_dataset:
+        train_data.config(fillna_type="ffill+bfill")
+        valid_data.config(fillna_type="ffill+bfill")
+        test_data.config(fillna_type="ffill+bfill")
 
-    test_dl = dataset.prepare("test", col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
-    test_dl.config(fillna_type="ffill+bfill")
+    print(f"    Train: {len(train_data)}, Valid: {len(valid_data)}, Test: {len(test_data)}")
 
-    print(f"    Train: {len(train_dl)}, Valid: {len(valid_dl)}, Test: {len(test_dl)}")
-
-    train_loader = DataLoader(train_dl, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-    valid_loader = DataLoader(valid_dl, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dl, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+    valid_loader = DataLoader(valid_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # 训练
     trainer = TCNTrainer(
@@ -647,13 +879,15 @@ def train_final_model(args, test_dataset):
         seed=args.seed,
     )
 
-    best_epoch, best_loss = trainer.fit(train_loader, valid_loader, verbose=True)
+    best_epoch, best_loss = trainer.fit(
+        train_loader, valid_loader,
+        use_ts_dataset=use_ts_dataset,
+        verbose=True
+    )
     print(f"    Best epoch: {best_epoch}, Best loss: {best_loss:.6f}")
 
     # 预测
-    test_pred = trainer.predict(test_loader)
-    test_index = test_dl.get_index()
-
+    test_pred = trainer.predict(test_loader, use_ts_dataset=use_ts_dataset)
     test_pred_series = pd.Series(test_pred, index=test_index, name='score')
 
     # 保存模型
@@ -663,7 +897,7 @@ def train_final_model(args, test_dataset):
     trainer.save(model_path)
     print(f"    Model saved to: {model_path}")
 
-    return trainer, test_pred_series, dataset, model_path
+    return trainer, test_pred_series, dataset, model_path, test_labels
 
 
 def main():
@@ -785,11 +1019,18 @@ def main():
         return
 
     # ========== 训练最终模型 ==========
-    trainer, test_pred, dataset, model_path = train_final_model(args, test_dataset)
+    trainer, test_pred, dataset, model_path, test_labels = train_final_model(args, test_dataset)
 
     # ========== 评估 ==========
     print("\n[*] Final Evaluation on Test Set (2025)...")
-    evaluate_ts_model(test_pred.values, test_pred.index, dataset, segment="test")
+    handler_cfg = TS_HANDLER_CONFIG[args.handler]
+    use_ts_dataset = handler_cfg['use_ts_dataset']
+
+    if use_ts_dataset:
+        evaluate_ts_model(test_pred.values, test_pred.index, dataset, segment="test")
+    else:
+        # DatasetH 模式：直接使用 labels
+        evaluate_simple_model(test_pred.values, test_labels, test_pred.index)
 
     # ========== 回测 ==========
     if args.backtest:
