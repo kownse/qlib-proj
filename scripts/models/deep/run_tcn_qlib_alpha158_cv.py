@@ -58,12 +58,60 @@ from data.datahandler_tcn_v1 import TCN_V1_Handler
 
 from models.common import (
     PROJECT_ROOT, MODEL_SAVE_PATH,
+    HANDLER_CONFIG,
     init_qlib,
     run_backtest,
     # CV utilities
     CV_FOLDS,
     FINAL_TEST,
 )
+from models.common.handlers import get_handler_class
+
+
+# ============================================================================
+# Handler 配置 - 为不同 handler 设置合适的 d_feat 和 step_len
+# ============================================================================
+
+# 针对 TSDatasetH 的 handler 配置
+# d_feat: 每个时间步的特征数
+# step_len: 时间序列长度
+TS_HANDLER_CONFIG = {
+    'tcn-v1': {
+        'd_feat': 20,
+        'step_len': 20,
+        'description': 'Qlib benchmark 20 features (from Alpha158)',
+    },
+    'alpha360': {
+        'd_feat': 6,
+        'step_len': 60,
+        'description': 'Alpha360: 6 OHLCV features × 60 days (includes VWAP)',
+    },
+    'alpha300': {
+        'd_feat': 5,
+        'step_len': 60,
+        'description': 'Alpha300: 5 OHLC+V features × 60 days (no VWAP, for US)',
+    },
+    'alpha300-ts': {
+        'd_feat': 5,
+        'step_len': 60,
+        'description': 'Alpha300 with time-series normalization',
+    },
+    'alpha180': {
+        'd_feat': 6,
+        'step_len': 30,
+        'description': 'Alpha180: 6 OHLCV features × 30 days',
+    },
+    'alpha360-macro': {
+        'd_feat': 29,  # 6 OHLCV + 23 core macro
+        'step_len': 60,
+        'description': 'Alpha360 + 23 core macro features',
+    },
+    'alpha180-macro': {
+        'd_feat': 29,  # 6 OHLCV + 23 core macro
+        'step_len': 30,
+        'description': 'Alpha180 + 23 core macro features',
+    },
+}
 
 # 导入 qlib 的 TCN 模型组件
 from qlib.contrib.model.tcn import TemporalConvNet
@@ -297,14 +345,28 @@ def create_ts_handler_for_fold(args, fold_config):
     """为特定 fold 创建 TSDatasetH 的 Handler"""
     end_time = fold_config.get('test_end', fold_config['valid_end'])
 
-    handler = TCN_V1_Handler(
-        volatility_window=args.nday,
-        instruments=STOCK_POOLS[args.stock_pool],
-        start_time=fold_config['train_start'],
-        end_time=end_time,
-        fit_start_time=fold_config['train_start'],
-        fit_end_time=fold_config['train_end'],
-    )
+    # 根据 handler 类型选择不同的创建方式
+    if args.handler == 'tcn-v1':
+        handler = TCN_V1_Handler(
+            volatility_window=args.nday,
+            instruments=STOCK_POOLS[args.stock_pool],
+            start_time=fold_config['train_start'],
+            end_time=end_time,
+            fit_start_time=fold_config['train_start'],
+            fit_end_time=fold_config['train_end'],
+        )
+    else:
+        # 使用通用 handler
+        HandlerClass = get_handler_class(args.handler)
+        handler = HandlerClass(
+            volatility_window=args.nday,
+            instruments=STOCK_POOLS[args.stock_pool],
+            start_time=fold_config['train_start'],
+            end_time=end_time,
+            fit_start_time=fold_config['train_start'],
+            fit_end_time=fold_config['train_end'],
+            infer_processors=[],  # TSDatasetH 需要原始数据
+        )
 
     return handler
 
@@ -597,7 +659,7 @@ def train_final_model(args, test_dataset):
     # 保存模型
     MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = MODEL_SAVE_PATH / f"tcn_qlib_alpha158_cv_{args.stock_pool}_{args.nday}d_{timestamp}.pt"
+    model_path = MODEL_SAVE_PATH / f"tcn_cv_{args.handler}_{args.stock_pool}_{args.nday}d_{timestamp}.pt"
     trainer.save(model_path)
     print(f"    Model saved to: {model_path}")
 
@@ -605,22 +667,31 @@ def train_final_model(args, test_dataset):
 
 
 def main():
+    # 构建 handler 帮助信息
+    handler_help = "Handler choices:\n"
+    for name, cfg in TS_HANDLER_CONFIG.items():
+        handler_help += f"  {name}: {cfg['description']} (d_feat={cfg['d_feat']}, step_len={cfg['step_len']})\n"
+
     parser = argparse.ArgumentParser(
-        description='TCN Cross-Validation Training (Qlib Alpha158 Benchmark)',
+        description='TCN Cross-Validation Training',
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=handler_help,
     )
 
     # 基础参数
+    parser.add_argument('--handler', type=str, default='alpha300-ts',
+                        choices=list(TS_HANDLER_CONFIG.keys()),
+                        help='Handler type (default: alpha300-ts)')
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
     parser.add_argument('--nday', type=int, default=5,
                         help='Label prediction horizon (default: 5)')
 
-    # TCN 参数 (与 benchmark 一致)
-    parser.add_argument('--d-feat', type=int, default=20,
-                        help='Features per timestep (default: 20)')
-    parser.add_argument('--step-len', type=int, default=20,
-                        help='Time series length (default: 20)')
+    # TCN 参数 - 可以覆盖 handler 默认值
+    parser.add_argument('--d-feat', type=int, default=None,
+                        help='Features per timestep (auto from handler if not set)')
+    parser.add_argument('--step-len', type=int, default=None,
+                        help='Time series length (auto from handler if not set)')
     parser.add_argument('--n-chans', type=int, default=32,
                         help='Number of channels (default: 32)')
     parser.add_argument('--kernel-size', type=int, default=7,
@@ -669,17 +740,29 @@ def main():
     if args.eval_only and not args.model_path:
         parser.error("--eval-only requires --model-path")
 
+    # 从 handler 配置自动获取 d_feat 和 step_len（如果未指定）
+    handler_cfg = TS_HANDLER_CONFIG[args.handler]
+    if args.d_feat is None:
+        args.d_feat = handler_cfg['d_feat']
+    if args.step_len is None:
+        args.step_len = handler_cfg['step_len']
+
+    # 检查是否需要 TA-Lib
+    handler_meta = HANDLER_CONFIG.get(args.handler, {})
+    use_talib = handler_meta.get('use_talib', False) if isinstance(handler_meta, dict) else False
+
     # 初始化 Qlib
-    qlib_data_path = project_root / "my_data" / "qlib_us"
-    qlib.init(provider_uri=str(qlib_data_path), region=REG_US)
+    init_qlib(use_talib)
 
     print("\n" + "=" * 70)
-    print("TCN Qlib Alpha158 Benchmark - US Data")
+    print("TCN Cross-Validation Training - US Data")
     print("=" * 70)
+    print(f"Handler: {args.handler} ({handler_cfg['description']})")
     print(f"Stock Pool: {args.stock_pool}")
     print(f"N-day: {args.nday}")
     print(f"Step Length: {args.step_len}")
     print(f"d_feat: {args.d_feat}")
+    print(f"Total features: {args.d_feat * args.step_len}")
     print(f"Channels: {args.n_chans}")
     print(f"Kernel Size: {args.kernel_size}")
     print(f"Num Layers: {args.num_layers}")
