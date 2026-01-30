@@ -213,6 +213,14 @@ HANDLER_REGISTRY = {
         'description': 'Alpha360 + MASTER market info (60×69 features: time-aligned)',
         'use_talib': False,
     },
+
+    # TCN benchmark handlers
+    'tcn-v1': {
+        'module': 'data.datahandler_tcn_v1',
+        'class_name': 'TCN_V1_Handler',
+        'description': 'TCN V1 (20 features from Qlib benchmark, for TSDatasetH)',
+        'use_talib': False,
+    },
 }
 
 
