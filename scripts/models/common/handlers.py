@@ -192,6 +192,14 @@ HANDLER_REGISTRY = {
         'use_talib': True,
     },
 
+    # LightGBM optimized handlers
+    'lightgbm-v1': {
+        'module': 'data.datahandler_lightgbm_v1',
+        'class_name': 'Alpha158_LightGBM_V1',
+        'description': 'LightGBM V1 (~12 features: nested CV forward selection for LightGBM)',
+        'use_talib': True,
+    },
+
     # MASTER model handlers
     'alpha158-master': {
         'module': 'data.datahandler_master',
