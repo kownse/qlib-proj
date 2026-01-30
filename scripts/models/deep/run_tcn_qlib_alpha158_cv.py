@@ -53,7 +53,6 @@ from qlib.constant import REG_US
 from qlib.data.dataset import TSDatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
-from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
 from data.datahandler_tcn_v1 import TCN_V1_Handler
 
@@ -364,6 +363,68 @@ def compute_ic_from_pred(pred, dataset, segment):
     return mean_ic, ic_std, icir
 
 
+def evaluate_ts_model(test_pred, test_index, dataset, segment="test"):
+    """
+    评估 TSDatasetH 模型性能
+
+    Args:
+        test_pred: 预测结果数组
+        test_index: 预测结果的索引
+        dataset: TSDatasetH 对象
+        segment: 数据段名称
+    """
+    # 获取标签
+    dl = dataset.prepare(segment, col_set=["feature", "label"], data_key=DataHandlerLP.DK_L)
+    dl.config(fillna_type="ffill+bfill")
+
+    # 获取标签值
+    labels = []
+    for i in range(len(dl)):
+        data = dl[i]
+        label = data[-1, -1]  # 最后一个时间步的最后一个值 (label)
+        labels.append(label)
+
+    labels = np.array(labels)
+
+    # 创建 DataFrame
+    df = pd.DataFrame({'pred': test_pred, 'label': labels}, index=test_index)
+
+    # 去除 NaN 值
+    valid_idx = ~(np.isnan(df['pred']) | np.isnan(df['label']))
+    df_clean = df[valid_idx]
+
+    print(f"    Valid test samples: {len(df_clean)}")
+
+    # 计算 IC (Information Coefficient)
+    ic_by_date = df_clean.groupby(level='datetime').apply(
+        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
+    )
+    ic_by_date = ic_by_date.dropna()
+
+    # 计算误差指标
+    mse = ((df_clean['pred'] - df_clean['label']) ** 2).mean()
+    mae = (df_clean['pred'] - df_clean['label']).abs().mean()
+    rmse = np.sqrt(mse)
+
+    print(f"\n    ╔════════════════════════════════════════╗")
+    print(f"    ║  Information Coefficient (IC)          ║")
+    print(f"    ╠════════════════════════════════════════╣")
+    print(f"    ║  Mean IC:   {ic_by_date.mean():>8.4f}                  ║")
+    print(f"    ║  IC Std:    {ic_by_date.std():>8.4f}                  ║")
+    print(f"    ║  ICIR:      {ic_by_date.mean() / ic_by_date.std() if ic_by_date.std() > 0 else 0:>8.4f}                  ║")
+    print(f"    ╚════════════════════════════════════════╝")
+
+    print(f"\n    ╔════════════════════════════════════════╗")
+    print(f"    ║  Prediction Error Metrics              ║")
+    print(f"    ╠════════════════════════════════════════╣")
+    print(f"    ║  MSE (Mean Squared Error):   {mse:>8.6f} ║")
+    print(f"    ║  MAE (Mean Absolute Error):  {mae:>8.6f} ║")
+    print(f"    ║  RMSE (Root Mean Sq Error):  {rmse:>8.6f} ║")
+    print(f"    ╚════════════════════════════════════════╝")
+
+    return ic_by_date.mean(), ic_by_date.std()
+
+
 # ============================================================================
 # CV 训练函数
 # ============================================================================
@@ -645,7 +706,7 @@ def main():
 
     # ========== 评估 ==========
     print("\n[*] Final Evaluation on Test Set (2025)...")
-    evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+    evaluate_ts_model(test_pred.values, test_pred.index, dataset, segment="test")
 
     # ========== 回测 ==========
     if args.backtest:
