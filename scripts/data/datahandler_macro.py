@@ -941,11 +941,14 @@ class Alpha300_Macro(DataHandlerLP):
     - Macro features: VIX, bonds, yields, etc. per timestep (same for all stocks on that day)
 
     Feature counts (recommended: minimal for memory efficiency):
-    - macro_features="minimal": 660 features ((5+6) x 60), d_feat=11 [DEFAULT, memory efficient]
+    - macro_features="minimal": ~600 features ((5+5) x 60), d_feat~10 [DEFAULT, memory efficient]
     - macro_features="none": 300 features (5 x 60), d_feat=5
-    - macro_features="vix_only": ~1080 features ((5+13) x 60), d_feat=18
-    - macro_features="core": ~1680 features ((5+23) x 60), d_feat=28 [HIGH MEMORY]
-    - macro_features="all": ~6600 features ((5+105) x 60) [VERY HIGH MEMORY]
+    - macro_features="vix_only": varies based on available data
+    - macro_features="core": varies based on available data [HIGH MEMORY]
+    - macro_features="all": varies based on available data [VERY HIGH MEMORY]
+
+    Note: Actual d_feat depends on which macro features are available in your data.
+    The handler will print the correct d_feat value during initialization.
 
     Minimal macro features (6, selected via CatBoost forward selection):
     - macro_vix_zscore20: VIX normalized level
@@ -1086,19 +1089,21 @@ class Alpha300_Macro(DataHandlerLP):
                 print("Warning: No macro features available")
                 return
 
-            # Show missing features warning
+            # Show detailed feature info
             missing_cols = [c for c in macro_cols if c not in self._macro_df.columns]
+            print(f"Alpha300_Macro: Requested {len(macro_cols)} macro features, found {len(available_cols)}")
+            print(f"Alpha300_Macro: Available: {available_cols}")
             if missing_cols:
-                print(f"Warning: {len(missing_cols)} macro features not found in data: {missing_cols[:5]}...")
+                print(f"Alpha300_Macro: Missing: {missing_cols}")
 
             # Add to _learn with temporal expansion
             if hasattr(self, "_learn") and self._learn is not None:
                 self._learn = self._expand_macro_temporally(self._learn, available_cols)
                 num_macro_expanded = len(available_cols) * 60
                 d_feat = 5 + len(available_cols)  # 5 base OHLCV + macro
-                print(f"Alpha300_Macro: Added {num_macro_expanded} macro features to learn data "
-                      f"({len(available_cols)} macro x 60 timesteps)")
-                print(f"Alpha300_Macro: Total features = {300 + num_macro_expanded}, d_feat = {d_feat}, step_len = 60")
+                total_features = 300 + num_macro_expanded
+                print(f"Alpha300_Macro: Total features = {total_features}, d_feat = {d_feat}, step_len = 60")
+                print(f"Alpha300_Macro: Use --d-feat {d_feat} when running TCN")
 
             # Add to _infer with temporal expansion
             if hasattr(self, "_infer") and self._infer is not None:
