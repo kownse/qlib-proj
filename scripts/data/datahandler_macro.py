@@ -978,17 +978,18 @@ class Alpha300_Macro(DataHandlerLP):
 
     # Minimal macro features (6) - based on CatBoost forward selection
     # These 6 features provided the best IC improvement in nested CV
+    # IMPORTANT: All features should have similar scale (std ≈ 1.0) for TCN
     MINIMAL_MACRO_FEATURES = [
-        # VIX (1) - most important volatility indicator
+        # VIX (1) - most important volatility indicator (already z-scored, std≈1.2)
         "macro_vix_zscore20",
         # Credit/Risk (2) - credit spreads are strong predictors
-        "macro_hy_spread",  # use raw spread instead of zscore
-        "macro_credit_stress",
-        # Bonds (1) - interest rate sensitivity
+        "macro_hy_spread_zscore",  # Use z-scored version (std≈1.0), not raw (std≈0.03)
+        "macro_credit_stress",     # Already z-scored (std≈1.0)
+        # Bonds (1) - interest rate sensitivity (will be z-scored in handler)
         "macro_tlt_pct_20d",
-        # Commodities (1) - oil as economic indicator
+        # Commodities (1) - oil as economic indicator (will be z-scored in handler)
         "macro_uso_pct_5d",
-        # Cross-asset (1) - risk regime
+        # Cross-asset (1) - risk regime (already z-scored, std≈1.1)
         "macro_risk_on_off",
     ]
 
@@ -1114,12 +1115,33 @@ class Alpha300_Macro(DataHandlerLP):
             import traceback
             traceback.print_exc()
 
+    # Features that need z-score normalization (small std, not already z-scored)
+    FEATURES_NEED_ZSCORE = [
+        "macro_tlt_pct_20d",  # std ≈ 0.035
+        "macro_uso_pct_5d",   # std ≈ 0.043
+        "macro_tlt_pct_5d",   # std ≈ 0.018
+        "macro_tlt_pct_1d",   # std ≈ 0.009
+        "macro_uso_pct_1d",   # std ≈ 0.020
+        "macro_uso_pct_20d",  # std ≈ 0.086
+        "macro_gld_pct_20d",  # pct features have small std
+        "macro_gld_pct_5d",
+        "macro_gld_pct_1d",
+        "macro_uup_pct_5d",
+        "macro_uup_pct_1d",
+        "macro_spy_pct_20d",
+        "macro_spy_pct_5d",
+        "macro_spy_pct_1d",
+    ]
+
     def _expand_macro_temporally(self, df: pd.DataFrame, macro_cols: list) -> pd.DataFrame:
         """
         Expand macro features temporally to align with Alpha300's 60-day structure.
 
         For each macro feature col, creates 60 columns: col_59, col_58, ..., col_0
         where col_i contains the macro value from i days ago.
+
+        Features with small std (pct changes) are z-score normalized using
+        rolling 60-day statistics to maintain consistent scale with other features.
 
         Args:
             df: DataFrame with Alpha300 features (index: datetime, instrument)
@@ -1135,7 +1157,17 @@ class Alpha300_Macro(DataHandlerLP):
         # Build all expanded macro columns at once to avoid fragmentation
         expanded_data = {}
         for col in macro_cols:
-            base_series = self._macro_df[col]
+            base_series = self._macro_df[col].copy()
+
+            # Apply rolling z-score normalization for features with small std
+            if col in self.FEATURES_NEED_ZSCORE:
+                rolling_mean = base_series.rolling(window=60, min_periods=20).mean()
+                rolling_std = base_series.rolling(window=60, min_periods=20).std()
+                # Z-score with protection against division by zero
+                base_series = (base_series - rolling_mean) / (rolling_std + 1e-8)
+                # Clip extreme values
+                base_series = base_series.clip(-5, 5)
+
             for i in range(59, -1, -1):  # 60 days: 59, 58, ..., 0
                 col_name = f"{col}_{i}"
                 # Shift macro data by i days (shift(i) means value from i days ago)
