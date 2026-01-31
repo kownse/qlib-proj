@@ -982,7 +982,7 @@ class Alpha300_Macro(DataHandlerLP):
         # VIX (1) - most important volatility indicator
         "macro_vix_zscore20",
         # Credit/Risk (2) - credit spreads are strong predictors
-        "macro_hy_spread_zscore",
+        "macro_hy_spread",  # use raw spread instead of zscore
         "macro_credit_stress",
         # Bonds (1) - interest rate sensitivity
         "macro_tlt_pct_20d",

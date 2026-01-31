@@ -123,10 +123,10 @@ TS_HANDLER_CONFIG = {
         'description': 'Alpha180 + 23 core macro features',
     },
     'alpha300-macro': {
-        'd_feat': 10,  # 5 OHLC+V (no VWAP) + 5 available minimal macro
+        'd_feat': 11,  # 5 OHLC+V (no VWAP) + 6 minimal macro
         'step_len': 60,
         'use_ts_dataset': False,
-        'description': 'Alpha300 + minimal macro features (no VWAP, memory efficient)',
+        'description': 'Alpha300 + 6 minimal macro features (no VWAP, memory efficient)',
     },
 }
 
