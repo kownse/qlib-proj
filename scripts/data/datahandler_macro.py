@@ -1061,12 +1061,19 @@ class Alpha300_Macro(DataHandlerLP):
                 print("Warning: No macro features available")
                 return
 
+            # Show missing features warning
+            missing_cols = [c for c in macro_cols if c not in self._macro_df.columns]
+            if missing_cols:
+                print(f"Warning: {len(missing_cols)} macro features not found in data: {missing_cols[:5]}...")
+
             # Add to _learn with temporal expansion
             if hasattr(self, "_learn") and self._learn is not None:
                 self._learn = self._expand_macro_temporally(self._learn, available_cols)
                 num_macro_expanded = len(available_cols) * 60
-                print(f"Added {num_macro_expanded} macro features to learn data "
-                      f"({len(available_cols)} features x 60 timesteps)")
+                d_feat = 5 + len(available_cols)  # 5 base OHLCV + macro
+                print(f"Alpha300_Macro: Added {num_macro_expanded} macro features to learn data "
+                      f"({len(available_cols)} macro x 60 timesteps)")
+                print(f"Alpha300_Macro: Total features = {300 + num_macro_expanded}, d_feat = {d_feat}, step_len = 60")
 
             # Add to _infer with temporal expansion
             if hasattr(self, "_infer") and self._infer is not None:
