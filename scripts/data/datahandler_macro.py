@@ -940,11 +940,20 @@ class Alpha300_Macro(DataHandlerLP):
     - Stock features: CLOSE, OPEN, HIGH, LOW, VOLUME per timestep (no VWAP)
     - Macro features: VIX, bonds, yields, etc. per timestep (same for all stocks on that day)
 
-    Feature counts:
-    - macro_features="none": 300 features (5 x 60)
-    - macro_features="vix_only": 1080 features ((5+13) x 60)
-    - macro_features="core": 1680 features ((5+23) x 60), d_feat=28
-    - macro_features="all": 6600 features ((5+105) x 60)
+    Feature counts (recommended: minimal for memory efficiency):
+    - macro_features="minimal": 660 features ((5+6) x 60), d_feat=11 [DEFAULT, memory efficient]
+    - macro_features="none": 300 features (5 x 60), d_feat=5
+    - macro_features="vix_only": ~1080 features ((5+13) x 60), d_feat=18
+    - macro_features="core": ~1680 features ((5+23) x 60), d_feat=28 [HIGH MEMORY]
+    - macro_features="all": ~6600 features ((5+105) x 60) [VERY HIGH MEMORY]
+
+    Minimal macro features (6, selected via CatBoost forward selection):
+    - macro_vix_zscore20: VIX normalized level
+    - macro_hy_spread_zscore: High-yield credit spread
+    - macro_credit_stress: Credit market stress
+    - macro_tlt_pct_20d: Bond momentum
+    - macro_uso_pct_5d: Oil momentum
+    - macro_risk_on_off: Risk regime indicator
 
     Usage:
         handler = Alpha300_Macro(
@@ -952,18 +961,33 @@ class Alpha300_Macro(DataHandlerLP):
             instruments=["AAPL", "MSFT", "NVDA"],
             start_time="2020-01-01",
             end_time="2024-12-31",
-            macro_features="core",  # or "all", "vix_only", "none"
+            macro_features="minimal",  # recommended for TCN
         )
 
-        # For ALSTM/TCN/Transformer:
-        # d_feat = 5 + num_macro_features (28 for core, 18 for vix_only)
-        # seq_len = 60
+        # For TCN:
+        # d_feat = 11 (minimal), step_len = 60
     """
 
     # Reuse macro feature definitions from Alpha158_Volatility_TALib_Macro
     ALL_MACRO_FEATURES = Alpha158_Volatility_TALib_Macro.ALL_MACRO_FEATURES
     CORE_MACRO_FEATURES = Alpha158_Volatility_TALib_Macro.CORE_MACRO_FEATURES
     VIX_ONLY_FEATURES = Alpha158_Volatility_TALib_Macro.VIX_ONLY_FEATURES
+
+    # Minimal macro features (6) - based on CatBoost forward selection
+    # These 6 features provided the best IC improvement in nested CV
+    MINIMAL_MACRO_FEATURES = [
+        # VIX (1) - most important volatility indicator
+        "macro_vix_zscore20",
+        # Credit/Risk (2) - credit spreads are strong predictors
+        "macro_hy_spread_zscore",
+        "macro_credit_stress",
+        # Bonds (1) - interest rate sensitivity
+        "macro_tlt_pct_20d",
+        # Commodities (1) - oil as economic indicator
+        "macro_uso_pct_5d",
+        # Cross-asset (1) - risk regime
+        "macro_risk_on_off",
+    ]
 
     def __init__(
         self,
@@ -981,7 +1005,7 @@ class Alpha300_Macro(DataHandlerLP):
         inst_processors=None,
         # Macro feature parameters
         macro_data_path: Union[str, Path] = None,
-        macro_features: str = "core",  # "all", "core", "vix_only", "none"
+        macro_features: str = "minimal",  # "minimal", "core", "vix_only", "all", "none"
         **kwargs,
     ):
         """
@@ -991,10 +1015,11 @@ class Alpha300_Macro(DataHandlerLP):
             volatility_window: Prediction window (days) for label
             macro_data_path: Path to macro features parquet file
             macro_features: Macro feature set to use
+                - "minimal": 6 key features (recommended, d_feat=11) [default]
+                - "core": Core features (~23, d_feat=28)
+                - "vix_only": VIX features only (~13, d_feat=18)
                 - "all": All macro features (~105)
-                - "core": Core features (~23) [default]
-                - "vix_only": VIX features only (~13)
-                - "none": No macro features (pure Alpha300)
+                - "none": No macro features (pure Alpha300, d_feat=5)
             **kwargs: Additional arguments for parent class
         """
         self.volatility_window = volatility_window
@@ -1126,9 +1151,21 @@ class Alpha300_Macro(DataHandlerLP):
         # Return a copy to ensure defragmentation
         return merged.copy()
 
-    # Reuse methods from Alpha158_Volatility_TALib_Macro
+    # Reuse load method from Alpha158_Volatility_TALib_Macro
     _load_macro_features = Alpha158_Volatility_TALib_Macro._load_macro_features
-    _get_macro_feature_columns = Alpha158_Volatility_TALib_Macro._get_macro_feature_columns
+
+    def _get_macro_feature_columns(self):
+        """Get macro feature columns based on configuration."""
+        if self.macro_features == "minimal":
+            return self.MINIMAL_MACRO_FEATURES
+        elif self.macro_features == "core":
+            return self.CORE_MACRO_FEATURES
+        elif self.macro_features == "vix_only":
+            return self.VIX_ONLY_FEATURES
+        elif self.macro_features == "none":
+            return []
+        else:  # "all"
+            return self.ALL_MACRO_FEATURES
 
     def get_label_config(self):
         """Return N-day volatility label."""

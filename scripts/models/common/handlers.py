@@ -118,7 +118,7 @@ HANDLER_REGISTRY = {
     'alpha300-macro': {
         'module': 'data.datahandler_macro',
         'class_name': 'Alpha300_Macro',
-        'description': 'Alpha300 + Macro features (60 timesteps × (5+M) features, no VWAP)',
+        'description': 'Alpha300 + 6 minimal macro (d_feat=11, memory efficient, no VWAP)',
         'use_talib': False,
     },
 
