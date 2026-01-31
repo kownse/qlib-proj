@@ -115,6 +115,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha360 + Macro features (60 timesteps × (6+M) features)',
         'use_talib': False,
     },
+    'alpha300-macro': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha300_Macro',
+        'description': 'Alpha300 + Macro features (60 timesteps × (5+M) features, no VWAP)',
+        'use_talib': False,
+    },
 
     # Enhanced handlers
     'alpha158-enhanced': {

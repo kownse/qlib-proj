@@ -122,6 +122,12 @@ TS_HANDLER_CONFIG = {
         'use_ts_dataset': False,
         'description': 'Alpha180 + 23 core macro features',
     },
+    'alpha300-macro': {
+        'd_feat': 28,  # 5 OHLC+V (no VWAP) + 23 core macro
+        'step_len': 60,
+        'use_ts_dataset': False,
+        'description': 'Alpha300 + 23 core macro features (no VWAP, for US)',
+    },
 }
 
 # 导入 qlib 的 TCN 模型组件
@@ -1006,9 +1012,88 @@ def main():
 
     # ========== 评估模式 ==========
     if args.eval_only:
-        print("\n[*] Evaluation mode...")
-        # TODO: 实现评估模式
-        print("    Not implemented yet")
+        print("\n[*] Evaluation mode - Loading pre-trained model...")
+        print(f"    Model path: {args.model_path}")
+
+        # 加载模型
+        trainer = TCNTrainer(gpu=args.gpu)
+        trainer.load(args.model_path)
+        print(f"    Model loaded: d_feat={trainer.d_feat}, n_chans={trainer.n_chans}, "
+              f"kernel_size={trainer.kernel_size}, num_layers={trainer.num_layers}")
+
+        # 准备测试数据
+        print("\n[*] Preparing test data...")
+        handler_cfg = TS_HANDLER_CONFIG[args.handler]
+        use_ts_dataset = handler_cfg['use_ts_dataset']
+
+        test_handler = create_handler_for_fold(args, FINAL_TEST)
+        test_dataset = create_dataset_for_fold(
+            test_handler, FINAL_TEST,
+            use_ts_dataset=use_ts_dataset,
+            step_len=args.step_len
+        )
+
+        test_data, test_index, test_labels = prepare_data_for_tcn(
+            test_dataset, "test", args.d_feat, args.step_len, use_ts_dataset
+        )
+
+        if use_ts_dataset:
+            test_data.config(fillna_type="ffill+bfill")
+
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        print(f"    Test samples: {len(test_data)}")
+        print(f"    Test period: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']}")
+
+        # 预测
+        print("\n[*] Running predictions on test set...")
+        test_pred = trainer.predict(test_loader, use_ts_dataset=use_ts_dataset)
+        test_pred_series = pd.Series(test_pred, index=test_index, name='score')
+
+        # 评估
+        print("\n[*] Evaluation Results on Test Set:")
+        if use_ts_dataset:
+            mean_ic, ic_std = evaluate_ts_model(test_pred, test_index, test_dataset, segment="test")
+        else:
+            mean_ic, ic_std = evaluate_simple_model(test_pred, test_labels, test_index)
+
+        # 输出简洁的 IC 结果
+        icir = mean_ic / ic_std if ic_std > 0 else 0
+        print("\n" + "=" * 70)
+        print("TEST SET EVALUATION COMPLETE")
+        print("=" * 70)
+        print(f"Test IC:   {mean_ic:.4f}")
+        print(f"IC Std:    {ic_std:.4f}")
+        print(f"ICIR:      {icir:.4f}")
+        print("=" * 70)
+
+        # 回测
+        if args.backtest:
+            pred_df = test_pred_series.to_frame("score")
+
+            time_splits = {
+                'train_start': FINAL_TEST['train_start'],
+                'train_end': FINAL_TEST['train_end'],
+                'valid_start': FINAL_TEST['valid_start'],
+                'valid_end': FINAL_TEST['valid_end'],
+                'test_start': FINAL_TEST['test_start'],
+                'test_end': FINAL_TEST['test_end'],
+            }
+
+            def load_model(path):
+                t = TCNTrainer(gpu=args.gpu)
+                t.load(path)
+                return t
+
+            def get_feature_count(m):
+                return args.d_feat * args.step_len
+
+            run_backtest(
+                args.model_path, test_dataset, pred_df, args, time_splits,
+                model_name="TCN (Eval)",
+                load_model_func=load_model,
+                get_feature_count_func=get_feature_count
+            )
+
         return
 
     # ========== CV 训练 ==========
