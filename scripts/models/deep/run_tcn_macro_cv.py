@@ -1,7 +1,7 @@
 """
 TCN with Macro Conditioning - Cross-Validation Training Script
 
-Architecture:
+Architecture (Concat mode - default):
     Input: Stock features (batch, 5, 60)  +  Macro features (batch, N)
                         ↓                              ↓
                   TemporalConvNet                      │
@@ -18,6 +18,24 @@ Architecture:
                         ↓
                    prediction
 
+Architecture (FiLM mode - --film flag):
+    Input: Stock features (batch, 5, 60)  +  Macro features (batch, N)
+                        ↓                              ↓
+                  TemporalConvNet              FiLM Generator MLP
+                        ↓                              ↓
+             output[:, :, -1] (batch, 32)        γ, β (batch, 32 each)
+                        ↓                              ↓
+                 FiLM modulation: output = γ * tcn_out + β
+                        ↓
+                  Linear(32, 1)
+                        ↓
+                   prediction
+
+    FiLM Benefits:
+    - Multiplicative interaction: macro controls signal strength
+    - γ > 1 amplifies, γ < 1 dampens features based on market regime
+    - More expressive than additive concatenation
+
 Key Design:
     - Stock features only through TCN: (5, 60) = CLOSE, OPEN, HIGH, LOW, VOLUME × 60 days
     - Macro features via MLP: N current-day values
@@ -32,6 +50,15 @@ Usage:
 
     # With CORE macro features (23 features)
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core
+
+    # Skip CV folds, directly train on FINAL_TEST (faster iteration)
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --skip-cv
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --skip-cv
+
+    # FiLM conditioning (multiplicative macro interaction)
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --skip-cv
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --film-hidden 16 --skip-cv
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --film-hidden 64 --skip-cv
 
     # With backtest
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --backtest
@@ -211,6 +238,92 @@ class TCNWithMacro(nn.Module):
         # MLP: (batch, combined_size) -> (batch, 1)
         out = self.dropout(self.relu(self.fc1(combined)))
         out = self.fc2(out)
+
+        return out.squeeze(-1)
+
+
+class TCNWithMacroFiLM(nn.Module):
+    """
+    TCN with FiLM (Feature-wise Linear Modulation) conditioning.
+
+    FiLM applies per-channel modulation: y = γ * tcn_out + β
+    where γ and β are generated from macro features.
+
+    Benefits over concatenation:
+    - Multiplicative interaction: macro controls signal strength
+    - γ > 1 amplifies, γ < 1 dampens features based on market regime
+    - More expressive than additive concatenation
+    """
+
+    def __init__(
+        self,
+        num_input: int,
+        num_channels: list,
+        kernel_size: int,
+        dropout: float,
+        n_macro: int = 6,
+        film_hidden: int = 32,
+    ):
+        """
+        Args:
+            num_input: Number of input features per timestep (d_feat)
+            num_channels: List of channel sizes for TCN layers
+            kernel_size: Kernel size for TCN convolutions
+            dropout: Dropout rate
+            n_macro: Number of macro features
+            film_hidden: Hidden layer size for FiLM generator
+        """
+        super().__init__()
+
+        self.num_input = num_input
+        self.n_macro = n_macro
+        tcn_out_size = num_channels[-1]
+
+        # TCN backbone
+        self.tcn = TemporalConvNet(num_input, num_channels, kernel_size, dropout=dropout)
+
+        # FiLM generators: macro → gamma & beta
+        self.film_generator = nn.Sequential(
+            nn.Linear(n_macro, film_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(film_hidden, tcn_out_size * 2)  # gamma + beta
+        )
+
+        # Initialize gamma close to 1, beta close to 0
+        nn.init.zeros_(self.film_generator[-1].weight)
+        nn.init.zeros_(self.film_generator[-1].bias)
+        self.film_generator[-1].bias.data[:tcn_out_size] = 1.0  # gamma = 1
+
+        # Prediction head
+        self.fc = nn.Linear(tcn_out_size, 1)
+        self.dropout_layer = nn.Dropout(dropout)
+
+    def forward(self, x_stock, x_macro):
+        """
+        Forward pass with FiLM conditioning.
+
+        Args:
+            x_stock: Stock features (batch, d_feat, step_len)
+            x_macro: Macro features (batch, n_macro)
+
+        Returns:
+            predictions: (batch,)
+        """
+        # TCN: (batch, d_feat, step_len) → (batch, n_chans, step_len) → (batch, n_chans)
+        tcn_out = self.tcn(x_stock)
+        tcn_out = tcn_out[:, :, -1]
+
+        # Generate FiLM parameters
+        film_params = self.film_generator(x_macro)  # (batch, 2*n_chans)
+        gamma, beta = film_params.chunk(2, dim=1)   # (batch, n_chans) each
+
+        # Apply FiLM: y = γ * x + β
+        modulated = gamma * tcn_out + beta
+
+        # Prediction
+        out = self.dropout_layer(modulated)
+        out = self.fc(out)
 
         return out.squeeze(-1)
 
@@ -395,6 +508,8 @@ class TCNMacroTrainer:
         early_stop: int = 20,
         gpu: int = 0,
         seed: int = None,
+        use_film: bool = False,
+        film_hidden: int = 32,
     ):
         self.d_feat = d_feat
         self.n_macro = n_macro
@@ -408,6 +523,8 @@ class TCNMacroTrainer:
         self.batch_size = batch_size
         self.early_stop = early_stop
         self.seed = seed
+        self.use_film = use_film
+        self.film_hidden = film_hidden
 
         self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() and gpu >= 0 else "cpu")
 
@@ -422,14 +539,24 @@ class TCNMacroTrainer:
 
     def _init_model(self):
         """Initialize the model."""
-        self.model = TCNWithMacro(
-            num_input=self.d_feat,
-            num_channels=[self.n_chans] * self.num_layers,
-            kernel_size=self.kernel_size,
-            dropout=self.dropout,
-            n_macro=self.n_macro,
-            hidden_size=self.hidden_size,
-        )
+        if self.use_film:
+            self.model = TCNWithMacroFiLM(
+                num_input=self.d_feat,
+                num_channels=[self.n_chans] * self.num_layers,
+                kernel_size=self.kernel_size,
+                dropout=self.dropout,
+                n_macro=self.n_macro,
+                film_hidden=self.film_hidden,
+            )
+        else:
+            self.model = TCNWithMacro(
+                num_input=self.d_feat,
+                num_channels=[self.n_chans] * self.num_layers,
+                kernel_size=self.kernel_size,
+                dropout=self.dropout,
+                n_macro=self.n_macro,
+                hidden_size=self.hidden_size,
+            )
         self.model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
@@ -554,6 +681,8 @@ class TCNMacroTrainer:
                 'num_layers': self.num_layers,
                 'dropout': self.dropout,
                 'hidden_size': self.hidden_size,
+                'use_film': self.use_film,
+                'film_hidden': self.film_hidden,
             }
         }, path)
 
@@ -569,6 +698,8 @@ class TCNMacroTrainer:
         self.num_layers = config['num_layers']
         self.dropout = config['dropout']
         self.hidden_size = config.get('hidden_size', 16)
+        self.use_film = config.get('use_film', False)
+        self.film_hidden = config.get('film_hidden', 32)
 
         self._init_model()
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -796,6 +927,8 @@ def run_cv_training(args, macro_df, macro_cols):
             early_stop=args.early_stop,
             gpu=args.gpu,
             seed=args.seed + fold_idx if args.seed else None,
+            use_film=args.film,
+            film_hidden=args.film_hidden,
         )
 
         best_epoch, best_loss = trainer.fit(
@@ -886,6 +1019,8 @@ def train_final_model(args, macro_df, macro_cols, test_dataset):
         early_stop=args.early_stop,
         gpu=args.gpu,
         seed=args.seed,
+        use_film=args.film,
+        film_hidden=args.film_hidden,
     )
 
     best_epoch, best_loss = trainer.fit(train_loader, valid_loader, verbose=True)
@@ -898,7 +1033,8 @@ def train_final_model(args, macro_df, macro_cols, test_dataset):
     # Save model
     MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = MODEL_SAVE_PATH / f"tcn_macro_cv_{args.stock_pool}_{args.nday}d_m{args.n_macro}_{timestamp}.pt"
+    film_suffix = "_film" if args.film else ""
+    model_path = MODEL_SAVE_PATH / f"tcn_macro_cv_{args.stock_pool}_{args.nday}d_m{args.n_macro}{film_suffix}_{timestamp}.pt"
     trainer.save(model_path)
     print(f"    Model saved to: {model_path}")
 
@@ -951,6 +1087,12 @@ def main():
     parser.add_argument('--hidden-size', type=int, default=16,
                         help='MLP hidden layer size (default: 16)')
 
+    # FiLM conditioning parameters
+    parser.add_argument('--film', action='store_true',
+                        help='Use FiLM conditioning instead of concatenation')
+    parser.add_argument('--film-hidden', type=int, default=32,
+                        help='FiLM generator hidden layer size (default: 32)')
+
     # Training parameters
     parser.add_argument('--n-epochs', type=int, default=200,
                         help='Max epochs (default: 200)')
@@ -968,6 +1110,8 @@ def main():
     # Mode selection
     parser.add_argument('--cv-only', action='store_true',
                         help='Only run CV training, skip final model')
+    parser.add_argument('--skip-cv', action='store_true',
+                        help='Skip CV folds, directly train on FINAL_TEST (faster iteration)')
     parser.add_argument('--eval-only', action='store_true',
                         help='Only evaluate pre-trained model')
     parser.add_argument('--model-path', type=str, default=None,
@@ -1011,14 +1155,15 @@ def main():
     args.n_macro = len(macro_cols)
 
     print("\n" + "=" * 70)
-    print("TCN with Macro Conditioning - US Data")
+    conditioning_type = "FiLM" if args.film else "Concat"
+    print(f"TCN with Macro Conditioning ({conditioning_type}) - US Data")
     print("=" * 70)
     print(f"Stock Pool: {args.stock_pool}")
     print(f"N-day: {args.nday}")
     print(f"Stock d_feat: {args.d_feat}, step_len: {args.step_len}")
     print(f"Macro features ({args.n_macro}): {macro_cols}")
+    print(f"Conditioning: {conditioning_type}" + (f" (hidden={args.film_hidden})" if args.film else f" (hidden={args.hidden_size})"))
     print(f"TCN: {args.n_chans} channels × {args.num_layers} layers, kernel={args.kernel_size}")
-    print(f"MLP hidden: {args.hidden_size}")
     print(f"GPU: {args.gpu}")
     print("=" * 70)
 
@@ -1091,15 +1236,19 @@ def main():
         return
 
     # ========== CV Training ==========
-    fold_results, mean_ic, std_ic, test_dataset = run_cv_training(args, macro_df, macro_cols)
+    if args.skip_cv:
+        print("\n[*] Skipping CV folds, directly training on FINAL_TEST...")
+        mean_ic, std_ic = None, None
+    else:
+        fold_results, mean_ic, std_ic, test_dataset = run_cv_training(args, macro_df, macro_cols)
 
-    if args.cv_only:
-        print("\n[*] CV-only mode, skipping final model training.")
-        return
+        if args.cv_only:
+            print("\n[*] CV-only mode, skipping final model training.")
+            return
 
     # ========== Train final model ==========
     trainer, test_pred, dataset, model_path, test_labels = train_final_model(
-        args, macro_df, macro_cols, test_dataset
+        args, macro_df, macro_cols, None  # test_dataset not needed, will be created inside
     )
 
     # ========== Evaluate ==========
@@ -1136,7 +1285,10 @@ def main():
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"CV Valid Mean IC: {mean_ic:.4f} (±{std_ic:.4f})")
+    if mean_ic is not None:
+        print(f"CV Valid Mean IC: {mean_ic:.4f} (±{std_ic:.4f})")
+    else:
+        print("CV skipped (--skip-cv mode)")
     print(f"Model saved to: {model_path}")
     print("=" * 70)
 
