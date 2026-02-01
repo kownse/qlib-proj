@@ -1081,7 +1081,12 @@ class Alpha300_Macro(DataHandlerLP):
             self._add_macro_to_processed_data()
 
     def _add_macro_to_processed_data(self):
-        """Add time-aligned macro features to _learn and _infer."""
+        """Add time-aligned macro features to _learn and _infer.
+
+        Uses interaction features (stock × macro) instead of raw macro features
+        because raw macro features have zero cross-sectional variance and cannot
+        help differentiate between stocks.
+        """
         try:
             macro_cols = self._get_macro_feature_columns()
             available_cols = [c for c in macro_cols if c in self._macro_df.columns]
@@ -1097,29 +1102,110 @@ class Alpha300_Macro(DataHandlerLP):
             if missing_cols:
                 print(f"Alpha300_Macro: Missing: {missing_cols}")
 
-            # Add to _learn with temporal expansion
+            # Add to _learn with INTERACTION features (not raw macro)
             if hasattr(self, "_learn") and self._learn is not None:
-                # First normalize stock features to match macro feature scale
+                # First normalize stock features
                 self._learn = self._normalize_stock_features(self._learn)
-                # Then add macro features
-                self._learn = self._expand_macro_temporally(self._learn, available_cols)
-                num_macro_expanded = len(available_cols) * 60
-                d_feat = 5 + len(available_cols)  # 5 base OHLCV + macro
-                total_features = 300 + num_macro_expanded
+                # Add interaction features instead of raw macro
+                self._learn = self._add_interaction_features(self._learn, available_cols)
+
+                # Calculate dimensions
+                num_interaction_expanded = len(available_cols) * 60  # Same as before
+                d_feat = 5 + len(available_cols)
+                total_features = 300 + num_interaction_expanded
                 print(f"Alpha300_Macro: Total features = {total_features}, d_feat = {d_feat}, step_len = 60")
+                print(f"Alpha300_Macro: Using INTERACTION features (stock × macro)")
                 print(f"Alpha300_Macro: Use --d-feat {d_feat} when running TCN")
 
-            # Add to _infer with temporal expansion
+            # Add to _infer with interaction features
             if hasattr(self, "_infer") and self._infer is not None:
-                # First normalize stock features to match macro feature scale
                 self._infer = self._normalize_stock_features(self._infer)
-                # Then add macro features
-                self._infer = self._expand_macro_temporally(self._infer, available_cols)
+                self._infer = self._add_interaction_features(self._infer, available_cols)
 
         except Exception as e:
             print(f"Warning: Error adding macro features: {e}")
             import traceback
             traceback.print_exc()
+
+    def _add_interaction_features(self, df: pd.DataFrame, macro_cols: list) -> pd.DataFrame:
+        """
+        Create interaction features: stock_feature × macro_feature
+
+        Instead of adding raw macro features (which are same for all stocks),
+        we multiply stock returns by macro values. This creates features with
+        cross-sectional variance that can help differentiate stocks.
+
+        For each macro feature M and time step t:
+            interaction_M_t = CLOSE_return_t × M_t
+
+        where CLOSE_return_t = CLOSE_t / CLOSE_0 - 1 (return relative to current)
+
+        This captures "how does this stock's price movement interact with market conditions"
+        """
+        datetime_col = df.index.names[0]
+        main_datetimes = df.index.get_level_values(datetime_col)
+        has_multi_columns = isinstance(df.columns, pd.MultiIndex)
+
+        # Get CLOSE columns to compute returns
+        close_cols = []
+        for col in df.columns:
+            col_name = col[1] if has_multi_columns else col
+            if col_name.startswith('CLOSE'):
+                close_cols.append((col, col_name))
+
+        # Build interaction features
+        expanded_data = {}
+
+        for macro_col in macro_cols:
+            base_series = self._macro_df[macro_col].copy()
+
+            # Apply z-score if needed
+            if macro_col in self.FEATURES_NEED_ZSCORE:
+                rolling_mean = base_series.rolling(window=60, min_periods=20).mean()
+                rolling_std = base_series.rolling(window=60, min_periods=20).std()
+                base_series = (base_series - rolling_mean) / (rolling_std + 1e-8)
+                base_series = base_series.clip(-5, 5)
+
+            for i in range(59, -1, -1):
+                # Get macro value at time t-i
+                shifted_macro = base_series.shift(i)
+                macro_values = shifted_macro.reindex(main_datetimes).values
+
+                # Get corresponding CLOSE feature (already normalized)
+                close_col_name = f"CLOSE{i}"
+                close_col = None
+                for col, name in close_cols:
+                    if name == close_col_name:
+                        close_col = col
+                        break
+
+                if close_col is not None:
+                    # Create interaction: normalized_close × macro
+                    # Both are already z-scored, so product captures interaction
+                    close_values = df[close_col].values
+                    interaction = close_values * macro_values
+
+                    col_name = f"interact_{macro_col}_{i}"
+                    if has_multi_columns:
+                        expanded_data[('feature', col_name)] = interaction
+                    else:
+                        expanded_data[col_name] = interaction
+                else:
+                    # Fallback: just use macro (shouldn't happen)
+                    col_name = f"interact_{macro_col}_{i}"
+                    if has_multi_columns:
+                        expanded_data[('feature', col_name)] = macro_values
+                    else:
+                        expanded_data[col_name] = macro_values
+
+        # Create DataFrame with interaction features
+        expanded_df = pd.DataFrame(expanded_data, index=df.index)
+
+        # Merge
+        merged = pd.concat([df, expanded_df], axis=1, copy=False)
+
+        print(f"Alpha300_Macro: Created {len(expanded_data)} interaction features")
+        return merged.copy()
 
     def _normalize_stock_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
