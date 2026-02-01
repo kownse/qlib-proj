@@ -36,6 +36,27 @@ Architecture (FiLM mode - --film flag):
     - γ > 1 amplifies, γ < 1 dampens features based on market regime
     - More expressive than additive concatenation
 
+Architecture (Residual FiLM mode - --film --residual):
+    Same as FiLM but with residual connection:
+        output = tcn_out + γ * tcn_out + β = (1 + γ) * tcn_out + β
+
+    Residual FiLM Benefits:
+    - Preserves original signal when γ=0
+    - More stable training (identity transform at initialization)
+    - Learns modulation as a delta from identity
+
+Architecture (Layer-wise FiLM mode - --layer-film):
+    Applies FiLM at each TCN layer, not just the output:
+
+    Stock → TCN Layer 0 → FiLM 0 → TCN Layer 1 → FiLM 1 → ... → Linear → pred
+
+    Each FiLM layer uses residual: x = x + γ * x + β
+
+    Layer-wise FiLM Benefits:
+    - Macro can influence feature extraction at every level
+    - More expressive than output-only modulation
+    - ~10k extra params (vs ~2k for output-only FiLM)
+
 Key Design:
     - Stock features only through TCN: (5, 60) = CLOSE, OPEN, HIGH, LOW, VOLUME × 60 days
     - Macro features via MLP: N current-day values
@@ -57,8 +78,15 @@ Usage:
 
     # FiLM conditioning (multiplicative macro interaction)
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --skip-cv
-    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --film-hidden 16 --skip-cv
-    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --film-hidden 64 --skip-cv
+
+    # Residual FiLM (recommended for stability)
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --film --residual --skip-cv
+
+    # Layer-wise FiLM (FiLM at each TCN layer)
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --layer-film --skip-cv
+
+    # Layer-wise FiLM with custom residual setting
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core --layer-film --residual --skip-cv
 
     # With backtest
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --backtest
@@ -246,13 +274,17 @@ class TCNWithMacroFiLM(nn.Module):
     """
     TCN with FiLM (Feature-wise Linear Modulation) conditioning.
 
-    FiLM applies per-channel modulation: y = γ * tcn_out + β
-    where γ and β are generated from macro features.
+    Standard FiLM: y = γ * tcn_out + β
+    Residual FiLM: y = tcn_out + γ * tcn_out + β = (1 + γ) * tcn_out + β
 
     Benefits over concatenation:
     - Multiplicative interaction: macro controls signal strength
     - γ > 1 amplifies, γ < 1 dampens features based on market regime
     - More expressive than additive concatenation
+
+    Residual FiLM benefits:
+    - Preserves original signal when γ=0
+    - More stable training (identity transform at initialization)
     """
 
     def __init__(
@@ -263,6 +295,7 @@ class TCNWithMacroFiLM(nn.Module):
         dropout: float,
         n_macro: int = 6,
         film_hidden: int = 32,
+        residual: bool = False,
     ):
         """
         Args:
@@ -272,11 +305,13 @@ class TCNWithMacroFiLM(nn.Module):
             dropout: Dropout rate
             n_macro: Number of macro features
             film_hidden: Hidden layer size for FiLM generator
+            residual: If True, use residual FiLM: y = tcn + γ*tcn + β
         """
         super().__init__()
 
         self.num_input = num_input
         self.n_macro = n_macro
+        self.residual = residual
         tcn_out_size = num_channels[-1]
 
         # TCN backbone
@@ -290,10 +325,12 @@ class TCNWithMacroFiLM(nn.Module):
             nn.Linear(film_hidden, tcn_out_size * 2)  # gamma + beta
         )
 
-        # Initialize gamma close to 1, beta close to 0
+        # Initialize: gamma=0, beta=0 for residual; gamma=1, beta=0 for standard
         nn.init.zeros_(self.film_generator[-1].weight)
         nn.init.zeros_(self.film_generator[-1].bias)
-        self.film_generator[-1].bias.data[:tcn_out_size] = 1.0  # gamma = 1
+        if not residual:
+            self.film_generator[-1].bias.data[:tcn_out_size] = 1.0  # gamma = 1
+        # else: gamma=0 (already zeros), so (1+0)*x + 0 = x (identity)
 
         # Prediction head
         self.fc = nn.Linear(tcn_out_size, 1)
@@ -318,13 +355,124 @@ class TCNWithMacroFiLM(nn.Module):
         film_params = self.film_generator(x_macro)  # (batch, 2*n_chans)
         gamma, beta = film_params.chunk(2, dim=1)   # (batch, n_chans) each
 
-        # Apply FiLM: y = γ * x + β
-        modulated = gamma * tcn_out + beta
+        # Apply FiLM
+        if self.residual:
+            # Residual FiLM: output = tcn + γ*tcn + β = (1+γ)*tcn + β
+            modulated = tcn_out + gamma * tcn_out + beta
+        else:
+            # Standard FiLM: output = γ*tcn + β
+            modulated = gamma * tcn_out + beta
 
         # Prediction
         out = self.dropout_layer(modulated)
         out = self.fc(out)
 
+        return out.squeeze(-1)
+
+
+class TCNWithMacroLayerFiLM(nn.Module):
+    """
+    TCN with FiLM conditioning at each layer.
+
+    Applies FiLM modulation at each TCN layer output, allowing macro features
+    to influence feature extraction at every level of the network.
+
+    Architecture:
+        Stock → TCN Layer 0 → FiLM 0 → TCN Layer 1 → FiLM 1 → ... → Linear → pred
+    """
+
+    def __init__(
+        self,
+        num_input: int,
+        num_channels: list,
+        kernel_size: int,
+        dropout: float,
+        n_macro: int = 6,
+        film_hidden: int = 32,
+        residual: bool = True,
+    ):
+        """
+        Args:
+            num_input: Number of input features per timestep (d_feat)
+            num_channels: List of channel sizes for TCN layers
+            kernel_size: Kernel size for TCN convolutions
+            dropout: Dropout rate
+            n_macro: Number of macro features
+            film_hidden: Hidden layer size for FiLM generator
+            residual: If True, use residual FiLM: y = x + γ*x + β (default: True)
+        """
+        super().__init__()
+
+        self.num_input = num_input
+        self.n_macro = n_macro
+        self.num_layers = len(num_channels)
+        self.residual = residual
+
+        # Import TemporalBlock from qlib
+        from qlib.contrib.model.tcn import TemporalBlock
+
+        # Build TCN layers manually
+        self.tcn_layers = nn.ModuleList()
+        for i in range(self.num_layers):
+            dilation = 2 ** i
+            in_ch = num_input if i == 0 else num_channels[i-1]
+            out_ch = num_channels[i]
+            padding = (kernel_size - 1) * dilation
+            self.tcn_layers.append(
+                TemporalBlock(in_ch, out_ch, kernel_size, 1, dilation, padding, dropout)
+            )
+
+        # FiLM generator for each layer
+        self.film_generators = nn.ModuleList()
+        for i in range(self.num_layers):
+            out_ch = num_channels[i]
+            gen = nn.Sequential(
+                nn.Linear(n_macro, film_hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(film_hidden, out_ch * 2)  # gamma + beta
+            )
+            # Initialize gamma=0 for residual mode (identity at start)
+            nn.init.zeros_(gen[-1].weight)
+            nn.init.zeros_(gen[-1].bias)
+            self.film_generators.append(gen)
+
+        # Prediction head
+        self.fc = nn.Linear(num_channels[-1], 1)
+        self.dropout_layer = nn.Dropout(dropout)
+
+    def forward(self, x_stock, x_macro):
+        """
+        Forward pass with layer-wise FiLM conditioning.
+
+        Args:
+            x_stock: Stock features (batch, d_feat, step_len)
+            x_macro: Macro features (batch, n_macro)
+
+        Returns:
+            predictions: (batch,)
+        """
+        x = x_stock  # (batch, d_feat, step_len)
+
+        for i, (tcn_layer, film_gen) in enumerate(zip(self.tcn_layers, self.film_generators)):
+            # TCN layer
+            x = tcn_layer(x)  # (batch, n_chans, step_len)
+
+            # Generate FiLM params
+            film_params = film_gen(x_macro)  # (batch, 2*n_chans)
+            gamma, beta = film_params.chunk(2, dim=1)  # (batch, n_chans) each
+
+            # Expand for broadcasting: (batch, n_chans, 1)
+            gamma = gamma.unsqueeze(-1)
+            beta = beta.unsqueeze(-1)
+
+            # Apply FiLM (always residual for layer-wise)
+            x = x + gamma * x + beta
+
+        # Take last timestep
+        out = x[:, :, -1]  # (batch, n_chans)
+        out = self.dropout_layer(out)
+        out = self.fc(out)
         return out.squeeze(-1)
 
 
@@ -510,6 +658,8 @@ class TCNMacroTrainer:
         seed: int = None,
         use_film: bool = False,
         film_hidden: int = 32,
+        residual: bool = False,
+        use_layer_film: bool = False,
     ):
         self.d_feat = d_feat
         self.n_macro = n_macro
@@ -525,6 +675,8 @@ class TCNMacroTrainer:
         self.seed = seed
         self.use_film = use_film
         self.film_hidden = film_hidden
+        self.residual = residual
+        self.use_layer_film = use_layer_film
 
         self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() and gpu >= 0 else "cpu")
 
@@ -539,7 +691,19 @@ class TCNMacroTrainer:
 
     def _init_model(self):
         """Initialize the model."""
-        if self.use_film:
+        if self.use_layer_film:
+            # Layer-wise FiLM: apply FiLM at each TCN layer
+            self.model = TCNWithMacroLayerFiLM(
+                num_input=self.d_feat,
+                num_channels=[self.n_chans] * self.num_layers,
+                kernel_size=self.kernel_size,
+                dropout=self.dropout,
+                n_macro=self.n_macro,
+                film_hidden=self.film_hidden,
+                residual=self.residual,
+            )
+        elif self.use_film:
+            # Standard or Residual FiLM at output only
             self.model = TCNWithMacroFiLM(
                 num_input=self.d_feat,
                 num_channels=[self.n_chans] * self.num_layers,
@@ -547,8 +711,10 @@ class TCNMacroTrainer:
                 dropout=self.dropout,
                 n_macro=self.n_macro,
                 film_hidden=self.film_hidden,
+                residual=self.residual,
             )
         else:
+            # Concatenation-based conditioning
             self.model = TCNWithMacro(
                 num_input=self.d_feat,
                 num_channels=[self.n_chans] * self.num_layers,
@@ -683,6 +849,8 @@ class TCNMacroTrainer:
                 'hidden_size': self.hidden_size,
                 'use_film': self.use_film,
                 'film_hidden': self.film_hidden,
+                'residual': self.residual,
+                'use_layer_film': self.use_layer_film,
             }
         }, path)
 
@@ -700,6 +868,8 @@ class TCNMacroTrainer:
         self.hidden_size = config.get('hidden_size', 16)
         self.use_film = config.get('use_film', False)
         self.film_hidden = config.get('film_hidden', 32)
+        self.residual = config.get('residual', False)
+        self.use_layer_film = config.get('use_layer_film', False)
 
         self._init_model()
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -929,6 +1099,8 @@ def run_cv_training(args, macro_df, macro_cols):
             seed=args.seed + fold_idx if args.seed else None,
             use_film=args.film,
             film_hidden=args.film_hidden,
+            residual=args.residual,
+            use_layer_film=args.layer_film,
         )
 
         best_epoch, best_loss = trainer.fit(
@@ -1021,6 +1193,8 @@ def train_final_model(args, macro_df, macro_cols, test_dataset):
         seed=args.seed,
         use_film=args.film,
         film_hidden=args.film_hidden,
+        residual=args.residual,
+        use_layer_film=args.layer_film,
     )
 
     best_epoch, best_loss = trainer.fit(train_loader, valid_loader, verbose=True)
@@ -1033,7 +1207,15 @@ def train_final_model(args, macro_df, macro_cols, test_dataset):
     # Save model
     MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    film_suffix = "_film" if args.film else ""
+    # Build model suffix
+    if args.layer_film:
+        film_suffix = "_layerfilm"
+    elif args.film:
+        film_suffix = "_film"
+    else:
+        film_suffix = ""
+    if args.residual and (args.film or args.layer_film):
+        film_suffix += "_res"
     model_path = MODEL_SAVE_PATH / f"tcn_macro_cv_{args.stock_pool}_{args.nday}d_m{args.n_macro}{film_suffix}_{timestamp}.pt"
     trainer.save(model_path)
     print(f"    Model saved to: {model_path}")
@@ -1092,6 +1274,10 @@ def main():
                         help='Use FiLM conditioning instead of concatenation')
     parser.add_argument('--film-hidden', type=int, default=32,
                         help='FiLM generator hidden layer size (default: 32)')
+    parser.add_argument('--residual', action='store_true',
+                        help='Use residual FiLM: output = tcn + γ*tcn + β (default: False)')
+    parser.add_argument('--layer-film', action='store_true',
+                        help='Apply FiLM at each TCN layer (default: output only)')
 
     # Training parameters
     parser.add_argument('--n-epochs', type=int, default=200,
@@ -1155,14 +1341,25 @@ def main():
     args.n_macro = len(macro_cols)
 
     print("\n" + "=" * 70)
-    conditioning_type = "FiLM" if args.film else "Concat"
+    # Determine conditioning type string
+    if args.layer_film:
+        conditioning_type = "Layer-wise FiLM"
+        if args.residual:
+            conditioning_type += " (Residual)"
+    elif args.film:
+        conditioning_type = "FiLM"
+        if args.residual:
+            conditioning_type += " (Residual)"
+    else:
+        conditioning_type = "Concat"
     print(f"TCN with Macro Conditioning ({conditioning_type}) - US Data")
     print("=" * 70)
     print(f"Stock Pool: {args.stock_pool}")
     print(f"N-day: {args.nday}")
     print(f"Stock d_feat: {args.d_feat}, step_len: {args.step_len}")
     print(f"Macro features ({args.n_macro}): {macro_cols}")
-    print(f"Conditioning: {conditioning_type}" + (f" (hidden={args.film_hidden})" if args.film else f" (hidden={args.hidden_size})"))
+    cond_detail = f" (hidden={args.film_hidden})" if (args.film or args.layer_film) else f" (hidden={args.hidden_size})"
+    print(f"Conditioning: {conditioning_type}{cond_detail}")
     print(f"TCN: {args.n_chans} channels × {args.num_layers} layers, kernel={args.kernel_size}")
     print(f"GPU: {args.gpu}")
     print("=" * 70)
