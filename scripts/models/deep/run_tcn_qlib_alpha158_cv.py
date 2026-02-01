@@ -431,6 +431,18 @@ def create_handler_for_fold(args, fold_config):
             fit_start_time=fold_config['train_start'],
             fit_end_time=fold_config['train_end'],
         )
+    elif 'macro' in args.handler:
+        # Handler with macro features - pass macro_features argument
+        HandlerClass = get_handler_class(args.handler)
+        handler = HandlerClass(
+            volatility_window=args.nday,
+            instruments=STOCK_POOLS[args.stock_pool],
+            start_time=fold_config['train_start'],
+            end_time=end_time,
+            fit_start_time=fold_config['train_start'],
+            fit_end_time=fold_config['train_end'],
+            macro_features=args.macro_features,
+        )
     else:
         # 使用通用 handler
         HandlerClass = get_handler_class(args.handler)
@@ -974,6 +986,12 @@ def main():
     parser.add_argument('--strategy', type=str, default='topk',
                         choices=['topk', 'dynamic_risk', 'vol_stoploss'])
 
+    # Macro feature options for alpha300-macro handler
+    parser.add_argument('--macro-features', type=str, default='minimal',
+                        choices=['none', 'single', 'duo', 'minimal', 'core', 'vix_only', 'all'],
+                        help='Macro feature set: single (VIX only, d_feat=6), duo (VIX+credit, d_feat=7), '
+                             'minimal (6 features, d_feat=11), none (pure alpha300, d_feat=5)')
+
     args = parser.parse_args()
 
     # 验证参数
@@ -982,10 +1000,26 @@ def main():
 
     # 从 handler 配置自动获取 d_feat 和 step_len（如果未指定）
     handler_cfg = TS_HANDLER_CONFIG[args.handler]
-    if args.d_feat is None:
-        args.d_feat = handler_cfg['d_feat']
     if args.step_len is None:
         args.step_len = handler_cfg['step_len']
+
+    # Calculate d_feat dynamically for macro handlers
+    if args.d_feat is None:
+        if 'macro' in args.handler:
+            # d_feat = 5 (OHLCV) + number of macro features
+            macro_feat_count = {
+                'none': 0,
+                'single': 1,
+                'duo': 2,
+                'minimal': 6,
+                'vix_only': 13,  # approximate
+                'core': 23,     # approximate
+                'all': 109,     # approximate
+            }
+            args.d_feat = 5 + macro_feat_count.get(args.macro_features, 6)
+            print(f"[*] Auto-detected d_feat={args.d_feat} for {args.handler} with macro_features={args.macro_features}")
+        else:
+            args.d_feat = handler_cfg['d_feat']
 
     # 检查是否需要 TA-Lib
     handler_meta = HANDLER_CONFIG.get(args.handler, {})

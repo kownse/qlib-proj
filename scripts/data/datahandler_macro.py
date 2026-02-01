@@ -993,6 +993,19 @@ class Alpha300_Macro(DataHandlerLP):
         "macro_risk_on_off",
     ]
 
+    # Single macro feature - just VIX (most important, minimal noise)
+    # Use macro_features="single" for d_feat=6
+    SINGLE_MACRO_FEATURES = [
+        "macro_vix_zscore20",
+    ]
+
+    # Two key macro features - VIX + credit stress
+    # Use macro_features="duo" for d_feat=7
+    DUO_MACRO_FEATURES = [
+        "macro_vix_zscore20",
+        "macro_credit_stress",
+    ]
+
     def __init__(
         self,
         volatility_window: int = 2,
@@ -1325,6 +1338,10 @@ class Alpha300_Macro(DataHandlerLP):
         """Get macro feature columns based on configuration."""
         if self.macro_features == "minimal":
             return self.MINIMAL_MACRO_FEATURES
+        elif self.macro_features == "single":
+            return self.SINGLE_MACRO_FEATURES
+        elif self.macro_features == "duo":
+            return self.DUO_MACRO_FEATURES
         elif self.macro_features == "core":
             return self.CORE_MACRO_FEATURES
         elif self.macro_features == "vix_only":
