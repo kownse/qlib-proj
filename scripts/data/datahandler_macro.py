@@ -1099,6 +1099,9 @@ class Alpha300_Macro(DataHandlerLP):
 
             # Add to _learn with temporal expansion
             if hasattr(self, "_learn") and self._learn is not None:
+                # First normalize stock features to match macro feature scale
+                self._learn = self._normalize_stock_features(self._learn)
+                # Then add macro features
                 self._learn = self._expand_macro_temporally(self._learn, available_cols)
                 num_macro_expanded = len(available_cols) * 60
                 d_feat = 5 + len(available_cols)  # 5 base OHLCV + macro
@@ -1108,12 +1111,53 @@ class Alpha300_Macro(DataHandlerLP):
 
             # Add to _infer with temporal expansion
             if hasattr(self, "_infer") and self._infer is not None:
+                # First normalize stock features to match macro feature scale
+                self._infer = self._normalize_stock_features(self._infer)
+                # Then add macro features
                 self._infer = self._expand_macro_temporally(self._infer, available_cols)
 
         except Exception as e:
             print(f"Warning: Error adding macro features: {e}")
             import traceback
             traceback.print_exc()
+
+    def _normalize_stock_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize Alpha300 stock features (CLOSE, OPEN, HIGH, LOW, VOLUME) to have std ≈ 1.0.
+
+        Problem: Stock price features have std ~0.08, VOLUME has std ~0.45,
+        while macro features have std ~1.0. This scale difference causes TCN
+        to focus on macro features and ignore stock features.
+
+        Solution: Z-score normalize all stock features so all features have similar scale.
+        """
+        has_multi_columns = isinstance(df.columns, pd.MultiIndex)
+
+        # Identify all stock feature columns (CLOSE, OPEN, HIGH, LOW, VOLUME)
+        stock_prefixes = ['CLOSE', 'OPEN', 'HIGH', 'LOW', 'VOLUME']
+        stock_cols = []
+        for col in df.columns:
+            col_name = col[1] if has_multi_columns else col
+            if any(col_name.startswith(prefix) for prefix in stock_prefixes):
+                stock_cols.append(col)
+
+        if not stock_cols:
+            return df
+
+        # Apply z-score normalization to all stock features
+        df = df.copy()
+        for col in stock_cols:
+            col_data = df[col]
+            mean = col_data.mean()
+            std = col_data.std()
+            if std > 1e-8:
+                # Z-score normalization
+                normalized = (col_data - mean) / std
+                # Clip extreme values to prevent outliers from dominating
+                df[col] = normalized.clip(-5, 5)
+
+        print(f"Alpha300_Macro: Normalized {len(stock_cols)} stock features to std≈1.0")
+        return df
 
     # Features that need z-score normalization (small std, not already z-scored)
     FEATURES_NEED_ZSCORE = [
