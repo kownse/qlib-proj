@@ -2,7 +2,7 @@
 TCN with Macro Conditioning - Cross-Validation Training Script
 
 Architecture:
-    Input: Stock features (batch, 5, 60)  +  Macro features (batch, 6)
+    Input: Stock features (batch, 5, 60)  +  Macro features (batch, N)
                         ↓                              ↓
                   TemporalConvNet                      │
                         ↓                              │
@@ -10,9 +10,9 @@ Architecture:
                         ↓                              │
                      Concat ←──────────────────────────┘
                         ↓
-             (batch, 32 + 6 = 38)
+             (batch, 32 + N)
                         ↓
-                  Linear(38, 16) + ReLU
+                  Linear(32+N, 16) + ReLU
                         ↓
                   Linear(16, 1)
                         ↓
@@ -20,13 +20,18 @@ Architecture:
 
 Key Design:
     - Stock features only through TCN: (5, 60) = CLOSE, OPEN, HIGH, LOW, VOLUME × 60 days
-    - Macro features via MLP: 6 current-day values (MINIMAL_MACRO_FEATURES)
+    - Macro features via MLP: N current-day values
+        - minimal (default): 6 features (MINIMAL_MACRO_FEATURES)
+        - core: 23 features (CORE_MACRO_FEATURES) - VIX, macro assets, benchmark, credit, treasury, cross-asset
     - Concat after TCN: Combine temporal embedding with macro conditioning
     - Small MLP: Learn non-linear stock×macro interactions
 
 Usage:
-    # Basic CV training
+    # Basic CV training with minimal macro features (6)
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500
+
+    # With CORE macro features (23 features)
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --macro-set core
 
     # With backtest
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --backtest
@@ -35,6 +40,7 @@ Usage:
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --n-macro 1  # VIX only
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --n-macro 2  # VIX + credit
     python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --n-macro 6  # all minimal
+    python scripts/models/deep/run_tcn_macro_cv.py --stock-pool sp500 --n-macro 23  # all core
 """
 
 import os
@@ -103,10 +109,34 @@ MINIMAL_MACRO_FEATURES = [
 SINGLE_MACRO_FEATURES = ["macro_vix_zscore20"]
 DUO_MACRO_FEATURES = ["macro_vix_zscore20", "macro_credit_stress"]
 
+# CORE macro features (23) - comprehensive set from datahandler_macro.py
+CORE_MACRO_FEATURES = [
+    # VIX (5)
+    "macro_vix_level", "macro_vix_zscore20", "macro_vix_pct_5d",
+    "macro_vix_regime", "macro_vix_term_structure",
+    # Macro Assets (5)
+    "macro_gld_pct_5d", "macro_tlt_pct_5d", "macro_yield_curve",
+    "macro_uup_pct_5d", "macro_uso_pct_5d",
+    # Benchmark (2)
+    "macro_spy_pct_5d", "macro_spy_vol20",
+    # Credit (3)
+    "macro_hyg_vs_lqd", "macro_credit_stress", "macro_hy_spread_zscore",
+    # Global (2)
+    "macro_eem_vs_spy", "macro_global_risk",
+    # Treasury (3)
+    "macro_yield_10y", "macro_yield_2s10s", "macro_yield_inversion",
+    # Cross-asset (3)
+    "macro_risk_on_off", "macro_market_stress", "macro_hy_spread",
+]
+
 # Features that need z-score normalization (small std)
 FEATURES_NEED_ZSCORE = [
     "macro_tlt_pct_20d",
+    "macro_tlt_pct_5d",
     "macro_uso_pct_5d",
+    "macro_gld_pct_5d",
+    "macro_uup_pct_5d",
+    "macro_spy_pct_5d",
 ]
 
 
@@ -312,22 +342,35 @@ def prepare_macro_features(
     return macro_aligned.values
 
 
-def get_macro_feature_list(n_macro: int) -> list:
+def get_macro_feature_list(n_macro: int = None, macro_set: str = "minimal") -> list:
     """
-    Get macro feature list based on n_macro count.
+    Get macro feature list based on macro_set or n_macro count.
 
     Args:
-        n_macro: Number of macro features to use (1, 2, or 6)
+        n_macro: Number of macro features to use (1, 2, 6, or up to 23).
+                 If specified, overrides macro_set for counts > 6.
+        macro_set: Macro feature set: 'minimal' (6), 'core' (23)
 
     Returns:
         List of macro feature column names
     """
-    if n_macro == 1:
-        return SINGLE_MACRO_FEATURES
-    elif n_macro == 2:
-        return DUO_MACRO_FEATURES
+    # If n_macro is explicitly specified, use it to determine features
+    if n_macro is not None:
+        if n_macro == 1:
+            return SINGLE_MACRO_FEATURES
+        elif n_macro == 2:
+            return DUO_MACRO_FEATURES
+        elif n_macro <= 6:
+            return MINIMAL_MACRO_FEATURES[:n_macro]
+        else:
+            # For n_macro > 6, use CORE features
+            return CORE_MACRO_FEATURES[:n_macro]
+
+    # Otherwise, use macro_set
+    if macro_set == "core":
+        return CORE_MACRO_FEATURES  # 23 features
     else:
-        return MINIMAL_MACRO_FEATURES[:n_macro]
+        return MINIMAL_MACRO_FEATURES  # 6 features (default)
 
 
 # ============================================================================
@@ -885,9 +928,12 @@ def main():
                         help='Time series length (default: 60)')
 
     # Macro feature parameters
-    parser.add_argument('--n-macro', type=int, default=6,
-                        choices=[1, 2, 3, 4, 5, 6],
-                        help='Number of macro features: 1=VIX, 2=VIX+credit, 6=all minimal (default: 6)')
+    parser.add_argument('--macro-set', type=str, default='minimal',
+                        choices=['minimal', 'core'],
+                        help='Macro feature set: minimal (6) or core (23) (default: minimal)')
+    parser.add_argument('--n-macro', type=int, default=None,
+                        help='Number of macro features (overrides --macro-set if specified). '
+                             '1-6 uses minimal features, 7-23 uses core features.')
     parser.add_argument('--macro-lag', type=int, default=1,
                         help='Days to lag macro features (default: 1)')
     parser.add_argument('--macro-path', type=str, default=None,
@@ -952,7 +998,7 @@ def main():
     macro_df = load_macro_df(macro_path)
 
     # Get macro feature list
-    macro_cols = get_macro_feature_list(args.n_macro)
+    macro_cols = get_macro_feature_list(n_macro=args.n_macro, macro_set=args.macro_set)
 
     # Verify macro features are available
     available_cols = [c for c in macro_cols if c in macro_df.columns]
@@ -960,7 +1006,9 @@ def main():
         missing = set(macro_cols) - set(available_cols)
         print(f"Warning: Missing macro features: {missing}")
         macro_cols = available_cols
-        args.n_macro = len(macro_cols)
+
+    # Set n_macro to actual count for model configuration
+    args.n_macro = len(macro_cols)
 
     print("\n" + "=" * 70)
     print("TCN with Macro Conditioning - US Data")
