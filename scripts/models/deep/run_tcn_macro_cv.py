@@ -660,6 +660,9 @@ class TCNMacroTrainer:
         film_hidden: int = 32,
         residual: bool = False,
         use_layer_film: bool = False,
+        weight_decay: float = 0.0,
+        loss_type: str = "mse",
+        huber_delta: float = 0.1,
     ):
         self.d_feat = d_feat
         self.n_macro = n_macro
@@ -677,6 +680,9 @@ class TCNMacroTrainer:
         self.film_hidden = film_hidden
         self.residual = residual
         self.use_layer_film = use_layer_film
+        self.weight_decay = weight_decay
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
 
         self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() and gpu >= 0 else "cpu")
 
@@ -724,14 +730,33 @@ class TCNMacroTrainer:
                 hidden_size=self.hidden_size,
             )
         self.model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay
+        )
 
-    def _mse_loss(self, pred, label):
-        """MSE loss with NaN handling."""
+    def _compute_loss(self, pred, label):
+        """Compute loss with NaN handling. Supports MSE and Huber loss."""
         mask = ~torch.isnan(label)
         if mask.sum() == 0:
             return torch.tensor(0.0, device=self.device)
-        return ((pred[mask] - label[mask]) ** 2).mean()
+
+        pred_valid = pred[mask]
+        label_valid = label[mask]
+
+        if self.loss_type == "huber":
+            # Huber loss: less sensitive to outliers
+            loss = nn.functional.huber_loss(
+                pred_valid, label_valid,
+                reduction='mean',
+                delta=self.huber_delta
+            )
+        else:
+            # MSE loss (default)
+            loss = ((pred_valid - label_valid) ** 2).mean()
+
+        return loss
 
     def _train_epoch(self, data_loader):
         """Train one epoch."""
@@ -745,7 +770,7 @@ class TCNMacroTrainer:
             label = label.to(self.device)
 
             pred = self.model(stock_feat, macro_feat)
-            loss = self._mse_loss(pred, label)
+            loss = self._compute_loss(pred, label)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -851,6 +876,9 @@ class TCNMacroTrainer:
                 'film_hidden': self.film_hidden,
                 'residual': self.residual,
                 'use_layer_film': self.use_layer_film,
+                'weight_decay': self.weight_decay,
+                'loss_type': self.loss_type,
+                'huber_delta': self.huber_delta,
             }
         }, path)
 
@@ -870,6 +898,9 @@ class TCNMacroTrainer:
         self.film_hidden = config.get('film_hidden', 32)
         self.residual = config.get('residual', False)
         self.use_layer_film = config.get('use_layer_film', False)
+        self.weight_decay = config.get('weight_decay', 0.0)
+        self.loss_type = config.get('loss_type', 'mse')
+        self.huber_delta = config.get('huber_delta', 0.1)
 
         self._init_model()
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -1101,6 +1132,9 @@ def run_cv_training(args, macro_df, macro_cols):
             film_hidden=args.film_hidden,
             residual=args.residual,
             use_layer_film=args.layer_film,
+            weight_decay=args.weight_decay,
+            loss_type=args.loss,
+            huber_delta=args.huber_delta,
         )
 
         best_epoch, best_loss = trainer.fit(
@@ -1195,6 +1229,9 @@ def train_final_model(args, macro_df, macro_cols, test_dataset):
         film_hidden=args.film_hidden,
         residual=args.residual,
         use_layer_film=args.layer_film,
+        weight_decay=args.weight_decay,
+        loss_type=args.loss,
+        huber_delta=args.huber_delta,
     )
 
     best_epoch, best_loss = trainer.fit(train_loader, valid_loader, verbose=True)
@@ -1288,6 +1325,13 @@ def main():
                         help='Batch size (default: 2000)')
     parser.add_argument('--early-stop', type=int, default=20,
                         help='Early stopping patience (default: 20)')
+    parser.add_argument('--weight-decay', type=float, default=0.0,
+                        help='L2 regularization weight decay (default: 0.0)')
+    parser.add_argument('--loss', type=str, default='mse',
+                        choices=['mse', 'huber'],
+                        help='Loss function: mse or huber (default: mse)')
+    parser.add_argument('--huber-delta', type=float, default=0.1,
+                        help='Huber loss delta parameter (default: 0.1)')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
     parser.add_argument('--seed', type=int, default=None,
@@ -1361,6 +1405,8 @@ def main():
     cond_detail = f" (hidden={args.film_hidden})" if (args.film or args.layer_film) else f" (hidden={args.hidden_size})"
     print(f"Conditioning: {conditioning_type}{cond_detail}")
     print(f"TCN: {args.n_chans} channels × {args.num_layers} layers, kernel={args.kernel_size}")
+    loss_info = f"Loss: {args.loss}" + (f" (delta={args.huber_delta})" if args.loss == "huber" else "")
+    print(f"{loss_info}, Weight Decay: {args.weight_decay}")
     print(f"GPU: {args.gpu}")
     print("=" * 70)
 
