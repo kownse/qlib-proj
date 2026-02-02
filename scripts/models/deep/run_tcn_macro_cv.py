@@ -816,6 +816,7 @@ class TCNMacroTrainer:
         best_epoch = 0
         best_params = None
         stop_steps = 0
+        nan_detected = False
 
         for epoch in range(self.n_epochs):
             train_loss = self._train_epoch(train_loader)
@@ -823,6 +824,20 @@ class TCNMacroTrainer:
 
             if verbose:
                 print(f"    Epoch {epoch+1:3d}: train_loss={train_loss:.6f}, valid_loss={valid_loss:.6f}")
+
+            # NaN protection: detect and recover
+            if np.isnan(train_loss) or np.isnan(valid_loss):
+                nan_detected = True
+                if verbose:
+                    print(f"    ⚠️  NaN detected at epoch {epoch+1}!")
+                if best_params is not None:
+                    self.model.load_state_dict(best_params)
+                    if verbose:
+                        print(f"    ↩️  Restored best checkpoint from epoch {best_epoch+1}")
+                else:
+                    if verbose:
+                        print(f"    ⚠️  No valid checkpoint to restore, training failed")
+                break
 
             if valid_loss < best_loss:
                 best_loss = valid_loss
@@ -836,7 +851,7 @@ class TCNMacroTrainer:
                         print(f"    Early stop at epoch {epoch+1}")
                     break
 
-        if best_params is not None:
+        if best_params is not None and not nan_detected:
             self.model.load_state_dict(best_params)
 
         self.fitted = True
