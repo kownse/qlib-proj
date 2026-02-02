@@ -1101,7 +1101,7 @@ def main():
                         help='Learning rate (default: 1e-4)')
     parser.add_argument('--batch-size', type=int, default=2000,
                         help='Batch size (default: 2000)')
-    parser.add_argument('--early-stop', type=int, default=20,
+    parser.add_argument('--early-stop', type=int, default=10,
                         help='Early stopping patience (default: 20)')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
