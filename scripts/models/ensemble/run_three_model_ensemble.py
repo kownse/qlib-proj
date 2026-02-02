@@ -1,7 +1,7 @@
 """
-Three-Model Ensemble: AE-MLP + CatBoost + TCN
+Three-Model Ensemble: AE-MLP + CatBoost + TCN-FiLM
 
-Load pre-trained AE-MLP, CatBoost, and TCN models, generate predictions on test set,
+Load pre-trained AE-MLP, CatBoost, and TCN-FiLM models, generate predictions on test set,
 learn optimal ensemble weights, and compute IC.
 
 Usage:
@@ -18,7 +18,7 @@ Usage:
     python scripts/models/ensemble/run_three_model_ensemble.py \
         --ae-model my_models/ae_mlp.keras \
         --cb-model my_models/catboost.cbm \
-        --tcn-model my_models/tcn.pt
+        --tcn-model my_models/tcn_film.pt
 """
 
 import os
@@ -28,6 +28,8 @@ os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['NUMEXPR_NUM_THREADS'] = '1'
+os.environ['JOBLIB_START_METHOD'] = 'fork'
+os.environ['LOKY_MAX_CPU_COUNT'] = '1'
 
 import sys
 from pathlib import Path
@@ -70,72 +72,106 @@ from models.common import (
     FINAL_TEST,
 )
 from models.deep.ae_mlp_model import AEMLP
+from models.deep.tcn_film import TCNFiLM
 
 
 # ============================================================================
-# TCN Model Components (imported from run_tcn_qlib_alpha158_cv.py)
+# TCN-FiLM Components (using macro conditioning)
 # ============================================================================
 
-from qlib.contrib.model.tcn import TemporalConvNet
-import torch.nn as nn
+# Macro configuration
+DEFAULT_MACRO_PATH = PROJECT_ROOT / "my_data" / "macro_processed" / "macro_features.parquet"
+
+CORE_MACRO_FEATURES = [
+    "macro_vix_level", "macro_vix_zscore20", "macro_vix_pct_5d",
+    "macro_vix_regime", "macro_vix_term_structure",
+    "macro_gld_pct_5d", "macro_tlt_pct_5d", "macro_yield_curve",
+    "macro_uup_pct_5d", "macro_uso_pct_5d",
+    "macro_spy_pct_5d", "macro_spy_vol20",
+    "macro_hyg_vs_lqd", "macro_credit_stress", "macro_hy_spread_zscore",
+    "macro_eem_vs_spy", "macro_global_risk",
+    "macro_yield_10y", "macro_yield_2s10s", "macro_yield_inversion",
+    "macro_risk_on_off", "macro_market_stress", "macro_hy_spread",
+]
+
+FEATURES_NEED_ZSCORE = [
+    "macro_tlt_pct_20d", "macro_tlt_pct_5d", "macro_uso_pct_5d",
+    "macro_gld_pct_5d", "macro_uup_pct_5d", "macro_spy_pct_5d",
+]
 
 
-class TCNModel(nn.Module):
-    """TCN Model - consistent with Qlib benchmark"""
-
-    def __init__(self, num_input, output_size, num_channels, kernel_size, dropout):
-        super().__init__()
-        self.num_input = num_input
-        self.tcn = TemporalConvNet(num_input, num_channels, kernel_size, dropout=dropout)
-        self.linear = nn.Linear(num_channels[-1], output_size)
-
-    def forward(self, x):
-        output = self.tcn(x)
-        output = self.linear(output[:, :, -1])
-        return output.squeeze()
+def load_macro_df(path=None):
+    """Load macro features DataFrame"""
+    path = path or DEFAULT_MACRO_PATH
+    df = pd.read_parquet(path)
+    return df
 
 
-class TCNTrainer:
-    """TCN Trainer for loading and predicting"""
+def prepare_macro(index, macro_df, macro_cols, lag=1):
+    """Prepare macro features aligned to stock index"""
+    dates = index.get_level_values('datetime')
+    available = [c for c in macro_cols if c in macro_df.columns]
+    macro = macro_df[available].copy()
+
+    # Z-score normalize momentum features
+    for col in available:
+        if col in FEATURES_NEED_ZSCORE:
+            roll_mean = macro[col].rolling(60, min_periods=20).mean()
+            roll_std = macro[col].rolling(60, min_periods=20).std()
+            macro[col] = ((macro[col] - roll_mean) / (roll_std + 1e-8)).clip(-5, 5)
+
+    if lag > 0:
+        macro = macro.shift(lag)
+
+    return macro.reindex(dates).fillna(0).values
+
+
+class TCNMacroDataset(torch.utils.data.Dataset):
+    """Dataset for TCN-FiLM with macro conditioning"""
+
+    def __init__(self, stock_features, macro_features, labels, d_feat, step_len):
+        self.stock = stock_features.reshape(-1, d_feat, step_len)
+        self.macro = macro_features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.stock)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.stock[idx], dtype=torch.float32),
+            torch.tensor(self.macro[idx], dtype=torch.float32),
+            torch.tensor(self.labels[idx], dtype=torch.float32),
+        )
+
+
+class TCNFiLMTrainer:
+    """TCN-FiLM Trainer for loading and predicting"""
 
     def __init__(self, gpu=0):
         self.device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() and gpu >= 0 else "cpu")
         self.model = None
+        self.config = None
         self.fitted = False
-        self.d_feat = None
-        self.n_chans = None
-        self.kernel_size = None
-        self.num_layers = None
-        self.dropout = None
 
     def _init_model(self):
-        """Initialize model"""
-        self.model = TCNModel(
-            num_input=self.d_feat,
-            output_size=1,
-            num_channels=[self.n_chans] * self.num_layers,
-            kernel_size=self.kernel_size,
-            dropout=self.dropout,
-        )
-        self.model.to(self.device)
+        """Initialize model from config"""
+        self.model = TCNFiLM(**self.config).to(self.device)
 
     def load(self, path):
-        """Load model"""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        config = checkpoint['config']
-
-        self.d_feat = config['d_feat']
-        self.n_chans = config['n_chans']
-        self.kernel_size = config['kernel_size']
-        self.num_layers = config['num_layers']
-        self.dropout = config['dropout']
-
+        """Load model checkpoint"""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # Filter config to only include TCNFiLM parameters
+        valid_keys = {'d_feat', 'n_macro', 'n_chans', 'num_layers', 'kernel_size', 'dropout', 'film_hidden'}
+        self.config = {k: v for k, v in ckpt['config'].items() if k in valid_keys}
         self._init_model()
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Support both 'state_dict' and 'model_state_dict' keys
+        state_key = 'state_dict' if 'state_dict' in ckpt else 'model_state_dict'
+        self.model.load_state_dict(ckpt[state_key])
         self.fitted = True
 
     def predict(self, data_loader):
-        """Predict"""
+        """Predict with model"""
         if not self.fitted:
             raise ValueError("Model not fitted yet")
 
@@ -143,39 +179,11 @@ class TCNTrainer:
         preds = []
 
         with torch.no_grad():
-            for batch_data in data_loader:
-                feature, _ = batch_data
-                feature = feature.to(self.device)
-                pred = self.model(feature)
+            for stock, macro, _ in data_loader:
+                pred = self.model(stock.to(self.device), macro.to(self.device))
                 preds.append(pred.cpu().numpy())
 
         return np.concatenate(preds)
-
-
-class ReshapedTCNDataset(torch.utils.data.Dataset):
-    """Dataset for Alpha300/Alpha360 with time-series structure"""
-
-    def __init__(self, features, labels, d_feat, step_len):
-        self.features = features
-        self.labels = labels
-        self.d_feat = d_feat
-        self.step_len = step_len
-
-        expected_features = d_feat * step_len
-        if features.shape[1] != expected_features:
-            raise ValueError(
-                f"Feature dimension mismatch: got {features.shape[1]}, "
-                f"expected {expected_features} (d_feat={d_feat} x step_len={step_len})"
-            )
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        feat = self.features[idx]
-        feat_reshaped = feat.reshape(self.d_feat, self.step_len)
-        label = self.labels[idx] if self.labels is not None else 0.0
-        return torch.tensor(feat_reshaped, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
 
 
 # ============================================================================
@@ -198,12 +206,13 @@ def load_catboost_model(model_path: Path):
 
 
 def load_tcn_model(model_path: Path, gpu: int = 0):
-    """Load TCN (.pt) model"""
-    print(f"    Loading TCN model from: {model_path}")
-    trainer = TCNTrainer(gpu=gpu)
+    """Load TCN-FiLM (.pt) model"""
+    print(f"    Loading TCN-FiLM model from: {model_path}")
+    trainer = TCNFiLMTrainer(gpu=gpu)
     trainer.load(str(model_path))
-    print(f"      Config: d_feat={trainer.d_feat}, n_chans={trainer.n_chans}, "
-          f"kernel_size={trainer.kernel_size}, num_layers={trainer.num_layers}")
+    cfg = trainer.config
+    print(f"      Config: d_feat={cfg['d_feat']}, n_macro={cfg['n_macro']}, "
+          f"n_chans={cfg['n_chans']}, num_layers={cfg['num_layers']}")
     return trainer
 
 
@@ -228,35 +237,44 @@ def load_model_meta(model_path: Path) -> dict:
 # Data Preparation Functions
 # ============================================================================
 
-def create_data_handler(handler_name: str, symbols: list, time_splits: dict, nday: int):
-    """Create DataHandler for a specific handler type"""
+def create_data_handler(handler_name: str, symbols: list, time_splits: dict, nday: int,
+                        include_valid: bool = False):
+    """Create DataHandler for a specific handler type
+
+    Args:
+        include_valid: If True, load data from valid_start; otherwise from test_start
+    """
     from models.common.handlers import get_handler_class
 
     HandlerClass = get_handler_class(handler_name)
 
+    # Only load data we need (valid+test or just test)
+    start_time = time_splits['valid_start'] if include_valid else time_splits['test_start']
+
     handler = HandlerClass(
         volatility_window=nday,
         instruments=symbols,
-        start_time=time_splits['train_start'],
+        start_time=start_time,
         end_time=time_splits['test_end'],
-        fit_start_time=time_splits['train_start'],
-        fit_end_time=time_splits['train_end'],
+        fit_start_time=start_time,
+        fit_end_time=time_splits['test_end'],
         infer_processors=[],
     )
 
     return handler
 
 
-def create_dataset(handler, time_splits: dict) -> DatasetH:
-    """Create Qlib DatasetH"""
-    return DatasetH(
-        handler=handler,
-        segments={
-            "train": (time_splits['train_start'], time_splits['train_end']),
-            "valid": (time_splits['valid_start'], time_splits['valid_end']),
-            "test": (time_splits['test_start'], time_splits['test_end']),
-        }
-    )
+def create_dataset(handler, time_splits: dict, include_valid: bool = False) -> DatasetH:
+    """Create Qlib DatasetH
+
+    Args:
+        include_valid: If True, include valid segment; otherwise only test
+    """
+    segments = {"test": (time_splits['test_start'], time_splits['test_end'])}
+    if include_valid:
+        segments["valid"] = (time_splits['valid_start'], time_splits['valid_end'])
+
+    return DatasetH(handler=handler, segments=segments)
 
 
 # ============================================================================
@@ -279,9 +297,11 @@ def predict_with_catboost(model: CatBoostRegressor, dataset: DatasetH, segment: 
     return pred
 
 
-def predict_with_tcn(model: TCNTrainer, dataset: DatasetH, segment: str = "test",
-                     d_feat: int = 5, step_len: int = 60, batch_size: int = 2000) -> pd.Series:
-    """Generate predictions with TCN model"""
+def predict_with_tcn(model: TCNFiLMTrainer, dataset: DatasetH, segment: str = "test",
+                     d_feat: int = 5, step_len: int = 60, batch_size: int = 2000,
+                     macro_df: pd.DataFrame = None, macro_cols: list = None,
+                     macro_lag: int = 1) -> pd.Series:
+    """Generate predictions with TCN-FiLM model using macro conditioning"""
     # Get features and labels
     features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
     labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
@@ -293,9 +313,13 @@ def predict_with_tcn(model: TCNTrainer, dataset: DatasetH, segment: str = "test"
 
     index = features.index
 
+    # Prepare macro features
+    macro = prepare_macro(index, macro_df, macro_cols, macro_lag)
+
     # Create dataset and dataloader
-    tcn_dataset = ReshapedTCNDataset(
+    tcn_dataset = TCNMacroDataset(
         features.values,
+        macro,
         labels.values,
         d_feat=d_feat,
         step_len=step_len,
@@ -594,7 +618,7 @@ def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
     from qlib.contrib.evaluate import risk_analysis
 
     print("\n" + "=" * 70)
-    print("BACKTEST with TopkDropoutStrategy (Three-Model Ensemble)")
+    print("BACKTEST with TopkDropoutStrategy (AE-MLP + CatBoost + TCN-FiLM)")
     print("=" * 70)
 
     pred_df = pred.to_frame("score")
@@ -737,8 +761,8 @@ def main():
                         default=str(MODEL_SAVE_PATH / 'catboost_cv_catboost-v1_test_5d_20260129_105915_best.cbm'),
                         help='CatBoost model path (.cbm)')
     parser.add_argument('--tcn-model', type=str,
-                        default=str(MODEL_SAVE_PATH / 'tcn_cv_alpha300_sp500_5d_20260130_152436_best.pt'),
-                        help='TCN model path (.pt)')
+                        default=str(MODEL_SAVE_PATH / 'tcn_macro_cv_sp500_5d_m23_film_20260202_090518_best.pt'),
+                        help='TCN-FiLM model path (.pt)')
 
     # Handler configuration
     parser.add_argument('--ae-handler', type=str, default='alpha158-enhanced-v7',
@@ -748,11 +772,13 @@ def main():
     parser.add_argument('--tcn-handler', type=str, default='alpha300',
                         help='Handler for TCN model')
 
-    # TCN specific parameters
+    # TCN-FiLM specific parameters
     parser.add_argument('--tcn-d-feat', type=int, default=5,
                         help='TCN d_feat (default: 5 for alpha300)')
     parser.add_argument('--tcn-step-len', type=int, default=60,
                         help='TCN step_len (default: 60 for alpha300)')
+    parser.add_argument('--macro-lag', type=int, default=1,
+                        help='Macro feature lag in days (default: 1)')
 
     # Ensemble parameters
     parser.add_argument('--ensemble-method', type=str, default='zscore_weighted',
@@ -819,17 +845,18 @@ def main():
     }
 
     print("=" * 70)
-    print("Three-Model Ensemble: AE-MLP + CatBoost + TCN")
+    print("Three-Model Ensemble: AE-MLP + CatBoost + TCN-FiLM")
     print("=" * 70)
-    print(f"AE-MLP Model:   {args.ae_model}")
-    print(f"CatBoost Model: {args.cb_model}")
-    print(f"TCN Model:      {args.tcn_model}")
-    print(f"Handlers:       AE-MLP={args.ae_handler}, CatBoost={args.cb_handler}, TCN={args.tcn_handler}")
-    print(f"Stock Pool:     {args.stock_pool}")
+    print(f"AE-MLP Model:    {args.ae_model}")
+    print(f"CatBoost Model:  {args.cb_model}")
+    print(f"TCN-FiLM Model:  {args.tcn_model}")
+    print(f"Handlers:        AE-MLP={args.ae_handler}, CatBoost={args.cb_handler}, TCN={args.tcn_handler}")
+    print(f"Macro Lag:       {args.macro_lag} day(s)")
+    print(f"Stock Pool:      {args.stock_pool}")
     print(f"Prediction Horizon: {args.nday} days")
     print(f"Ensemble Method: {args.ensemble_method}")
-    print(f"Learn Weights:  {args.learn_weights} (method: {args.weight_method})")
-    print(f"Test Period:    {time_splits['test_start']} to {time_splits['test_end']}")
+    print(f"Learn Weights:   {args.learn_weights} (method: {args.weight_method})")
+    print(f"Test Period:     {time_splits['test_start']} to {time_splits['test_end']}")
     print("=" * 70)
 
     # Check model files exist
@@ -837,10 +864,17 @@ def main():
     cb_path = Path(args.cb_model)
     tcn_path = Path(args.tcn_model)
 
-    for path, name in [(ae_path, 'AE-MLP'), (cb_path, 'CatBoost'), (tcn_path, 'TCN')]:
+    for path, name in [(ae_path, 'AE-MLP'), (cb_path, 'CatBoost'), (tcn_path, 'TCN-FiLM')]:
         if not path.exists():
             print(f"Error: {name} model not found: {path}")
             sys.exit(1)
+
+    # Load macro data for TCN-FiLM
+    print("\n[0] Loading macro data...")
+    macro_df = load_macro_df()
+    macro_cols = [c for c in CORE_MACRO_FEATURES if c in macro_df.columns]
+    print(f"    Loaded macro: {macro_df.shape}, {len(macro_cols)} features")
+    print(f"    Date range: {macro_df.index.min()} ~ {macro_df.index.max()}")
 
     # Initialize Qlib
     print("\n[1] Initializing Qlib...")
@@ -858,19 +892,22 @@ def main():
     print(f"\n[2] Using stock pool: {args.stock_pool} ({len(symbols)} stocks)")
 
     # Create datasets for each model
-    print("\n[3] Creating datasets...")
+    # Only load validation data if learning weights, otherwise just test data
+    include_valid = args.learn_weights
+    data_start = time_splits['valid_start'] if include_valid else time_splits['test_start']
+    print(f"\n[3] Creating datasets (from {data_start})...")
 
     print(f"    Creating {args.ae_handler} dataset for AE-MLP...")
-    ae_handler = create_data_handler(args.ae_handler, symbols, time_splits, args.nday)
-    ae_dataset = create_dataset(ae_handler, time_splits)
+    ae_handler = create_data_handler(args.ae_handler, symbols, time_splits, args.nday, include_valid)
+    ae_dataset = create_dataset(ae_handler, time_splits, include_valid)
 
     print(f"    Creating {args.cb_handler} dataset for CatBoost...")
-    cb_handler = create_data_handler(args.cb_handler, symbols, time_splits, args.nday)
-    cb_dataset = create_dataset(cb_handler, time_splits)
+    cb_handler = create_data_handler(args.cb_handler, symbols, time_splits, args.nday, include_valid)
+    cb_dataset = create_dataset(cb_handler, time_splits, include_valid)
 
     print(f"    Creating {args.tcn_handler} dataset for TCN...")
-    tcn_handler = create_data_handler(args.tcn_handler, symbols, time_splits, args.nday)
-    tcn_dataset = create_dataset(tcn_handler, time_splits)
+    tcn_handler = create_data_handler(args.tcn_handler, symbols, time_splits, args.nday, include_valid)
+    tcn_dataset = create_dataset(tcn_handler, time_splits, include_valid)
 
     # Load models
     print("\n[4] Loading models...")
@@ -889,16 +926,18 @@ def main():
     pred_cb = predict_with_catboost(cb_model, cb_dataset)
     print(f"      Shape: {len(pred_cb)}, Range: [{pred_cb.min():.4f}, {pred_cb.max():.4f}]")
 
-    print("    TCN predictions...")
+    print("    TCN-FiLM predictions...")
     pred_tcn = predict_with_tcn(tcn_model, tcn_dataset, d_feat=args.tcn_d_feat,
-                                step_len=args.tcn_step_len, batch_size=args.batch_size)
+                                step_len=args.tcn_step_len, batch_size=args.batch_size,
+                                macro_df=macro_df, macro_cols=macro_cols,
+                                macro_lag=args.macro_lag)
     print(f"      Shape: {len(pred_tcn)}, Range: [{pred_tcn.min():.4f}, {pred_tcn.max():.4f}]")
 
     # Store predictions in dict
     preds = {
         'AE-MLP': pred_ae,
         'CatBoost': pred_cb,
-        'TCN': pred_tcn,
+        'TCN-FiLM': pred_tcn,
     }
 
     # Calculate pairwise correlations
@@ -923,17 +962,19 @@ def main():
         val_pred_cb = predict_with_catboost(cb_model, cb_dataset, segment="valid")
         val_pred_tcn = predict_with_tcn(tcn_model, tcn_dataset, segment="valid",
                                          d_feat=args.tcn_d_feat, step_len=args.tcn_step_len,
-                                         batch_size=args.batch_size)
+                                         batch_size=args.batch_size,
+                                         macro_df=macro_df, macro_cols=macro_cols,
+                                         macro_lag=args.macro_lag)
 
         val_preds = {
             'AE-MLP': val_pred_ae,
             'CatBoost': val_pred_cb,
-            'TCN': val_pred_tcn,
+            'TCN-FiLM': val_pred_tcn,
         }
 
         print(f"      AE-MLP valid: {len(val_pred_ae)} samples")
         print(f"      CatBoost valid: {len(val_pred_cb)} samples")
-        print(f"      TCN valid: {len(val_pred_tcn)} samples")
+        print(f"      TCN-FiLM valid: {len(val_pred_tcn)} samples")
 
         # Get validation labels
         val_label = ae_dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
@@ -964,13 +1005,13 @@ def main():
         weights = {
             'AE-MLP': args.ae_weight / total,
             'CatBoost': args.cb_weight / total,
-            'TCN': args.tcn_weight / total,
+            'TCN-FiLM': args.tcn_weight / total,
         }
         print(f"\n[7] Using manual weights: AE-MLP={weights['AE-MLP']:.3f}, "
-              f"CatBoost={weights['CatBoost']:.3f}, TCN={weights['TCN']:.3f}")
+              f"CatBoost={weights['CatBoost']:.3f}, TCN-FiLM={weights['TCN-FiLM']:.3f}")
     else:
         # Equal weights
-        weights = {'AE-MLP': 1/3, 'CatBoost': 1/3, 'TCN': 1/3}
+        weights = {'AE-MLP': 1/3, 'CatBoost': 1/3, 'TCN-FiLM': 1/3}
         print(f"\n[7] Using equal weights: 1/3 each")
 
     # Ensemble predictions
@@ -1001,7 +1042,7 @@ def main():
     print("    +" + "-" * 68 + "+")
     print(f"    |  {'AE-MLP':<15s} | {weights['AE-MLP']:>8.3f} | {ae_ic:>10.4f} | {ae_std:>10.4f} | {ae_icir:>10.4f} |")
     print(f"    |  {'CatBoost':<15s} | {weights['CatBoost']:>8.3f} | {cb_ic:>10.4f} | {cb_std:>10.4f} | {cb_icir:>10.4f} |")
-    print(f"    |  {'TCN':<15s} | {weights['TCN']:>8.3f} | {tcn_ic:>10.4f} | {tcn_std:>10.4f} | {tcn_icir:>10.4f} |")
+    print(f"    |  {'TCN-FiLM':<15s} | {weights['TCN-FiLM']:>8.3f} | {tcn_ic:>10.4f} | {tcn_std:>10.4f} | {tcn_icir:>10.4f} |")
     print("    +" + "-" * 68 + "+")
     print(f"    |  {'ENSEMBLE':<15s} | {'1.000':>8s} | {ens_ic:>10.4f} | {ens_std:>10.4f} | {ens_icir:>10.4f} |")
     print("    +" + "=" * 68 + "+")
@@ -1009,7 +1050,7 @@ def main():
     # Calculate improvement
     best_single_ic = max(ae_ic, cb_ic, tcn_ic)
     best_single_icir = max(ae_icir, cb_icir, tcn_icir)
-    best_model = 'AE-MLP' if ae_ic == best_single_ic else ('CatBoost' if cb_ic == best_single_ic else 'TCN')
+    best_model = 'AE-MLP' if ae_ic == best_single_ic else ('CatBoost' if cb_ic == best_single_ic else 'TCN-FiLM')
 
     if best_single_ic != 0:
         ic_improvement = (ens_ic - best_single_ic) / abs(best_single_ic) * 100
@@ -1029,10 +1070,10 @@ def main():
     print("\n" + "=" * 70)
     print("THREE-MODEL ENSEMBLE COMPLETE")
     print("=" * 70)
-    print(f"Weights: AE-MLP={weights['AE-MLP']:.3f}, CatBoost={weights['CatBoost']:.3f}, TCN={weights['TCN']:.3f}")
+    print(f"Weights: AE-MLP={weights['AE-MLP']:.3f}, CatBoost={weights['CatBoost']:.3f}, TCN-FiLM={weights['TCN-FiLM']:.3f}")
     print(f"AE-MLP IC:   {ae_ic:.4f} (ICIR: {ae_icir:.4f})")
     print(f"CatBoost IC: {cb_ic:.4f} (ICIR: {cb_icir:.4f})")
-    print(f"TCN IC:      {tcn_ic:.4f} (ICIR: {tcn_icir:.4f})")
+    print(f"TCN-FiLM IC: {tcn_ic:.4f} (ICIR: {tcn_icir:.4f})")
     print(f"Ensemble IC: {ens_ic:.4f} (ICIR: {ens_icir:.4f})")
     print("=" * 70)
 
