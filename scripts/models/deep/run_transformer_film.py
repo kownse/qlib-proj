@@ -353,7 +353,7 @@ def compute_ic(pred, labels, index):
 def main():
     parser = argparse.ArgumentParser(description='Transformer-FiLM Training')
     parser.add_argument('--stock-pool', default='sp500', choices=['test', 'tech', 'sp100', 'sp500'])
-    parser.add_argument('--handler', default='alpha360', choices=['alpha300', 'alpha360'])
+    parser.add_argument('--handler', default='alpha300', choices=['alpha300', 'alpha360'])
     parser.add_argument('--nday', type=int, default=5)
     parser.add_argument('--macro-set', default='core', choices=['minimal', 'core'])
     parser.add_argument('--macro-lag', type=int, default=1)
