@@ -465,7 +465,7 @@ def main():
                         help='Initial account balance')
     parser.add_argument('--topk', type=int, default=10,
                         help='Number of stocks to hold')
-    parser.add_argument('--n-drop', type=int, default=1,
+    parser.add_argument('--n-drop', type=int, default=2,
                         help='Number of stocks to drop each rebalance')
     parser.add_argument('--rebalance-freq', type=int, default=5,
                         help='Rebalance frequency in days')
