@@ -469,7 +469,7 @@ def main():
                         help='Number of stocks to drop each rebalance')
     parser.add_argument('--rebalance-freq', type=int, default=5,
                         help='Rebalance frequency in days')
-    parser.add_argument('--backtest-start', type=str, default='2026-01-01',
+    parser.add_argument('--backtest-start', type=str, default='2026-02-01',
                         help='Backtest start date')
     parser.add_argument('--test-end', type=str, default=None,
                         help='Backtest end date')
