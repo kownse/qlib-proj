@@ -107,8 +107,10 @@ def get_stockmixer_loss_simple(
     batch_size = prediction.shape[0]
     all_one = torch.ones(batch_size, 1, dtype=torch.float32, device=device)
 
-    # Regression loss (MSE)
-    reg_loss = F.mse_loss(prediction * mask, ground_truth * mask)
+    # Regression loss (MSE) - only over valid stocks
+    valid_count = mask.sum().clamp(min=1.0)
+    diff = (prediction - ground_truth) * mask
+    reg_loss = (diff ** 2).sum() / valid_count
 
     # Pairwise ranking loss
     pre_pw_dif = prediction @ all_one.t() - all_one @ prediction.t()
@@ -593,12 +595,20 @@ class StockMixer:
         import time
         start_time = time.time()
 
-        # Get raw data
+        # Get data: features are z-scored (DK_L), labels are raw returns (DK_R)
+        # Using raw labels matches the original StockMixer which predicts returns directly
         features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
-        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
+        labels = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_R)
 
         if isinstance(labels, pd.DataFrame):
             labels = labels.iloc[:, 0]
+
+        # Align indices: DK_L may have fewer rows than DK_R (DropnaLabel in learn_processors)
+        common_idx = features.index.intersection(labels.index)
+        if len(common_idx) < len(features):
+            features = features.loc[common_idx]
+        if len(common_idx) < len(labels):
+            labels = labels.loc[common_idx]
 
         # Get unique dates and instruments
         dates = sorted(features.index.get_level_values('datetime').unique())
@@ -683,8 +693,13 @@ class StockMixer:
             valid_positions = valid_positions[final_mask]
 
             # Reshape and fill tensors
+            # Alpha300 features are stored channels-first:
+            #   [CLOSE59..CLOSE0, OPEN59..OPEN0, HIGH59..HIGH0, LOW59..LOW0, VOL59..VOL0]
+            # So reshape to (n, channels, time_steps) then transpose to (n, time_steps, channels)
             try:
-                reshaped_features = valid_features.reshape(-1, self.time_steps, self.channels)
+                reshaped_features = valid_features.reshape(
+                    -1, self.channels, self.time_steps
+                ).transpose(0, 2, 1)  # -> (n, time_steps, channels)
                 for j, pos in enumerate(valid_positions):
                     data_tensor[pos] = torch.from_numpy(reshaped_features[j].copy())
                     label_tensor[pos] = float(valid_labels[j])
@@ -738,6 +753,31 @@ class StockMixer:
         print(f"    Stock universe: {self.num_stocks}")
         print(f"    Data shape per date: ({self.num_stocks}, {self.time_steps}, {self.channels})")
 
+        # === Diagnostic logging ===
+        if train_dates_list:
+            sample_date = train_dates_list[0]
+            sample_data = train_data[sample_date]
+            sample_labels = train_labels[sample_date]
+            sample_masks = train_masks[sample_date]
+            valid_count = int(sample_masks.sum().item())
+            valid_idx = torch.where(sample_masks > 0)[0]
+
+            print(f"\n    --- Data Diagnostics (date={sample_date}) ---")
+            print(f"    Valid stocks: {valid_count}/{self.num_stocks}")
+            if valid_count > 0:
+                first_valid = valid_idx[0].item()
+                sample_stock = sample_data[first_valid]  # (time_steps, channels)
+                print(f"    Sample stock[{first_valid}] shape: {sample_stock.shape}")
+                print(f"    Sample stock[{first_valid}] channel means: {sample_stock.mean(dim=0).tolist()}")
+                print(f"    Sample stock[{first_valid}] channel stds:  {sample_stock.std(dim=0).tolist()}")
+                print(f"    Sample stock[{first_valid}] [t=0]: {sample_stock[0].tolist()}")
+                print(f"    Sample stock[{first_valid}] [t=-1]: {sample_stock[-1].tolist()}")
+
+                valid_labels_vals = sample_labels[valid_idx]
+                print(f"    Labels - mean: {valid_labels_vals.mean():.6f}, std: {valid_labels_vals.std():.6f}, "
+                      f"min: {valid_labels_vals.min():.6f}, max: {valid_labels_vals.max():.6f}")
+        print()
+
         # Build model
         print("\n    Building StockMixer network...")
         self.model = self._build_model()
@@ -754,32 +794,52 @@ class StockMixer:
         # Early stopping
         early_stopping = EarlyStopping(patience=self.early_stop_patience, restore_best=True)
 
-        # Training loop
-        print("\n    Training...")
+        # Training loop with gradient accumulation for speed
+        accum_steps = 8  # Accumulate gradients over 8 dates before updating
+        print(f"\n    Training (gradient accumulation over {accum_steps} dates)...")
+
         for epoch in range(self.n_epochs):
             # Training phase
             self.model.train()
             train_losses = {'total': 0, 'reg': 0, 'rank': 0}
             np.random.shuffle(train_dates_list)
+            optimizer.zero_grad()
 
-            for date in train_dates_list:
+            for di, date in enumerate(train_dates_list):
                 data_batch = train_data[date].to(self.device)
                 label_batch = train_labels[date].unsqueeze(1).to(self.device)
                 mask_batch = train_masks[date].unsqueeze(1).to(self.device)
 
-                optimizer.zero_grad()
-
                 # Forward pass
                 prediction = self.model(data_batch)
 
-                # Compute loss
+                # Diagnostic: log model output range on first batch of first epoch
+                if epoch == 0 and di == 0:
+                    with torch.no_grad():
+                        valid_mask = mask_batch.squeeze() > 0
+                        valid_pred = prediction.squeeze()[valid_mask]
+                        valid_gt = label_batch.squeeze()[valid_mask]
+                        print(f"\n    --- Epoch 0, Batch 0 Diagnostics ---")
+                        print(f"    Prediction range: [{valid_pred.min():.6f}, {valid_pred.max():.6f}], "
+                              f"mean={valid_pred.mean():.6f}, std={valid_pred.std():.6f}")
+                        print(f"    Label range:      [{valid_gt.min():.6f}, {valid_gt.max():.6f}], "
+                              f"mean={valid_gt.mean():.6f}, std={valid_gt.std():.6f}")
+                        print(f"    Valid stocks: {valid_mask.sum().item()}")
+
+                # Compute loss (scale by accumulation steps)
                 total_loss, reg_loss, rank_loss = get_stockmixer_loss_simple(
                     prediction, label_batch, mask_batch, self.alpha
                 )
+                scaled_loss = total_loss / accum_steps
 
-                # Backward pass
-                total_loss.backward()
-                optimizer.step()
+                # Backward pass (accumulate gradients)
+                scaled_loss.backward()
+
+                # Update every accum_steps dates
+                if (di + 1) % accum_steps == 0 or (di + 1) == len(train_dates_list):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                 train_losses['total'] += total_loss.item()
                 train_losses['reg'] += reg_loss.item()
