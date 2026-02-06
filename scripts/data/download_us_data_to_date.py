@@ -64,8 +64,11 @@ def check_update_status(symbols: list, csv_dir: Path) -> dict:
 
         if latest_date is None:
             status["missing"].append(symbol)
+        elif latest_date.date() >= today.date():
+            # 已有今天的数据，但盘中价格可能已更新，需要重新下载
+            status["needs_update"].append((symbol, latest_date))
         elif latest_date.date() >= today.date() - timedelta(days=1):
-            # 允许 1 天的延迟（周末/节假日）
+            # 昨天的数据已经是收盘价，不需要更新（允许周末/节假日延迟）
             status["up_to_date"].append(symbol)
         else:
             status["needs_update"].append((symbol, latest_date))
@@ -117,8 +120,13 @@ def update_stock_data(symbols_to_update: list, csv_dir: Path, end_date: str):
     for i, item in enumerate(symbols_to_update):
         if isinstance(item, tuple):
             symbol, latest_date = item
-            # 从最新日期的下一天开始下载
-            start_date = (latest_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            today = pd.Timestamp(datetime.now().date())
+            if latest_date.date() >= today.date():
+                # 今天的数据需要重新下载以获取最新价格
+                start_date = latest_date.strftime("%Y-%m-%d")
+            else:
+                # 从最新日期的下一天开始下载
+                start_date = (latest_date + timedelta(days=1)).strftime("%Y-%m-%d")
         else:
             symbol = item
             latest_date = None
