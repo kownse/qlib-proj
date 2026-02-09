@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "22": "^0.0.0",
+    "@colbymchenry/codegraph": "^0.3.1"
+  }
+}

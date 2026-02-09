@@ -227,6 +227,34 @@ HANDLER_REGISTRY = {
         'description': 'TCN V1 (20 features from Qlib benchmark, for TSDatasetH)',
         'use_talib': False,
     },
+
+    # Target Engineering variants (V9 features, different labels)
+    'v9-mkt-neutral': {
+        'module': 'data.datahandler_target_variants',
+        'class_name': 'Alpha158_V9_MarketNeutral',
+        'description': 'V9 features + market-neutral label (stock return - SPY return)',
+        'use_talib': True,
+    },
+    'v9-rank': {
+        'module': 'data.datahandler_target_variants',
+        'class_name': 'Alpha158_V9_RankTarget',
+        'description': 'V9 features + cross-sectional rank label (percentile 0-1)',
+        'use_talib': True,
+    },
+    'v9-vol-scaled': {
+        'module': 'data.datahandler_target_variants',
+        'class_name': 'Alpha158_V9_VolScaled',
+        'description': 'V9 features + volatility-scaled return label',
+        'use_talib': True,
+    },
+
+    # CBOE options-derived features
+    'v9-cboe': {
+        'module': 'data.datahandler_v9_cboe',
+        'class_name': 'Alpha158_V9_CBOE',
+        'description': 'V9 + CBOE options features (SKEW, VVIX, VIX9D)',
+        'use_talib': True,
+    },
 }
 
 
