@@ -190,11 +190,30 @@ HANDLER_REGISTRY = {
         'use_talib': True,
     },
 
+    'alpha158-enhanced-v12': {
+        'module': 'data.datahandler_enhanced_v12',
+        'class_name': 'Alpha158_Enhanced_V12',
+        'description': 'Alpha158 Enhanced V12 (~13 features: V9 mkt-neutral + CBOE skew)',
+        'use_talib': True,
+    },
+
     # CatBoost optimized handlers
     'catboost-v1': {
         'module': 'data.datahandler_catboost_v1',
         'class_name': 'Alpha158_CatBoost_V1',
         'description': 'CatBoost V1 (~14 features: nested CV forward selection for CatBoost)',
+        'use_talib': True,
+    },
+    'catboost-v1-csrank': {
+        'module': 'data.datahandler_catboost_v1_csrank',
+        'class_name': 'Alpha158_CatBoost_V1_CSRank',
+        'description': 'CatBoost V1 + CSRankNorm on stock features (~14 features)',
+        'use_talib': True,
+    },
+    'catboost-v1-mkt-neutral': {
+        'module': 'data.datahandler_tree_mkt_neutral',
+        'class_name': 'Alpha158_CatBoost_V1_MktNeutral',
+        'description': 'CatBoost V1 + market-neutral label (~14 features)',
         'use_talib': True,
     },
 
@@ -203,6 +222,12 @@ HANDLER_REGISTRY = {
         'module': 'data.datahandler_lightgbm_v1',
         'class_name': 'Alpha158_LightGBM_V1',
         'description': 'LightGBM V1 (~12 features: nested CV forward selection for LightGBM)',
+        'use_talib': True,
+    },
+    'lightgbm-v1-mkt-neutral': {
+        'module': 'data.datahandler_tree_mkt_neutral',
+        'class_name': 'Alpha158_LightGBM_V1_MktNeutral',
+        'description': 'LightGBM V1 + market-neutral label (~12 features)',
         'use_talib': True,
     },
 
