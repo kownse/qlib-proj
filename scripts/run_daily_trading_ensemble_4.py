@@ -1,21 +1,28 @@
 #!/usr/bin/env python
 """
-每日交易脚本 (Ensemble版本) - 使用 AE-MLP + CatBoost 模型集成
+每日交易脚本 (Ensemble V4) - AE-MLP + AE-MLP(mkt-neutral) + CatBoost 三模型集成
+
+模型:
+  1. AE-MLP (alpha158-enhanced-v7)
+  2. AE-MLP mkt-neutral (v9-mkt-neutral)
+  3. CatBoost (catboost-v1)
+
+默认 Stacking Weights: AE-MLP=0.350, AE-MLP-MN=0.300, CatBoost=0.350
 
 流程:
-1. 下载最新美股数据 (download_us_data_to_date.py)
-2. 增量更新宏观数据 (download_macro_data_to_date.py)
-3. 处理宏观数据为特征 (process_macro_data.py)
-4. 加载 AE-MLP 和 CatBoost 预训练模型
+1. 下载最新美股数据
+2. 增量更新宏观数据
+3. 处理宏观数据为特征
+4. 加载 3 个预训练模型
 5. 生成各自的预测并计算相关性
-6. 集成预测结果
+6. 集成预测结果 (zscore_weighted)
 7. 运行回测，输出每日交易信息
 
 使用方法:
-    python scripts/run_daily_trading_ensemble.py
-    python scripts/run_daily_trading_ensemble.py --skip-download
-    python scripts/run_daily_trading_ensemble.py --ensemble-method zscore_mean
-    python scripts/run_daily_trading_ensemble.py --predict-only  # 只输出预测，不回测
+    python scripts/run_daily_trading_ensemble_4.py
+    python scripts/run_daily_trading_ensemble_4.py --skip-download
+    python scripts/run_daily_trading_ensemble_4.py --predict-only
+    python scripts/run_daily_trading_ensemble_4.py --send-email
 """
 
 import sys
@@ -52,7 +59,6 @@ def load_model_meta(model_path: Path) -> dict:
         with open(meta_path, 'rb') as f:
             return pickle.load(f)
 
-    # Try replacing _best suffix
     stem = model_path.stem
     if stem.endswith('_best'):
         alt_meta_path = model_path.parent / (stem[:-5] + '.meta.pkl')
@@ -104,67 +110,54 @@ def predict_with_catboost(model, dataset) -> pd.Series:
     return pred
 
 
-def calculate_correlation(pred1: pd.Series, pred2: pd.Series) -> tuple:
-    """Calculate correlation between two prediction series"""
-    common_idx = pred1.index.intersection(pred2.index)
-    p1 = pred1.loc[common_idx]
-    p2 = pred2.loc[common_idx]
-
-    overall_corr = p1.corr(p2)
-
-    daily_corr = pd.DataFrame({'p1': p1, 'p2': p2}).groupby(level='datetime').apply(
-        lambda x: x['p1'].corr(x['p2']) if len(x) > 1 else np.nan
-    )
-    daily_corr = daily_corr.dropna()
-
-    mean_daily_corr = daily_corr.mean()
-    std_daily_corr = daily_corr.std()
-
-    return overall_corr, mean_daily_corr, std_daily_corr
+def zscore_by_day(x):
+    mean = x.groupby(level='datetime').transform('mean')
+    std = x.groupby(level='datetime').transform('std')
+    return (x - mean) / (std + 1e-8)
 
 
-def ensemble_predictions(pred1: pd.Series, pred2: pd.Series,
-                         method: str = 'zscore_mean', weights: tuple = None) -> pd.Series:
-    """Ensemble two model predictions"""
-    common_idx = pred1.index.intersection(pred2.index)
-    p1 = pred1.loc[common_idx]
-    p2 = pred2.loc[common_idx]
+def ensemble_predictions_multi(pred_dict: dict, method: str = 'zscore_weighted',
+                                weights: dict = None) -> pd.Series:
+    """
+    Ensemble multiple model predictions.
+
+    Parameters
+    ----------
+    pred_dict : dict
+        {model_name: pd.Series}
+    method : str
+        'mean', 'weighted', 'rank_mean', 'zscore_mean', 'zscore_weighted'
+    weights : dict, optional
+        {model_name: weight}
+    """
+    names = list(pred_dict.keys())
+
+    # Find common index
+    common_idx = pred_dict[names[0]].index
+    for name in names[1:]:
+        common_idx = common_idx.intersection(pred_dict[name].index)
+
+    preds = {name: pred_dict[name].loc[common_idx] for name in names}
 
     if method == 'mean':
-        ensemble_pred = (p1 + p2) / 2
+        ensemble_pred = sum(preds.values()) / len(preds)
     elif method == 'weighted':
         if weights is None:
-            weights = (0.5, 0.5)
-        w1, w2 = weights
-        total = w1 + w2
-        ensemble_pred = (p1 * w1 + p2 * w2) / total
+            weights = {n: 1.0 / len(names) for n in names}
+        total = sum(weights.values())
+        ensemble_pred = sum(preds[n] * weights[n] for n in names) / total
     elif method == 'rank_mean':
-        rank1 = p1.groupby(level='datetime').rank(pct=True)
-        rank2 = p2.groupby(level='datetime').rank(pct=True)
-        ensemble_pred = (rank1 + rank2) / 2
+        ranks = {n: preds[n].groupby(level='datetime').rank(pct=True) for n in names}
+        ensemble_pred = sum(ranks.values()) / len(ranks)
     elif method == 'zscore_mean':
-        # Normalize to z-scores within each day, then average
-        # Preserves relative magnitude information better than rank
-        def zscore_by_day(x):
-            mean = x.groupby(level='datetime').transform('mean')
-            std = x.groupby(level='datetime').transform('std')
-            return (x - mean) / (std + 1e-8)
-        z1 = zscore_by_day(p1)
-        z2 = zscore_by_day(p2)
-        ensemble_pred = (z1 + z2) / 2
+        zscores = {n: zscore_by_day(preds[n]) for n in names}
+        ensemble_pred = sum(zscores.values()) / len(zscores)
     elif method == 'zscore_weighted':
-        # Z-score normalize then weighted average
         if weights is None:
-            weights = (0.5, 0.5)
-        w1, w2 = weights
-        total = w1 + w2
-        def zscore_by_day(x):
-            mean = x.groupby(level='datetime').transform('mean')
-            std = x.groupby(level='datetime').transform('std')
-            return (x - mean) / (std + 1e-8)
-        z1 = zscore_by_day(p1)
-        z2 = zscore_by_day(p2)
-        ensemble_pred = (z1 * w1 + z2 * w2) / total
+            weights = {n: 1.0 / len(names) for n in names}
+        total = sum(weights.values())
+        zscores = {n: zscore_by_day(preds[n]) for n in names}
+        ensemble_pred = sum(zscores[n] * weights[n] for n in names) / total
     else:
         raise ValueError(f"Unknown ensemble method: {method}")
 
@@ -172,10 +165,34 @@ def ensemble_predictions(pred1: pd.Series, pred2: pd.Series,
     return ensemble_pred
 
 
+def calculate_correlation_multi(pred_dict: dict) -> dict:
+    """Calculate pairwise daily correlation between all model predictions."""
+    names = list(pred_dict.keys())
+
+    common_idx = pred_dict[names[0]].index
+    for name in names[1:]:
+        common_idx = common_idx.intersection(pred_dict[name].index)
+
+    df = pd.DataFrame({name: pred_dict[name].loc[common_idx] for name in names})
+
+    daily_corrs = {}
+    for i, n1 in enumerate(names):
+        for j, n2 in enumerate(names):
+            if j <= i:
+                continue
+            pair_key = f"{n1} vs {n2}"
+            dc = df.groupby(level='datetime').apply(
+                lambda x, a=n1, b=n2: x[a].corr(x[b]) if len(x) > 1 else np.nan
+            ).dropna()
+            daily_corrs[pair_key] = (dc.mean(), dc.std())
+
+    return daily_corrs
+
+
 def run_live_prediction(
     pred_ensemble: pd.Series,
-    pred_ae: pd.Series,
-    pred_cb: pd.Series,
+    pred_dict: dict,
+    display_names: dict,
     stock_pool: str,
     topk: int = 10,
     account: float = 8000,
@@ -184,7 +201,7 @@ def run_live_prediction(
     from data.stock_pools import STOCK_POOLS
 
     print(f"\n{'='*70}")
-    print("LIVE TRADING PREDICTIONS (Ensemble)")
+    print("LIVE TRADING PREDICTIONS (Ensemble V4)")
     print(f"{'='*70}")
     print(f"Account: ${account:,.2f}")
     print(f"Top-K stocks: {topk}")
@@ -233,7 +250,7 @@ def run_live_prediction(
     pred_output = latest_preds.copy()
     pred_output.index = pred_output.index.str.upper()
     pred_output = pred_output.sort_values("score", ascending=False)
-    pred_path = output_dir / f"ensemble_predictions_{latest_date.strftime('%Y%m%d')}.csv"
+    pred_path = output_dir / f"ensemble_v4_predictions_{latest_date.strftime('%Y%m%d')}.csv"
     pred_output.to_csv(pred_path)
     print(f"\nFull predictions saved to: {pred_path}")
 
@@ -249,7 +266,7 @@ def run_live_prediction(
         })
 
     rec_df = pd.DataFrame(recommendations)
-    rec_path = output_dir / f"ensemble_recommendations_{latest_date.strftime('%Y%m%d')}.csv"
+    rec_path = output_dir / f"ensemble_v4_recommendations_{latest_date.strftime('%Y%m%d')}.csv"
     rec_df.to_csv(rec_path, index=False)
     print(f"Buy recommendations saved to: {rec_path}")
 
@@ -275,7 +292,7 @@ def run_trading_backtest(
     from utils.strategy import get_strategy_config
 
     print(f"\n{'='*70}")
-    print("TRADING BACKTEST (Ensemble)")
+    print("TRADING BACKTEST (Ensemble V4)")
     print(f"{'='*70}")
     print(f"Period: {test_start} to {test_end}")
     print(f"Initial Account: ${account:,.2f}")
@@ -337,7 +354,6 @@ def run_trading_backtest(
     }
 
     pool_symbols = STOCK_POOLS[stock_pool]
-    # Convert to lowercase to match Qlib's internal format
     pool_symbols_lower = [s.lower() for s in pool_symbols]
 
     backtest_config = {
@@ -407,7 +423,6 @@ def run_trading_backtest(
         print("DAILY TRADING DETAILS (Last 10 days)")
         print(f"{'='*70}")
 
-        # 使用公共函数收集和打印交易详情
         all_trading_details = collect_trading_details_from_positions(positions, report_df)
         print_trading_details(all_trading_details, show_last_n=10)
 
@@ -415,11 +430,10 @@ def run_trading_backtest(
         output_dir = PROJECT_ROOT / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        report_path = output_dir / f"ensemble_daily_trading_report_{freq}.csv"
+        report_path = output_dir / f"ensemble_v4_daily_trading_report_{freq}.csv"
         report_df.to_csv(report_path)
         print(f"\n\nReport saved to: {report_path}")
 
-        # 返回交易详情供邮件使用
         return all_trading_details
 
     return []
@@ -427,35 +441,42 @@ def run_trading_backtest(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Daily trading script (Ensemble) - AE-MLP + CatBoost',
+        description='Daily trading script (Ensemble V4) - AE-MLP + AE-MLP(mkt-neutral) + CatBoost',
     )
     parser.add_argument('--skip-download', action='store_true',
                         help='Skip data download step')
     parser.add_argument('--predict-only', action='store_true',
                         help='Only generate predictions, skip backtest')
 
-    # Model paths
+    # Model paths (same as run_ae_cb_ensemble_v4.py)
     parser.add_argument('--ae-model', type=str,
                         default='my_models/ae_mlp_cv_alpha158-enhanced-v7_sp500_5d_best.keras',
                         help='Path to AE-MLP model')
+    parser.add_argument('--ae-mn-model', type=str,
+                        default='my_models/ae_mlp_cv_v9-mkt-neutral_sp500_5d.keras',
+                        help='Path to AE-MLP market-neutral model')
     parser.add_argument('--cb-model', type=str,
                         default='my_models/catboost_cv_catboost-v1_sp500_5d_20260129_141353_best.cbm',
                         help='Path to CatBoost model')
 
-    # Handlers
+    # Handlers (same as run_ae_cb_ensemble_v4.py)
     parser.add_argument('--ae-handler', type=str, default='alpha158-enhanced-v7',
                         help='Handler for AE-MLP model')
+    parser.add_argument('--ae-mn-handler', type=str, default='v9-mkt-neutral',
+                        help='Handler for AE-MLP market-neutral model')
     parser.add_argument('--cb-handler', type=str, default='catboost-v1',
                         help='Handler for CatBoost model')
 
-    # Ensemble parameters
-    parser.add_argument('--ensemble-method', type=str, default='zscore_mean',
+    # Ensemble parameters (default: zscore_weighted with stacking weights)
+    parser.add_argument('--ensemble-method', type=str, default='zscore_weighted',
                         choices=['mean', 'weighted', 'rank_mean', 'zscore_mean', 'zscore_weighted'],
-                        help='Ensemble method (default: zscore_mean)')
-    parser.add_argument('--ae-weight', type=float, default=0.5,
-                        help='AE-MLP weight for weighted ensemble')
-    parser.add_argument('--cb-weight', type=float, default=0.5,
-                        help='CatBoost weight for weighted ensemble')
+                        help='Ensemble method (default: zscore_weighted)')
+    parser.add_argument('--ae-weight', type=float, default=0.350,
+                        help='AE-MLP weight (default: 0.350)')
+    parser.add_argument('--ae-mn-weight', type=float, default=0.300,
+                        help='AE-MLP mkt-neutral weight (default: 0.300)')
+    parser.add_argument('--cb-weight', type=float, default=0.350,
+                        help='CatBoost weight (default: 0.350)')
 
     # Trading parameters
     parser.add_argument('--stock-pool', type=str, default='sp500',
@@ -488,21 +509,54 @@ def main():
 
     args = parser.parse_args()
 
-    print("="*70)
+    # Model config
+    MODEL_CONFIG = {
+        'ae': {
+            'model_arg': 'ae_model',
+            'handler_arg': 'ae_handler',
+            'handler': args.ae_handler,
+            'display': 'AE-MLP',
+            'type': 'ae_mlp',
+        },
+        'ae_mn': {
+            'model_arg': 'ae_mn_model',
+            'handler_arg': 'ae_mn_handler',
+            'handler': args.ae_mn_handler,
+            'display': 'AE-MLP-MN',
+            'type': 'ae_mlp',
+        },
+        'cb': {
+            'model_arg': 'cb_model',
+            'handler_arg': 'cb_handler',
+            'handler': args.cb_handler,
+            'display': 'CatBoost',
+            'type': 'catboost',
+        },
+    }
+
+    display_names = {k: cfg['display'] for k, cfg in MODEL_CONFIG.items()}
+    weights = {
+        'ae': args.ae_weight,
+        'ae_mn': args.ae_mn_weight,
+        'cb': args.cb_weight,
+    }
+
+    print("=" * 70)
     mode = "LIVE PREDICTION MODE" if args.predict_only else "BACKTEST MODE"
-    print(f"DAILY TRADING SCRIPT (ENSEMBLE) - {mode}")
-    print("="*70)
+    print(f"DAILY TRADING SCRIPT (ENSEMBLE V4) - {mode}")
+    print("=" * 70)
     print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"AE-MLP Model: {args.ae_model}")
-    print(f"CatBoost Model: {args.cb_model}")
-    print(f"AE Handler: {args.ae_handler}")
-    print(f"CB Handler: {args.cb_handler}")
+    for key, cfg in MODEL_CONFIG.items():
+        model_path = getattr(args, cfg['model_arg'])
+        print(f"{cfg['display']} Model:   {model_path}")
+        print(f"{cfg['display']} Handler: {cfg['handler']}")
     print(f"Ensemble Method: {args.ensemble_method}")
+    print(f"Weights: " + ", ".join(f"{cfg['display']}={weights[k]:.3f}" for k, cfg in MODEL_CONFIG.items()))
     print(f"Stock Pool: {args.stock_pool}")
     print(f"Account: ${args.account:,.2f}")
     print(f"Top-K: {args.topk}")
     print(f"Backtest Start: {args.backtest_start}")
-    print("="*70)
+    print("=" * 70)
 
     # Step 1: 下载数据
     if not args.skip_download:
@@ -553,89 +607,85 @@ def main():
     print(f"{'='*60}")
     init_qlib_for_talib()
 
-    # Step 3: 检查模型文件
+    # Step 3: 检查模型文件并加载 metadata
     print(f"\n{'='*60}")
     print("[STEP] Checking model files")
     print(f"{'='*60}")
 
-    ae_path = PROJECT_ROOT / args.ae_model
-    cb_path = PROJECT_ROOT / args.cb_model
+    model_paths = {}
+    for key, cfg in MODEL_CONFIG.items():
+        model_path = PROJECT_ROOT / getattr(args, cfg['model_arg'])
+        if not model_path.exists():
+            print(f"Error: {cfg['display']} model not found: {model_path}")
+            sys.exit(1)
+        model_paths[key] = model_path
 
-    if not ae_path.exists():
-        print(f"Error: AE-MLP model not found: {ae_path}")
-        sys.exit(1)
-    if not cb_path.exists():
-        print(f"Error: CatBoost model not found: {cb_path}")
-        sys.exit(1)
-
-    # Load metadata
-    ae_meta = load_model_meta(ae_path)
-    cb_meta = load_model_meta(cb_path)
-
-    if ae_meta and 'handler' in ae_meta:
-        args.ae_handler = ae_meta['handler']
-        print(f"    AE-MLP handler from metadata: {args.ae_handler}")
-    if cb_meta and 'handler' in cb_meta:
-        args.cb_handler = cb_meta['handler']
-        print(f"    CatBoost handler from metadata: {args.cb_handler}")
+        meta = load_model_meta(model_path)
+        if meta and 'handler' in meta:
+            cfg['handler'] = meta['handler']
+            setattr(args, cfg['handler_arg'], meta['handler'])
+            print(f"    {cfg['display']} handler from metadata: {cfg['handler']}")
 
     # Step 4: 创建数据集
     print(f"\n{'='*60}")
     print("[STEP] Creating datasets")
     print(f"{'='*60}")
 
-    print("\n  Creating AE-MLP dataset...")
-    ae_dataset = create_dataset_for_trading(
-        args.ae_handler, args.stock_pool,
-        args.test_start, args.test_end, args.nday,
-        verbose=False
-    )
-
-    print("\n  Creating CatBoost dataset...")
-    cb_dataset = create_dataset_for_trading(
-        args.cb_handler, args.stock_pool,
-        args.test_start, args.test_end, args.nday,
-        verbose=False
-    )
+    datasets = {}
+    for key, cfg in MODEL_CONFIG.items():
+        print(f"\n  Creating {cfg['display']} dataset ({cfg['handler']})...")
+        datasets[key] = create_dataset_for_trading(
+            cfg['handler'], args.stock_pool,
+            args.test_start, args.test_end, args.nday,
+            verbose=False
+        )
 
     # Step 5: 加载模型
     print(f"\n{'='*60}")
     print("[STEP] Loading models")
     print(f"{'='*60}")
 
-    ae_model = load_ae_mlp_model(ae_path)
-    cb_model = load_catboost_model(cb_path)
+    models = {}
+    for key, cfg in MODEL_CONFIG.items():
+        if cfg['type'] == 'ae_mlp':
+            models[key] = load_ae_mlp_model(model_paths[key])
+        elif cfg['type'] == 'catboost':
+            models[key] = load_catboost_model(model_paths[key])
 
     # Step 6: 生成预测
     print(f"\n{'='*60}")
     print("[STEP] Generating predictions")
     print(f"{'='*60}")
 
-    print("\n  AE-MLP predictions...")
-    pred_ae = predict_with_ae_mlp(ae_model, ae_dataset)
-    print(f"    Shape: {len(pred_ae)}, Range: [{pred_ae.min():.4f}, {pred_ae.max():.4f}]")
-
-    print("\n  CatBoost predictions...")
-    pred_cb = predict_with_catboost(cb_model, cb_dataset)
-    print(f"    Shape: {len(pred_cb)}, Range: [{pred_cb.min():.4f}, {pred_cb.max():.4f}]")
+    pred_dict = {}
+    for key, cfg in MODEL_CONFIG.items():
+        print(f"\n  {cfg['display']} predictions...")
+        if cfg['type'] == 'ae_mlp':
+            pred = predict_with_ae_mlp(models[key], datasets[key])
+        elif cfg['type'] == 'catboost':
+            pred = predict_with_catboost(models[key], datasets[key])
+        pred_dict[key] = pred
+        print(f"    Shape: {len(pred)}, Range: [{pred.min():.4f}, {pred.max():.4f}]")
 
     # Step 7: 计算相关性
     print(f"\n{'='*60}")
-    print("[STEP] Calculating correlation")
+    print("[STEP] Calculating pairwise correlations")
     print(f"{'='*60}")
 
-    overall_corr, mean_daily_corr, std_daily_corr = calculate_correlation(pred_ae, pred_cb)
-    print(f"  Overall Correlation:     {overall_corr:.4f}")
-    print(f"  Mean Daily Correlation:  {mean_daily_corr:.4f}")
-    print(f"  Std Daily Correlation:   {std_daily_corr:.4f}")
+    daily_corrs = calculate_correlation_multi(pred_dict)
+    for pair, (mean_c, std_c) in daily_corrs.items():
+        n1, n2 = pair.split(' vs ')
+        d1 = display_names.get(n1, n1)
+        d2 = display_names.get(n2, n2)
+        print(f"  {d1} vs {d2}: {mean_c:.4f} +/- {std_c:.4f}")
 
     # Step 8: 集成预测
     print(f"\n{'='*60}")
     print(f"[STEP] Ensembling predictions ({args.ensemble_method})")
     print(f"{'='*60}")
+    print(f"  Weights: " + ", ".join(f"{display_names[k]}={weights[k]:.3f}" for k in MODEL_CONFIG))
 
-    weights = (args.ae_weight, args.cb_weight) if args.ensemble_method == 'weighted' else None
-    pred_ensemble = ensemble_predictions(pred_ae, pred_cb, args.ensemble_method, weights)
+    pred_ensemble = ensemble_predictions_multi(pred_dict, args.ensemble_method, weights)
     print(f"  Ensemble shape: {len(pred_ensemble)}")
     print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
@@ -645,8 +695,8 @@ def main():
     if args.predict_only:
         run_live_prediction(
             pred_ensemble=pred_ensemble,
-            pred_ae=pred_ae,
-            pred_cb=pred_cb,
+            pred_dict=pred_dict,
+            display_names=display_names,
             stock_pool=args.stock_pool,
             topk=args.topk,
             account=args.account,
@@ -664,7 +714,7 @@ def main():
         )
 
     print(f"\n{'='*70}")
-    print("ENSEMBLE TRADING SCRIPT COMPLETED")
+    print("ENSEMBLE V4 TRADING SCRIPT COMPLETED")
     print(f"{'='*70}")
 
     # Step 10: 发送邮件报告
@@ -673,21 +723,17 @@ def main():
         print("[STEP] Sending email report")
         print(f"{'='*60}")
 
-        # 获取最近 N 天的交易详情
         recent_details = trading_details[-args.email_days:] if len(trading_details) > args.email_days else trading_details
 
         if recent_details:
-            # 生成邮件内容
-            model_info = f"AE-MLP + CatBoost ({args.ensemble_method})"
+            model_info = "AE-MLP + AE-MLP-MN + CatBoost (Ensemble V4, zscore_weighted)"
             text_body = format_trading_details_text(recent_details, model_info)
             html_body = format_trading_details_html(recent_details, model_info)
 
-            # 构建邮件主题
             start_date = recent_details[0]['date']
             end_date = recent_details[-1]['date']
-            subject = f"Ensemble Trading Report: {start_date} to {end_date}"
+            subject = f"Ensemble V4 Trading Report: {start_date} to {end_date}"
 
-            # 发送邮件
             send_email(
                 subject=subject,
                 body=text_body,

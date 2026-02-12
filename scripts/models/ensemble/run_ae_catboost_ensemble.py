@@ -49,7 +49,6 @@ from utils.backtest_utils import plot_backtest_curve, generate_trade_records
 from data.stock_pools import STOCK_POOLS
 
 from models.common import (
-    HANDLER_CONFIG,
     PROJECT_ROOT,
     QLIB_DATA_PATH,
     MODEL_SAVE_PATH,
@@ -452,6 +451,152 @@ def compute_ic(pred: pd.Series, label: pd.Series) -> tuple:
     return mean_ic, ic_std, icir, ic_by_date
 
 
+def align_features_for_catboost(X, model):
+    """Align data features to match CatBoost model's expected feature names"""
+    model_features = model.feature_names_
+    if not model_features:
+        return X
+
+    if isinstance(X.columns, pd.MultiIndex):
+        X = X.copy()
+        X.columns = [col[1] if isinstance(col, tuple) else col for col in X.columns]
+
+    data_cols = set(X.columns)
+    missing = [c for c in model_features if c not in data_cols]
+    if missing:
+        for c in missing:
+            X[c] = 0.0
+
+    return X[list(model_features)]
+
+
+def predict_catboost_raw(model, dataset, segment):
+    """Predict with CatBoost using raw data, with feature alignment"""
+    data = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
+    data = data.fillna(0).replace([np.inf, -np.inf], 0)
+    data = align_features_for_catboost(data, model)
+    pred_values = model.predict(data)
+    return pd.Series(pred_values, index=data.index, name='score')
+
+
+def run_cv_evaluation(ae_model, cb_model, args, symbols):
+    """
+    在 CV folds 上评估 ensemble IC。
+
+    对每个 fold:
+    1. 创建两个 handler 的数据集 (AE-MLP handler + CatBoost handler)
+    2. 分别生成验证集预测
+    3. Ensemble 并计算 IC
+    4. 同时在 2025 测试集上计算 IC
+    """
+    print("\n" + "=" * 70)
+    print("CROSS-VALIDATION EVALUATION (Ensemble)")
+    print("=" * 70)
+    print(f"CV Folds: {len(CV_FOLDS)}")
+    for fold in CV_FOLDS:
+        print(f"  - {fold['name']}: valid {fold['valid_start']}~{fold['valid_end']}")
+    print(f"Test Set: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']} (2025)")
+    print(f"Ensemble Method: {args.ensemble_method}")
+    print("=" * 70)
+
+    # 准备 2025 测试集
+    print("\n[CV] Preparing 2025 test data...")
+    test_time = {
+        'train_start': FINAL_TEST['train_start'],
+        'train_end': FINAL_TEST['train_end'],
+        'valid_start': FINAL_TEST['valid_start'],
+        'valid_end': FINAL_TEST['valid_end'],
+        'test_start': FINAL_TEST['test_start'],
+        'test_end': FINAL_TEST['test_end'],
+    }
+    ae_test_handler = create_data_handler(args.ae_handler, symbols, test_time, args.nday)
+    ae_test_dataset = create_dataset(ae_test_handler, test_time)
+    cb_test_handler = create_data_handler(args.cb_handler, symbols, test_time, args.nday)
+    cb_test_dataset = create_dataset(cb_test_handler, test_time)
+
+    # 测试集预测 (只需做一次)
+    test_pred_ae = predict_with_ae_mlp(ae_model, ae_test_dataset, segment="test")
+    test_pred_cb = predict_catboost_raw(cb_model, cb_test_dataset, "test")
+    weights = (args.ae_weight, args.cb_weight) if args.ensemble_method in ['weighted', 'zscore_weighted'] else None
+    test_pred_ens = ensemble_predictions(test_pred_ae, test_pred_cb, args.ensemble_method, weights)
+
+    test_label_df = ae_test_dataset.prepare("test", col_set="label", data_key=DataHandlerLP.DK_L)
+    test_label = test_label_df.iloc[:, 0] if isinstance(test_label_df, pd.DataFrame) else test_label_df
+
+    test_ens_ic, _, test_ens_icir, _ = compute_ic(test_pred_ens, test_label)
+    test_ae_ic, _, _, _ = compute_ic(test_pred_ae, test_label)
+    test_cb_ic, _, _, _ = compute_ic(test_pred_cb, test_label)
+
+    print(f"    Test (2025): AE-MLP IC={test_ae_ic:.4f}, CatBoost IC={test_cb_ic:.4f}, Ensemble IC={test_ens_ic:.4f}")
+
+    fold_results = []
+
+    for fold in CV_FOLDS:
+        print(f"\n[CV] Evaluating on {fold['name']}...")
+
+        fold_time = {
+            'train_start': fold['train_start'],
+            'train_end': fold['train_end'],
+            'valid_start': fold['valid_start'],
+            'valid_end': fold['valid_end'],
+            'test_start': fold['valid_start'],  # no test segment needed
+            'test_end': fold['valid_end'],
+        }
+
+        # AE-MLP dataset
+        ae_handler = create_data_handler(args.ae_handler, symbols, fold_time, args.nday)
+        ae_dataset = create_dataset(ae_handler, fold_time)
+
+        # CatBoost dataset
+        cb_handler = create_data_handler(args.cb_handler, symbols, fold_time, args.nday)
+        cb_dataset = create_dataset(cb_handler, fold_time)
+
+        # 验证集预测
+        val_pred_ae = predict_with_ae_mlp(ae_model, ae_dataset, segment="valid")
+        val_pred_cb = predict_catboost_raw(cb_model, cb_dataset, "valid")
+        val_pred_ens = ensemble_predictions(val_pred_ae, val_pred_cb, args.ensemble_method, weights)
+
+        # 验证集标签
+        val_label_df = ae_dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
+        val_label = val_label_df.iloc[:, 0] if isinstance(val_label_df, pd.DataFrame) else val_label_df
+
+        # IC
+        ae_ic, _, _, _ = compute_ic(val_pred_ae, val_label)
+        cb_ic, _, _, _ = compute_ic(val_pred_cb, val_label)
+        ens_ic, _, ens_icir, _ = compute_ic(val_pred_ens, val_label)
+
+        fold_results.append({
+            'name': fold['name'],
+            'ae_ic': ae_ic,
+            'cb_ic': cb_ic,
+            'ens_ic': ens_ic,
+            'ens_icir': ens_icir,
+            'test_ens_ic': test_ens_ic,
+        })
+
+        print(f"    {fold['name']}: AE-MLP={ae_ic:.4f}, CatBoost={cb_ic:.4f}, Ensemble={ens_ic:.4f}")
+
+    # 汇总
+    ens_ics = [r['ens_ic'] for r in fold_results]
+    ae_ics = [r['ae_ic'] for r in fold_results]
+    cb_ics = [r['cb_ic'] for r in fold_results]
+
+    print("\n" + "=" * 70)
+    print("CV EVALUATION COMPLETE (Ensemble)")
+    print("=" * 70)
+    print(f"{'':25s} {'AE-MLP':>10s} {'CatBoost':>10s} {'Ensemble':>10s}")
+    print(f"{'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+    for r in fold_results:
+        print(f"{r['name']:<25s} {r['ae_ic']:>10.4f} {r['cb_ic']:>10.4f} {r['ens_ic']:>10.4f}")
+    print(f"{'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+    print(f"{'Valid Mean IC':<25s} {np.mean(ae_ics):>10.4f} {np.mean(cb_ics):>10.4f} {np.mean(ens_ics):>10.4f}")
+    print(f"{'Valid IC Std':<25s} {np.std(ae_ics):>10.4f} {np.std(cb_ics):>10.4f} {np.std(ens_ics):>10.4f}")
+    print(f"{'Test IC (2025)':<25s} {test_ae_ic:>10.4f} {test_cb_ic:>10.4f} {test_ens_ic:>10.4f}")
+    print("=" * 70)
+
+    return fold_results
+
+
 def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
     """Run backtest with ensembled predictions"""
     from qlib.backtest import backtest as qlib_backtest
@@ -640,7 +785,7 @@ def main():
                         default=str(MODEL_SAVE_PATH / 'ae_mlp_cv_alpha158-enhanced-v7_sp500_5d_best.keras'),
                         help='AE-MLP model path (.keras)')
     parser.add_argument('--cb-model', type=str,
-                        default=str(MODEL_SAVE_PATH / 'catboost_cv_catboost-v1_test_5d_20260129_105915_best.cbm'),
+                        default=str(MODEL_SAVE_PATH / 'catboost_cv_catboost-v1_sp500_5d_20260129_141353_best.cbm'),
                         help='CatBoost model path (.cbm)')
 
     # Handler configuration (override metadata)
@@ -792,8 +937,12 @@ def main():
     ae_model = load_ae_mlp_model(ae_path)
     cb_model = load_catboost_model(cb_path)
 
+    # CV evaluation
+    print("\n[6] Cross-validation evaluation...")
+    run_cv_evaluation(ae_model, cb_model, args, symbols)
+
     # Generate predictions
-    print("\n[6] Generating predictions...")
+    print("\n[7] Generating predictions...")
 
     print("    AE-MLP predictions...")
     pred_ae = predict_with_ae_mlp(ae_model, ae_dataset)
@@ -833,7 +982,7 @@ def main():
         print(f"    Consider using 'rank_mean' ensemble method or normalizing predictions.")
 
     # Calculate correlation between predictions
-    print("\n[7] Calculating correlation between model outputs...")
+    print("\n[8] Calculating correlation between model outputs...")
     overall_corr, mean_daily_corr, std_daily_corr, daily_corr = calculate_correlation(pred_ae, pred_cb)
 
     print(f"\n    Prediction Correlation:")
@@ -846,7 +995,7 @@ def main():
     # Stacking: Learn optimal weights from validation set
     learned_weights = None
     if args.stacking:
-        print(f"\n[8] Stacking: Learning optimal weights from validation set...")
+        print(f"\n[9] Stacking: Learning optimal weights from validation set...")
         print(f"    Method: {args.stacking_method}")
 
         # Generate predictions on validation set
@@ -887,7 +1036,7 @@ def main():
         print(f"\n    Using zscore_weighted ensemble with learned weights")
 
     # Ensemble predictions
-    step_num = 9 if args.stacking else 8
+    step_num = 10 if args.stacking else 9
     print(f"\n[{step_num}] Ensembling predictions ({args.ensemble_method})...")
     weights = (args.ae_weight, args.cb_weight) if args.ensemble_method in ['weighted', 'zscore_weighted'] else None
     pred_ensemble = ensemble_predictions(pred_ae, pred_cb, args.ensemble_method, weights)

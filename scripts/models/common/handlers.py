@@ -165,6 +165,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V7 (~40 features: expanded stock + macro)',
         'use_talib': True,
     },
+    'alpha158-enhanced-v7-mh': {
+        'module': 'data.datahandler_enhanced_v7',
+        'class_name': 'Alpha158_Enhanced_V7_MultiHorizon',
+        'description': 'Alpha158 Enhanced V7 (~40 features) + multi-horizon labels (2d/5d/10d)',
+        'use_talib': True,
+    },
     'alpha158-enhanced-v8': {
         'module': 'data.datahandler_enhanced_v8',
         'class_name': 'Alpha158_Enhanced_V8',
@@ -278,6 +284,26 @@ HANDLER_REGISTRY = {
         'module': 'data.datahandler_v9_cboe',
         'class_name': 'Alpha158_V9_CBOE',
         'description': 'V9 + CBOE options features (SKEW, VVIX, VIX9D)',
+        'use_talib': True,
+    },
+
+    # Multi-horizon handlers (for multi-task learning)
+    'alpha158-mh': {
+        'module': 'data.datahandler_multihorizon',
+        'class_name': 'Alpha158_MultiHorizon',
+        'description': 'Alpha158 + multi-horizon labels (2d/5d/10d forward returns)',
+        'use_talib': False,
+    },
+    'alpha158-talib-lite-mh': {
+        'module': 'data.datahandler_multihorizon',
+        'class_name': 'Alpha158_TALib_Lite_MultiHorizon',
+        'description': 'Alpha158 + TA-Lib Lite + multi-horizon labels (2d/5d/10d)',
+        'use_talib': True,
+    },
+    'alpha158-talib-lite-macro-mh': {
+        'module': 'data.datahandler_multihorizon',
+        'class_name': 'Alpha158_TALib_Lite_Macro_MultiHorizon',
+        'description': 'Alpha158 + TA-Lib Lite + Macro + multi-horizon labels (2d/5d/10d)',
         'use_talib': True,
     },
 }

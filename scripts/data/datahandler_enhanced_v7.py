@@ -450,3 +450,47 @@ class Alpha158_Enhanced_V7(DataHandlerLP):
         """Return N-day return label."""
         label_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [label_expr], ["LABEL0"]
+
+
+class Alpha158_Enhanced_V7_MultiHorizon(Alpha158_Enhanced_V7):
+    """
+    Alpha158 Enhanced V7 features + multi-horizon labels (2d/5d/10d).
+
+    Inherits all V7 features (~40: stock + lagged macro regime) and replaces
+    the single-horizon label with multiple forward return labels for
+    multi-task learning.
+
+    Labels:
+      - LABEL_2d: 2-day forward return
+      - LABEL_5d: 5-day forward return (primary)
+      - LABEL_10d: 10-day forward return
+    """
+
+    def __init__(self, horizons=None, primary_horizon=5, **kwargs):
+        """
+        Args:
+            horizons: list of prediction horizons in days, e.g. [2, 5, 10]
+            primary_horizon: primary prediction target horizon
+            **kwargs: passed to Alpha158_Enhanced_V7
+        """
+        self.horizons = horizons or [2, 5, 10]
+        self.primary_horizon = primary_horizon
+        if primary_horizon not in self.horizons:
+            self.horizons.append(primary_horizon)
+            self.horizons.sort()
+
+        # volatility_window defaults to primary_horizon if not specified
+        if 'volatility_window' not in kwargs:
+            kwargs['volatility_window'] = primary_horizon
+
+        super().__init__(**kwargs)
+
+    def get_label_config(self):
+        """Return multi-horizon forward return labels."""
+        fields = []
+        names = []
+        for h in self.horizons:
+            expr = f"Ref($close, -{h})/Ref($close, -1) - 1"
+            fields.append(expr)
+            names.append(f"LABEL_{h}d")
+        return fields, names
