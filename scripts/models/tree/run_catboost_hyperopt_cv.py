@@ -89,11 +89,15 @@ from models.common import (
     create_meta_data,
     generate_model_filename,
     run_backtest,
+    load_catboost_model,
+    get_catboost_feature_count,
     # CV utilities
     CV_FOLDS,
     FINAL_TEST,
     create_data_handler_for_fold,
     create_dataset_for_fold,
+    compute_time_decay_weights,
+    prepare_features_and_labels,
     compute_ic,
 )
 
@@ -146,22 +150,6 @@ def create_catboost_params(hyperparams: dict, thread_count: int = 16) -> dict:
     }
 
 
-def compute_time_decay_weights(index, half_life_years, min_weight=0.1):
-    """计算时间衰减权重（不依赖 Reweighter 类，直接计算）"""
-    if isinstance(index, pd.MultiIndex):
-        datetimes = index.get_level_values(0)
-    else:
-        datetimes = index
-    ref_date = datetimes.max()
-    days_ago = (ref_date - datetimes).days
-    years_ago = days_ago / 365.25
-    decay_rate = np.log(2) / half_life_years
-    weights = np.exp(-decay_rate * years_ago.values.astype(float))
-    if min_weight > 0:
-        weights = np.maximum(weights, min_weight)
-    return weights
-
-
 class CVHyperoptObjective:
     """时间序列交叉验证的 Hyperopt 目标函数"""
 
@@ -186,28 +174,8 @@ class CVHyperoptObjective:
             handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
             dataset = create_dataset_for_fold(handler, fold)
 
-            if top_features:
-                train_data = dataset.prepare("train", col_set="feature")[top_features]
-                valid_data = dataset.prepare("valid", col_set="feature")[top_features]
-            else:
-                train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-                valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-
-            # Preprocess features to match feature selection script
-            train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-            valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-            # Use DK_L for labels to ensure consistent processing with feature selection
-            train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-            valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-            if isinstance(train_label_df, pd.DataFrame):
-                train_label = train_label_df.iloc[:, 0].fillna(0).values
-            else:
-                train_label = train_label_df.fillna(0).values
-            if isinstance(valid_label_df, pd.DataFrame):
-                valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-            else:
-                valid_label = valid_label_df.fillna(0).values
+            train_data, train_label = prepare_features_and_labels(dataset, "train", top_features)
+            valid_data, valid_label = prepare_features_and_labels(dataset, "valid", top_features)
 
             # Debug: Print data statistics for first fold
             if len(self.fold_data) == 0:
@@ -383,24 +351,8 @@ def first_pass_feature_selection(args, handler_config, symbols):
     handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
     dataset = create_dataset_for_fold(handler, fold)
 
-    train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-    valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-
-    # Preprocess features
-    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-    # Use DK_L for labels
-    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-    if isinstance(train_label_df, pd.DataFrame):
-        train_label = train_label_df.iloc[:, 0].fillna(0).values
-    else:
-        train_label = train_label_df.fillna(0).values
-    if isinstance(valid_label_df, pd.DataFrame):
-        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-    else:
-        valid_label = valid_label_df.fillna(0).values
+    train_data, train_label = prepare_features_and_labels(dataset, "train")
+    valid_data, valid_label = prepare_features_and_labels(dataset, "valid")
 
     train_pool = Pool(train_data, label=train_label)
     valid_pool = Pool(valid_data, label=valid_label)
@@ -529,33 +481,10 @@ def train_final_model(args, handler_config, symbols, best_params, top_features=N
     handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
-    if top_features:
-        train_data = dataset.prepare("train", col_set="feature")[top_features]
-        valid_data = dataset.prepare("valid", col_set="feature")[top_features]
-        test_data = dataset.prepare("test", col_set="feature")[top_features]
-        feature_names = top_features
-    else:
-        train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-        valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
-        feature_names = train_data.columns.tolist()
-
-    # Preprocess features to match feature selection script
-    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-    test_data = test_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-    # Use DK_L for labels to ensure consistent processing
-    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-    if isinstance(train_label_df, pd.DataFrame):
-        train_label = train_label_df.iloc[:, 0].fillna(0).values
-    else:
-        train_label = train_label_df.fillna(0).values
-    if isinstance(valid_label_df, pd.DataFrame):
-        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-    else:
-        valid_label = valid_label_df.fillna(0).values
+    train_data, train_label = prepare_features_and_labels(dataset, "train", top_features)
+    valid_data, valid_label = prepare_features_and_labels(dataset, "valid", top_features)
+    test_data, _ = prepare_features_and_labels(dataset, "test", top_features)
+    feature_names = top_features if top_features else train_data.columns.tolist()
 
     print(f"\n    Final training data:")
     print(f"      Train: {train_data.shape} ({FINAL_TEST['train_start']} ~ {FINAL_TEST['train_end']})")
@@ -681,8 +610,7 @@ def main():
 
         # Load model
         print("\n[*] Loading model...")
-        model = CatBoostRegressor()
-        model.load_model(str(model_path))
+        model = load_catboost_model(model_path)
         print(f"    ✓ Model loaded successfully")
 
         # Load metadata if available
@@ -756,18 +684,6 @@ def main():
             'test_start': FINAL_TEST['test_start'],
             'test_end': FINAL_TEST['test_end'],
         }
-
-        def load_catboost_model(path):
-            m = CatBoostRegressor()
-            m.load_model(str(path))
-            return m
-
-        def get_catboost_feature_count(m):
-            if hasattr(m, 'get_feature_count'):
-                return m.get_feature_count()
-            elif m.feature_names_:
-                return len(m.feature_names_)
-            return "N/A"
 
         run_backtest(
             model_path, dataset, test_pred, args, time_splits,
@@ -900,18 +816,6 @@ def main():
 
     # 回测
     if args.backtest:
-        def load_catboost_model(path):
-            m = CatBoostRegressor()
-            m.load_model(str(path))
-            return m
-
-        def get_catboost_feature_count(m):
-            if hasattr(m, 'get_feature_count'):
-                return m.get_feature_count()
-            elif m.feature_names_:
-                return len(m.feature_names_)
-            return "N/A"
-
         run_backtest(
             model_path, dataset, test_pred, args, time_splits,
             model_name="CatBoost (CV Hyperopt)",

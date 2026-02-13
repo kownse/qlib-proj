@@ -82,7 +82,7 @@ DEFAULT_CATBOOST_PARAMS = {
 }
 
 
-def load_params_from_file(params_file: str) -> dict:
+def load_params_from_file(params_file: str) -> tuple:
     """
     从 JSON 文件加载 CatBoost 参数
 
@@ -93,8 +93,8 @@ def load_params_from_file(params_file: str) -> dict:
 
     Returns
     -------
-    dict
-        CatBoost 参数字典
+    tuple
+        (CatBoost 参数字典, sample_weight_halflife or None)
     """
     with open(params_file, 'r') as f:
         data = json.load(f)
@@ -102,23 +102,31 @@ def load_params_from_file(params_file: str) -> dict:
     # 支持两种格式:
     # 1. hyperopt CV 格式: {"params": {...}, "cv_results": {...}}
     # 2. 直接参数格式: {"learning_rate": ..., "max_depth": ...}
+    sample_weight_halflife = None
     if 'params' in data:
         params = data['params']
         print(f"    Loaded params from CV hyperopt file")
         if 'cv_results' in data:
             cv = data['cv_results']
             print(f"    CV Mean IC: {cv.get('mean_ic', 'N/A'):.4f} (±{cv.get('std_ic', 'N/A'):.4f})")
+        if 'sample_weight_halflife' in data:
+            sample_weight_halflife = data['sample_weight_halflife']
+            print(f"    Sample weight halflife: {sample_weight_halflife} years")
     else:
         params = data
+        if 'sample_weight_halflife' in params:
+            sample_weight_halflife = params.pop('sample_weight_halflife')
+            print(f"    Sample weight halflife: {sample_weight_halflife} years")
 
     # 确保必要的参数存在
     final_params = DEFAULT_CATBOOST_PARAMS.copy()
     for key in ['learning_rate', 'max_depth', 'l2_leaf_reg', 'random_strength',
-                'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf']:
+                'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf',
+                'iterations', 'random_seed', 'loss_function']:
         if key in params:
             final_params[key] = params[key]
 
-    return final_params
+    return final_params, sample_weight_halflife
 
 from utils.utils import evaluate_model
 from data.stock_pools import STOCK_POOLS
@@ -141,7 +149,111 @@ from models.common import (
     prepare_test_data_for_prediction,
     print_prediction_stats,
     run_backtest,
+    load_catboost_model,
+    get_catboost_feature_count,
+    # CV utilities (for --params-file aligned path)
+    FINAL_TEST,
+    create_data_handler_for_fold,
+    create_dataset_for_fold,
+    compute_time_decay_weights,
+    prepare_features_and_labels,
+    compute_ic,
 )
+
+
+def train_catboost_native(args, handler_config, symbols, cb_params, halflife=0):
+    """
+    使用原生 CatBoostRegressor 训练模型（与 hyperopt CV 的 train_final_model 一致）
+
+    当 --params-file 提供时使用此函数，确保训练流程与 hyperopt CV 完全对齐:
+    - 使用 FINAL_TEST 时间划分
+    - 使用原生 CatBoostRegressor (非 qlib CatBoostModel wrapper)
+    - 使用 compute_time_decay_weights (非 TimeDecayReweighter)
+    - fillna(0).replace([np.inf, -np.inf], 0) 预处理
+    - DK_L 数据键
+
+    Returns
+    -------
+    tuple
+        (model, feature_names, test_pred, dataset)
+    """
+    print("\n[*] Training with native CatBoostRegressor (aligned with hyperopt CV)...")
+    print("    Parameters:")
+    for key, value in cb_params.items():
+        if key not in ['thread_count', 'verbose', 'loss_function', 'random_seed']:
+            print(f"      {key}: {value}")
+    if halflife > 0:
+        print(f"      sample_weight_halflife: {halflife}")
+
+    # 创建数据集 (使用 FINAL_TEST splits，与 hyperopt CV 一致)
+    handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
+    dataset = create_dataset_for_fold(handler, FINAL_TEST)
+
+    # 准备特征和标签 (使用 DK_L，与 hyperopt CV 一致)
+    train_data, train_label = prepare_features_and_labels(dataset, "train")
+    valid_data, valid_label = prepare_features_and_labels(dataset, "valid")
+    test_data, _ = prepare_features_and_labels(dataset, "test")
+    feature_names = train_data.columns.tolist()
+
+    print(f"\n    Training data:")
+    print(f"      Train: {train_data.shape} ({FINAL_TEST['train_start']} ~ {FINAL_TEST['train_end']})")
+    print(f"      Valid: {valid_data.shape} ({FINAL_TEST['valid_start']} ~ {FINAL_TEST['valid_end']})")
+    print(f"      Test:  {test_data.shape} ({FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']})")
+
+    # 样本权重 (与 hyperopt CV 一致)
+    train_weight = None
+    valid_weight = None
+    if halflife > 0:
+        train_weight = compute_time_decay_weights(train_data.index, halflife)
+        valid_weight = compute_time_decay_weights(valid_data.index, halflife)
+        print(f"\n    Using sample weights: halflife={halflife} years")
+
+    train_pool = Pool(train_data, label=train_label, weight=train_weight)
+    valid_pool = Pool(valid_data, label=valid_label, weight=valid_weight)
+
+    # 训练
+    print("\n    Training progress:")
+    model = CatBoostRegressor(**cb_params)
+    model.fit(
+        train_pool,
+        eval_set=valid_pool,
+        early_stopping_rounds=50,
+        verbose_eval=100,
+    )
+
+    print(f"\n    Best iteration: {model.best_iteration_}")
+
+    # 验证集 IC
+    valid_pred = model.predict(valid_data)
+    valid_ic, valid_ic_std, valid_icir = compute_ic(valid_pred, valid_label, valid_data.index)
+    print(f"\n    [Validation Set - for reference]")
+    print(f"    Valid IC:   {valid_ic:.4f}")
+    print(f"    Valid ICIR: {valid_icir:.4f}")
+
+    # 测试集预测
+    test_pred_values = model.predict(test_data)
+    test_pred = pd.Series(test_pred_values, index=test_data.index, name='score')
+
+    print(f"\n    Test prediction shape: {test_pred.shape}")
+    print(f"    Test prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
+
+    # 特征重要性
+    importance = model.get_feature_importance()
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importance
+    }).sort_values('importance', ascending=False)
+    print_feature_importance(importance_df, "Top 20 Features by Importance")
+
+    # 保存特征重要性
+    outputs_dir = PROJECT_ROOT / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    importance_filename = generate_model_filename("catboost_importance", args, 0, ".csv")
+    importance_path = outputs_dir / importance_filename
+    importance_df.to_csv(importance_path, index=False)
+    print(f"    Feature importance saved to: {importance_path}")
+
+    return model, feature_names, test_pred, dataset
 
 
 def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None):
@@ -192,6 +304,14 @@ def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None):
     for key in optional_params:
         if key in cb_params and cb_params[key] is not None:
             model_kwargs[key] = cb_params[key]
+
+    # subsample 需要非 Bayesian bootstrap type
+    if 'subsample' in model_kwargs:
+        model_kwargs['bootstrap_type'] = 'MVS'
+
+    # colsample_bylevel (RSM) 在 GPU 上不支持回归模式，强制使用 CPU
+    if 'colsample_bylevel' in model_kwargs:
+        model_kwargs['task_type'] = 'CPU'
 
     if 'min_data_in_leaf' in cb_params and cb_params['min_data_in_leaf'] is not None:
         model_kwargs['min_data_in_leaf'] = int(cb_params['min_data_in_leaf'])
@@ -312,6 +432,14 @@ def retrain_with_top_features(dataset, importance_df, args, cb_params=None, rewe
         if key in cb_params and cb_params[key] is not None:
             model_kwargs[key] = cb_params[key]
 
+    # subsample 需要非 Bayesian bootstrap type
+    if 'subsample' in model_kwargs:
+        model_kwargs['bootstrap_type'] = 'MVS'
+
+    # colsample_bylevel (RSM) 在 GPU 上不支持回归模式，强制使用 CPU
+    if 'colsample_bylevel' in model_kwargs:
+        model_kwargs['task_type'] = 'CPU'
+
     if 'min_data_in_leaf' in cb_params and cb_params['min_data_in_leaf'] is not None:
         model_kwargs['min_data_in_leaf'] = int(cb_params['min_data_in_leaf'])
 
@@ -360,18 +488,63 @@ def main_train_impl():
     # 获取配置
     handler_config = HANDLER_CONFIG[args.handler]
     symbols = STOCK_POOLS[args.stock_pool]
-    time_splits = get_time_splits(args.max_train)
 
     # 加载 CatBoost 参数
     cb_params = None
+    sample_weight_halflife_from_file = None
     if args.params_file:
         print(f"\n[*] Loading CatBoost params from: {args.params_file}")
-        cb_params = load_params_from_file(args.params_file)
+        cb_params, sample_weight_halflife_from_file = load_params_from_file(args.params_file)
+
+    # 如果 params file 中有 sample_weight_halflife，且 CLI 未显式设置，则使用文件中的值
+    if sample_weight_halflife_from_file is not None and args.sample_weight_halflife == 0:
+        args.sample_weight_halflife = sample_weight_halflife_from_file
+
+    # =========================================================================
+    # --params-file 模式: 使用与 hyperopt CV train_final_model 完全对齐的流程
+    # =========================================================================
+    if args.params_file:
+        time_splits = FINAL_TEST
+
+        # 打印头部信息
+        print_training_header("CatBoost", args, symbols, handler_config, time_splits)
+        print(f"Params File: {args.params_file}")
+        print(f"Mode: Aligned with hyperopt CV (FINAL_TEST splits, native CatBoostRegressor)")
+
+        # 初始化
+        init_qlib(handler_config['use_talib'])
+
+        # 确定 halflife
+        halflife = args.sample_weight_halflife
+
+        # 训练 (使用与 hyperopt CV 完全一致的流程)
+        model, feature_names, test_pred, dataset = train_catboost_native(
+            args, handler_config, symbols, cb_params, halflife=halflife)
+
+        # 评估
+        print("\n[*] Evaluation on Test Set...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+
+        # 保存模型
+        print("\n[*] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_filename = generate_model_filename("catboost", args, 0, ".cbm")
+        model_path = MODEL_SAVE_PATH / model_filename
+        meta_data = create_meta_data(args, handler_config, time_splits, feature_names, "catboost", 0)
+        meta_data['params_file'] = args.params_file
+        if halflife > 0:
+            meta_data['sample_weight_halflife'] = halflife
+        save_model_with_meta(model, model_path, meta_data)
+
+        return model_path, dataset, test_pred, args, time_splits
+
+    # =========================================================================
+    # 默认模式: 使用 qlib CatBoostModel wrapper + DEFAULT_TIME_SPLITS
+    # =========================================================================
+    time_splits = get_time_splits(args.max_train)
 
     # 打印头部信息
     print_training_header("CatBoost", args, symbols, handler_config, time_splits)
-    if args.params_file:
-        print(f"Params File: {args.params_file}")
 
     # 初始化和数据准备
     init_qlib(handler_config['use_talib'])
@@ -439,22 +612,6 @@ def main_train_impl():
         save_model_with_meta(model.model, model_path, meta_data)
 
         return model_path, dataset, test_pred, args, time_splits
-
-
-def load_catboost_model(model_path):
-    """加载 CatBoost 模型"""
-    model = CatBoostRegressor()
-    model.load_model(str(model_path))
-    return model
-
-
-def get_catboost_feature_count(model):
-    """获取 CatBoost 模型特征数量"""
-    if hasattr(model, 'get_feature_count'):
-        return model.get_feature_count()
-    elif model.feature_names_:
-        return len(model.feature_names_)
-    return "N/A"
 
 
 def main():

@@ -69,8 +69,8 @@ Examples:
     )
 
     # 基础参数
-    parser.add_argument('--nday', type=int, default=2,
-                        help='Volatility prediction window in days (default: 2)')
+    parser.add_argument('--nday', type=int, default=5,
+                        help='Volatility prediction window in days (default: 5)')
     parser.add_argument('--handler', type=str, default='alpha158',
                         choices=list(HANDLER_CONFIG.keys()),
                         help='Handler type (default: alpha158)')
@@ -585,6 +585,23 @@ def prepare_test_data_for_prediction(dataset: DatasetH, num_model_features: int)
 
     print(f"    Filtered test features: {test_data_filtered.shape[1]} (expected: {num_model_features})")
     return test_data_filtered
+
+
+def load_catboost_model(model_path):
+    """加载 CatBoost 模型"""
+    from catboost import CatBoostRegressor
+    model = CatBoostRegressor()
+    model.load_model(str(model_path))
+    return model
+
+
+def get_catboost_feature_count(model):
+    """获取 CatBoost 模型特征数量"""
+    if hasattr(model, 'get_feature_count'):
+        return model.get_feature_count()
+    elif model.feature_names_:
+        return len(model.feature_names_)
+    return "N/A"
 
 
 def print_prediction_stats(pred: pd.Series):

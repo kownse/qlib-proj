@@ -80,15 +80,23 @@ def create_data_handler_for_fold(args, handler_config, symbols, fold_config):
     # 确定数据的结束时间
     end_time = fold_config.get('test_end', fold_config['valid_end'])
 
-    handler = HandlerClass(
-        volatility_window=args.nday,
-        instruments=symbols,
-        start_time=fold_config['train_start'],
-        end_time=end_time,
-        fit_start_time=fold_config['train_start'],
-        fit_end_time=fold_config['train_end'],
-        infer_processors=[],
-    )
+    handler_kwargs = {
+        'volatility_window': args.nday,
+        'instruments': symbols,
+        'start_time': fold_config['train_start'],
+        'end_time': end_time,
+        'fit_start_time': fold_config['train_start'],
+        'fit_end_time': fold_config['train_end'],
+        'infer_processors': [],
+    }
+
+    # Apply default kwargs from handler registry (e.g., sector_features for sector handlers)
+    if 'default_kwargs' in handler_config:
+        for key, value in handler_config['default_kwargs'].items():
+            if key not in handler_kwargs:
+                handler_kwargs[key] = value
+
+    handler = HandlerClass(**handler_kwargs)
 
     return handler
 
@@ -142,6 +150,49 @@ def prepare_data_from_dataset(dataset: DatasetH, segment: str):
         return features.values, labels, features.index
     except Exception:
         return features.values, None, features.index
+
+
+def compute_time_decay_weights(index, half_life_years, min_weight=0.1):
+    """计算时间衰减权重"""
+    if isinstance(index, pd.MultiIndex):
+        datetimes = index.get_level_values(0)
+    else:
+        datetimes = index
+    ref_date = datetimes.max()
+    days_ago = (ref_date - datetimes).days
+    years_ago = days_ago / 365.25
+    decay_rate = np.log(2) / half_life_years
+    weights = np.exp(-decay_rate * years_ago.values.astype(float))
+    if min_weight > 0:
+        weights = np.maximum(weights, min_weight)
+    return weights
+
+
+def prepare_features_and_labels(dataset, segment, top_features=None):
+    """
+    从 Dataset 准备特征 DataFrame 和标签 array。
+
+    Args:
+        dataset: DatasetH 实例
+        segment: 数据段名称 ("train", "valid", "test")
+        top_features: 可选的特征列表，用于特征选择
+
+    Returns:
+        tuple: (features_df: pd.DataFrame, labels: np.ndarray)
+    """
+    if top_features:
+        features = dataset.prepare(segment, col_set="feature")[top_features]
+    else:
+        features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
+    features = features.fillna(0).replace([np.inf, -np.inf], 0)
+
+    label_df = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
+    if isinstance(label_df, pd.DataFrame):
+        labels = label_df.iloc[:, 0].fillna(0).values
+    else:
+        labels = label_df.fillna(0).values
+
+    return features, labels
 
 
 def compute_ic(pred, label, index):

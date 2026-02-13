@@ -94,6 +94,7 @@ from models.common import (
     FINAL_TEST,
     create_data_handler_for_fold,
     create_dataset_for_fold,
+    prepare_features_and_labels,
     compute_ic,
 )
 
@@ -169,28 +170,8 @@ class CVHyperoptObjective:
             handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
             dataset = create_dataset_for_fold(handler, fold)
 
-            if top_features:
-                train_data = dataset.prepare("train", col_set="feature")[top_features]
-                valid_data = dataset.prepare("valid", col_set="feature")[top_features]
-            else:
-                train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-                valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-
-            # Preprocess features
-            train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-            valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-            # Use DK_L for labels
-            train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-            valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-            if isinstance(train_label_df, pd.DataFrame):
-                train_label = train_label_df.iloc[:, 0].fillna(0).values
-            else:
-                train_label = train_label_df.fillna(0).values
-            if isinstance(valid_label_df, pd.DataFrame):
-                valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-            else:
-                valid_label = valid_label_df.fillna(0).values
+            train_data, train_label = prepare_features_and_labels(dataset, "train", top_features)
+            valid_data, valid_label = prepare_features_and_labels(dataset, "valid", top_features)
 
             # Debug: Print data statistics for first fold
             if len(self.fold_data) == 0:
@@ -345,24 +326,8 @@ def first_pass_feature_selection(args, handler_config, symbols):
     handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
     dataset = create_dataset_for_fold(handler, fold)
 
-    train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-    valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-
-    # Preprocess features
-    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-    # Use DK_L for labels
-    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-    if isinstance(train_label_df, pd.DataFrame):
-        train_label = train_label_df.iloc[:, 0].fillna(0).values
-    else:
-        train_label = train_label_df.fillna(0).values
-    if isinstance(valid_label_df, pd.DataFrame):
-        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-    else:
-        valid_label = valid_label_df.fillna(0).values
+    train_data, train_label = prepare_features_and_labels(dataset, "train")
+    valid_data, valid_label = prepare_features_and_labels(dataset, "valid")
 
     train_set = lgb.Dataset(train_data, label=train_label)
     valid_set = lgb.Dataset(valid_data, label=valid_label, reference=train_set)
@@ -475,33 +440,10 @@ def train_final_model(args, handler_config, symbols, best_params, final_test_con
     handler = create_data_handler_for_fold(args, handler_config, symbols, final_test_config)
     dataset = create_dataset_for_fold(handler, final_test_config)
 
-    if top_features:
-        train_data = dataset.prepare("train", col_set="feature")[top_features]
-        valid_data = dataset.prepare("valid", col_set="feature")[top_features]
-        test_data = dataset.prepare("test", col_set="feature")[top_features]
-        feature_names = top_features
-    else:
-        train_data = dataset.prepare("train", col_set="feature", data_key=DataHandlerLP.DK_L)
-        valid_data = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L)
-        test_data = dataset.prepare("test", col_set="feature", data_key=DataHandlerLP.DK_L)
-        feature_names = train_data.columns.tolist()
-
-    # Preprocess features
-    train_data = train_data.fillna(0).replace([np.inf, -np.inf], 0)
-    valid_data = valid_data.fillna(0).replace([np.inf, -np.inf], 0)
-    test_data = test_data.fillna(0).replace([np.inf, -np.inf], 0)
-
-    # Use DK_L for labels
-    train_label_df = dataset.prepare("train", col_set="label", data_key=DataHandlerLP.DK_L)
-    valid_label_df = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
-    if isinstance(train_label_df, pd.DataFrame):
-        train_label = train_label_df.iloc[:, 0].fillna(0).values
-    else:
-        train_label = train_label_df.fillna(0).values
-    if isinstance(valid_label_df, pd.DataFrame):
-        valid_label = valid_label_df.iloc[:, 0].fillna(0).values
-    else:
-        valid_label = valid_label_df.fillna(0).values
+    train_data, train_label = prepare_features_and_labels(dataset, "train", top_features)
+    valid_data, valid_label = prepare_features_and_labels(dataset, "valid", top_features)
+    test_data, _ = prepare_features_and_labels(dataset, "test", top_features)
+    feature_names = top_features if top_features else train_data.columns.tolist()
 
     print(f"\n    Final training data:")
     print(f"      Train: {train_data.shape} ({final_test_config['train_start']} ~ {final_test_config['train_end']})")

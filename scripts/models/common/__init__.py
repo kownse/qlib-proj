@@ -30,6 +30,8 @@ from .training import (
     create_meta_data,
     generate_model_filename,
     prepare_test_data_for_prediction,
+    load_catboost_model,
+    get_catboost_feature_count,
     print_prediction_stats,
 )
 
@@ -41,6 +43,8 @@ from .cv_utils import (
     create_data_handler_for_fold,
     create_dataset_for_fold,
     prepare_data_from_dataset,
+    compute_time_decay_weights,
+    prepare_features_and_labels,
     compute_ic,
     print_cv_info,
     prepare_cv_fold_data,

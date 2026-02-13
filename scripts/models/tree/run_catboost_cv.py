@@ -16,13 +16,12 @@ CatBoost 交叉验证训练和评估脚本
     # ===== 评估模式 (加载已训练模型) =====
     python scripts/models/tree/run_catboost_cv.py \
         --eval-only \
-        --model-path my_models/catboost_cv_xxx.cbm \
-        --handler alpha158-enhanced-v7
+        --model-path my_models/catboost_cv_xxx.cbm
 
     # ===== 训练模式 =====
-    # 使用参数文件训练
+    # 使用参数文件训练 (自动读取 sample_weight_halflife)
     python scripts/models/tree/run_catboost_cv.py \
-        --params-file outputs/hyperopt_cv/catboost_cv_best_params_xxx.json
+        --params-file outputs/hyperopt_cv/catboost_cv_best_params__alpha158-talib-macro-sector.json
 
     # 只运行 CV 训练，不训练最终模型
     python scripts/models/tree/run_catboost_cv.py \
@@ -90,18 +89,20 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
-from qlib.data.dataset.handler import DataHandlerLP
-
 from data.stock_pools import STOCK_POOLS
 
 from models.common import (
     HANDLER_CONFIG, MODEL_SAVE_PATH,
     init_qlib,
     run_backtest,
+    load_catboost_model,
+    get_catboost_feature_count,
     CV_FOLDS,
     FINAL_TEST,
     create_data_handler_for_fold,
     create_dataset_for_fold,
+    compute_time_decay_weights,
+    prepare_features_and_labels,
     compute_ic,
 )
 
@@ -128,12 +129,17 @@ def load_params_from_json(params_file: str):
     with open(params_file, 'r') as f:
         data = json.load(f)
 
+    sample_weight_halflife = 0
     if 'params' in data:
         params = data['params']
         cv_results = data.get('cv_results', {})
+        if 'sample_weight_halflife' in data:
+            sample_weight_halflife = data['sample_weight_halflife']
     else:
         params = data
         cv_results = {}
+        if 'sample_weight_halflife' in params:
+            sample_weight_halflife = params.pop('sample_weight_halflife')
 
     # 合并到默认参数
     final_params = DEFAULT_CATBOOST_PARAMS.copy()
@@ -154,6 +160,8 @@ def load_params_from_json(params_file: str):
                 'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf']:
         if key in final_params and final_params[key] is not None:
             print(f"    {key}: {final_params[key]}")
+    if sample_weight_halflife > 0:
+        print(f"    sample_weight_halflife: {sample_weight_halflife} years")
 
     if cv_results:
         print(f"\n    Original CV results:")
@@ -162,21 +170,7 @@ def load_params_from_json(params_file: str):
             for fold in cv_results['fold_results']:
                 print(f"      {fold['name']}: IC={fold['ic']:.4f}, ICIR={fold['icir']:.4f}")
 
-    return final_params, cv_results
-
-
-def prepare_fold_data(dataset, segment):
-    """准备 fold 数据: 特征和标签"""
-    features = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
-    features = features.fillna(0).replace([np.inf, -np.inf], 0)
-
-    label_df = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_L)
-    if isinstance(label_df, pd.DataFrame):
-        label = label_df.iloc[:, 0].fillna(0).values
-    else:
-        label = label_df.fillna(0).values
-
-    return features, label
+    return final_params, cv_results, sample_weight_halflife
 
 
 # ============================================================================
@@ -237,8 +231,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path):
 
     # 加载模型
     print(f"\n[*] Loading model from: {model_path}")
-    model = CatBoostRegressor()
-    model.load_model(str(model_path))
+    model = load_catboost_model(model_path)
     model_features = model.feature_names_
     num_features = len(model_features) if model_features else "unknown"
     print(f"    Model features: {num_features}")
@@ -248,7 +241,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path):
     print("\n[*] Preparing 2025 test data...")
     test_handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     test_dataset = create_dataset_for_fold(test_handler, FINAL_TEST)
-    X_test, y_test = prepare_fold_data(test_dataset, "test")
+    X_test, y_test = prepare_features_and_labels(test_dataset, "test")
     X_test = align_features(X_test, model_features)
     print(f"    Test (2025): {X_test.shape}")
 
@@ -261,7 +254,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path):
 
         handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
         dataset = create_dataset_for_fold(handler, fold)
-        X_valid, y_valid = prepare_fold_data(dataset, "valid")
+        X_valid, y_valid = prepare_features_and_labels(dataset, "valid")
         X_valid = align_features(X_valid, model_features)
 
         print(f"    Valid: {X_valid.shape}")
@@ -313,7 +306,7 @@ def run_cv_evaluation(args, handler_config, symbols, model_path):
 # 训练模式
 # ============================================================================
 
-def run_cv_training(args, handler_config, symbols, params):
+def run_cv_training(args, handler_config, symbols, params, halflife=0):
     """运行 CV 训练, 同时在 2025 测试集上评估"""
     print("\n" + "=" * 70)
     print("CROSS-VALIDATION TRAINING (CatBoost)")
@@ -325,13 +318,15 @@ def run_cv_training(args, handler_config, symbols, params):
     print(f"Test Set: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']} (2025)")
     if args.seed is not None:
         print(f"Random seed: {args.seed}")
+    if halflife > 0:
+        print(f"Sample weight halflife: {halflife} years")
     print("=" * 70)
 
     # 准备 2025 测试集
     print("\n[*] Preparing 2025 test data...")
     test_handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     test_dataset = create_dataset_for_fold(test_handler, FINAL_TEST)
-    X_test, y_test = prepare_fold_data(test_dataset, "test")
+    X_test, y_test = prepare_features_and_labels(test_dataset, "test")
     print(f"    Test (2025): {X_test.shape}")
 
     fold_results = []
@@ -344,13 +339,20 @@ def run_cv_training(args, handler_config, symbols, params):
         handler = create_data_handler_for_fold(args, handler_config, symbols, fold)
         dataset = create_dataset_for_fold(handler, fold)
 
-        X_train, y_train = prepare_fold_data(dataset, "train")
-        X_valid, y_valid = prepare_fold_data(dataset, "valid")
+        X_train, y_train = prepare_features_and_labels(dataset, "train")
+        X_valid, y_valid = prepare_features_and_labels(dataset, "valid")
 
         print(f"    Train: {X_train.shape}, Valid: {X_valid.shape}")
 
-        train_pool = Pool(X_train, label=y_train)
-        valid_pool = Pool(X_valid, label=y_valid)
+        # 样本权重
+        train_weight = None
+        valid_weight = None
+        if halflife > 0:
+            train_weight = compute_time_decay_weights(X_train.index, halflife)
+            valid_weight = compute_time_decay_weights(X_valid.index, halflife)
+
+        train_pool = Pool(X_train, label=y_train, weight=train_weight)
+        valid_pool = Pool(X_valid, label=y_valid, weight=valid_weight)
 
         # 设置种子
         fold_params = params.copy()
@@ -407,7 +409,7 @@ def run_cv_training(args, handler_config, symbols, params):
     return fold_results, mean_ic_all, std_ic_all
 
 
-def train_final_model(args, handler_config, symbols, params):
+def train_final_model(args, handler_config, symbols, params, halflife=0):
     """使用最优参数在完整数据上训练最终模型"""
     print("\n[*] Training final model on full data...")
     print("    Parameters:")
@@ -415,21 +417,31 @@ def train_final_model(args, handler_config, symbols, params):
                 'bagging_temperature', 'subsample', 'colsample_bylevel', 'min_data_in_leaf']:
         if key in params and params[key] is not None:
             print(f"      {key}: {params[key]}")
+    if halflife > 0:
+        print(f"      sample_weight_halflife: {halflife}")
 
     handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
-    X_train, y_train = prepare_fold_data(dataset, "train")
-    X_valid, y_valid = prepare_fold_data(dataset, "valid")
-    X_test, y_test = prepare_fold_data(dataset, "test")
+    X_train, y_train = prepare_features_and_labels(dataset, "train")
+    X_valid, y_valid = prepare_features_and_labels(dataset, "valid")
+    X_test, y_test = prepare_features_and_labels(dataset, "test")
 
     print(f"\n    Final training data:")
     print(f"      Train: {X_train.shape} ({FINAL_TEST['train_start']} ~ {FINAL_TEST['train_end']})")
     print(f"      Valid: {X_valid.shape} ({FINAL_TEST['valid_start']} ~ {FINAL_TEST['valid_end']})")
     print(f"      Test:  {X_test.shape} ({FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']})")
 
-    train_pool = Pool(X_train, label=y_train)
-    valid_pool = Pool(X_valid, label=y_valid)
+    # 样本权重
+    train_weight = None
+    valid_weight = None
+    if halflife > 0:
+        train_weight = compute_time_decay_weights(X_train.index, halflife)
+        valid_weight = compute_time_decay_weights(X_valid.index, halflife)
+        print(f"\n    Using sample weights: halflife={halflife} years")
+
+    train_pool = Pool(X_train, label=y_train, weight=train_weight)
+    valid_pool = Pool(X_valid, label=y_valid, weight=valid_weight)
 
     final_params = params.copy()
     if args.seed is not None:
@@ -488,7 +500,7 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
-    parser.add_argument('--handler', type=str, default='alpha158-talib-macro',
+    parser.add_argument('--handler', type=str, default='alpha158-talib-macro-sector',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
                         choices=['test', 'tech', 'sp100', 'sp500'])
@@ -502,6 +514,15 @@ def main():
                         help='Run CV with multiple seeds and report best result')
     parser.add_argument('--verbose', action='store_true',
                         help='Show training progress for each fold')
+
+    # 样本权重参数
+    parser.add_argument('--sample-weight-halflife', type=float, default=0,
+                        help='Fixed time-decay half-life in years (0=disabled). '
+                             'Overrides value from params file if set.')
+
+    # 训练参数
+    parser.add_argument('--thread-count', type=int, default=16,
+                        help='Number of threads for CatBoost training (default: 16)')
 
     # 最终训练参数
     parser.add_argument('--n-epochs', type=int, default=1000,
@@ -559,25 +580,23 @@ def main():
                 'test_end': FINAL_TEST['test_end'],
             }
 
-            def load_model_func(path):
-                m = CatBoostRegressor()
-                m.load_model(str(path))
-                return m
-
-            def get_feature_count_func(m):
-                return len(m.feature_names_) if m.feature_names_ else "N/A"
-
             run_backtest(
                 args.model_path, test_dataset, pred_df, args, time_splits,
                 model_name="CatBoost (CV Eval)",
-                load_model_func=load_model_func,
-                get_feature_count_func=get_feature_count_func,
+                load_model_func=load_catboost_model,
+                get_feature_count_func=get_catboost_feature_count,
             )
 
         return
 
     # ========== 训练模式 ==========
-    params, original_cv_results = load_params_from_json(args.params_file)
+    params, original_cv_results, file_halflife = load_params_from_json(args.params_file)
+
+    # 确定 halflife: CLI 显式设置优先，否则用文件中的值
+    halflife = args.sample_weight_halflife if args.sample_weight_halflife > 0 else file_halflife
+
+    # 覆盖 thread_count
+    params['thread_count'] = args.thread_count
 
     print("\n" + "=" * 70)
     print("CatBoost Cross-Validation Training")
@@ -586,6 +605,8 @@ def main():
     print(f"Handler: {args.handler}")
     print(f"N-day: {args.nday}")
     print(f"CV Folds: {len(CV_FOLDS)}")
+    if halflife > 0:
+        print(f"Sample weight halflife: {halflife} years")
     if args.num_seeds > 1:
         print(f"Num seeds: {args.num_seeds}")
     print("=" * 70)
@@ -604,7 +625,7 @@ def main():
             print(f"{'='*70}")
 
             fold_results, mean_ic, std_ic = run_cv_training(
-                args, handler_config, symbols, params
+                args, handler_config, symbols, params, halflife=halflife
             )
             mean_test_ic = np.mean([r['test_ic'] for r in fold_results])
             all_results.append({
@@ -636,7 +657,7 @@ def main():
         print("=" * 70)
     else:
         fold_results, mean_ic, std_ic = run_cv_training(
-            args, handler_config, symbols, params
+            args, handler_config, symbols, params, halflife=halflife
         )
 
     # 比较
@@ -653,7 +674,7 @@ def main():
 
     # 训练最终模型
     model, test_pred, dataset = train_final_model(
-        args, handler_config, symbols, params
+        args, handler_config, symbols, params, halflife=halflife
     )
 
     # 保存模型
@@ -677,19 +698,11 @@ def main():
             'test_end': FINAL_TEST['test_end'],
         }
 
-        def load_model(path):
-            m = CatBoostRegressor()
-            m.load_model(str(path))
-            return m
-
-        def get_feature_count(m):
-            return len(m.feature_names_) if m.feature_names_ else "N/A"
-
         run_backtest(
             model_path, dataset, pred_df, args, time_splits,
             model_name="CatBoost (CV)",
-            load_model_func=load_model,
-            get_feature_count_func=get_feature_count,
+            load_model_func=load_catboost_model,
+            get_feature_count_func=get_catboost_feature_count,
         )
 
     print("\n" + "=" * 70)
