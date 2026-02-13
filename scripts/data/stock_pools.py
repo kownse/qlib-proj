@@ -14,18 +14,22 @@ TEST_SYMBOLS = [
     "NVDA", "TSLA", "JPM", "V", "JNJ"
 ]
 
-# 美股核心科技股（约30只）
+# 美股核心科技股（约50只）
 TECH_SYMBOLS = [
     # 超大型科技（Magnificent 7）
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-    # 半导体
-    "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT",
-    # 软件/云服务
-    "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR",
-    # 互联网/消费科技
-    "NFLX", "UBER", "ABNB", "SHOP", "PYPL", "SPOT",
+    # AI 半导体/硬件
+    "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT", "ARM", "MRVL", "SNDK",
+    # AI 服务器/基础设施
+    "DELL", "SMCI", "VRT", "ANET", "NBIS", "CRWV",
+    # AI 软件/云服务
+    "CRM", "ORCL", "ADBE", "NOW", "SNOW", "PLTR", "WDAY", "DDOG", "MDB", "PATH",
+    # AI 安全
+    "PANW", "CRWD", "ZS", "NET",
+    # AI 应用/消费科技
+    "APP", "NFLX", "UBER", "ABNB", "SHOP", "PYPL", "SPOT",
     # 网络/通信设备
-    "CSCO", "PANW", "CRWD",
+    "CSCO",
 ]
 
 # S&P 100 成分股（100只，流动性最好）
@@ -50,7 +54,7 @@ SP500_SYMBOLS = [
     "ADM", "ADP", "ADSK", "AEE", "AEP", "AES", "AFL", "AIG", "AIZ", "AJG",
     "AKAM", "ALB", "ALGN", "ALL", "ALLE", "AMAT", "AMCR", "AMD", "AME", "AMGN",
     "AMP", "AMT", "AMZN", "ANET", "ANSS", "AON", "AOS", "APA", "APD", "APH",
-    "APTV", "ARE", "ATO", "AVB", "AVGO", "AVY", "AWK", "AXON", "AXP", "AZO",
+    "APP", "APTV", "ARE", "ARM", "ATO", "AVB", "AVGO", "AVY", "AWK", "AXON", "AXP", "AZO",
     # B (注: BF.B 和 BRK.B 因含 "." 导致处理问题，已剔除)
     "BA", "BAC", "BALL", "BAX", "BBWI", "BBY", "BDX", "BEN", "BG",
     "BIIB", "BIO", "BK", "BKNG", "BKR", "BLDR", "BLK", "BMY", "BR",
@@ -60,10 +64,10 @@ SP500_SYMBOLS = [
     "CDNS", "CDW", "CE", "CEG", "CF", "CFG", "CHD", "CHRW", "CHTR", "CI",
     "CINF", "CL", "CLX", "CMA", "CMCSA", "CME", "CMG", "CMI", "CMS", "CNC",
     "CNP", "COF", "COO", "COP", "COR", "COST", "CPAY", "CPB", "CPRT", "CPT",
-    "CRL", "CRM", "CSCO", "CSGP", "CSX", "CTAS", "CTLT", "CTRA", "CTSH", "CTVA",
+    "CRL", "CRM", "CRWD", "CRWV", "CSCO", "CSGP", "CSX", "CTAS", "CTLT", "CTRA", "CTSH", "CTVA",
     "CVS", "CVX", "CZR",
     # D
-    "D", "DAL", "DAY", "DD", "DE", "DECK", "DFS", "DG", "DGX", "DHI",
+    "D", "DAL", "DAY", "DD", "DDOG", "DE", "DECK", "DELL", "DFS", "DG", "DGX", "DHI",
     "DHR", "DIS", "DLR", "DLTR", "DOC", "DOV", "DOW", "DPZ", "DRI", "DTE",
     "DUK", "DVA", "DVN",
     # E
@@ -91,17 +95,17 @@ SP500_SYMBOLS = [
     "KVUE", "L", "LDOS", "LEN", "LH", "LHX", "LIN", "LKQ", "LLY", "LMT",
     "LNT", "LOW", "LRCX", "LULU", "LUV", "LVS", "LW", "LYB", "LYV",
     # M
-    "MA", "MAA", "MAR", "MAS", "MCD", "MCHP", "MCK", "MCO", "MDLZ", "MDT",
+    "MA", "MAA", "MAR", "MAS", "MCD", "MCHP", "MCK", "MCO", "MDB", "MDLZ", "MDT",
     "MET", "META", "MGM", "MHK", "MKC", "MKTX", "MLM", "MMC", "MMM", "MNST",
     "MO", "MOH", "MOS", "MPC", "MPWR", "MRK", "MRNA", "MRO", "MS", "MSCI",
-    "MSFT", "MSI", "MTB", "MTCH", "MTD", "MU",
+    "MRVL", "MSFT", "MSI", "MTB", "MTCH", "MTD", "MU",
     # N
-    "NCLH", "NDAQ", "NDSN", "NEE", "NEM", "NFLX", "NI", "NKE", "NOC", "NOW",
+    "NBIS", "NCLH", "NDAQ", "NDSN", "NEE", "NEM", "NET", "NFLX", "NI", "NKE", "NOC", "NOW",
     "NRG", "NSC", "NTAP", "NTRS", "NUE", "NVDA", "NVR", "NWS", "NWSA",
     # O
     "O", "ODFL", "OKE", "OMC", "ON", "ORCL", "ORLY", "OTIS", "OXY",
     # P
-    "PANW", "PARA", "PAYC", "PAYX", "PCAR", "PCG", "PEG", "PEP", "PFE", "PFG",
+    "PANW", "PARA", "PATH", "PAYC", "PAYX", "PCAR", "PCG", "PEG", "PEP", "PFE", "PFG",
     "PG", "PGR", "PH", "PHM", "PKG", "PLD", "PLTR", "PM", "PNC", "PNR",
     "PNW", "PODD", "POOL", "PPG", "PPL", "PRU", "PSA", "PSX", "PTC", "PWR",
     "PXD", "PYPL",
@@ -109,7 +113,7 @@ SP500_SYMBOLS = [
     "QCOM", "QRVO", "RCL", "REG", "REGN", "RF", "RJF", "RL", "RMD", "ROK",
     "ROL", "ROP", "ROST", "RSG", "RTX",
     # S
-    "SBAC", "SBUX", "SCHW", "SHW", "SJM", "SLB", "SMCI", "SNA", "SNPS", "SO",
+    "SBAC", "SBUX", "SCHW", "SHW", "SJM", "SLB", "SMCI", "SNA", "SNDK", "SNOW", "SNPS", "SO",
     "SOLV", "SPG", "SPGI", "SRE", "STE", "STLD", "STT", "STX", "STZ", "SWK",
     "SWKS", "SYF", "SYK", "SYY",
     # T
@@ -119,13 +123,13 @@ SP500_SYMBOLS = [
     # U
     "UAL", "UBER", "UDR", "UHS", "ULTA", "UNH", "UNP", "UPS", "URI", "USB",
     # V
-    "V", "VICI", "VLO", "VLTO", "VMC", "VRSK", "VRSN", "VRTX", "VST", "VTR",
+    "V", "VICI", "VLO", "VLTO", "VMC", "VRSK", "VRSN", "VRT", "VRTX", "VST", "VTR",
     "VTRS", "VZ",
     # W
-    "WAB", "WAT", "WBA", "WBD", "WDC", "WEC", "WELL", "WFC", "WM", "WMB",
+    "WAB", "WAT", "WBA", "WBD", "WDAY", "WDC", "WEC", "WELL", "WFC", "WM", "WMB",
     "WMT", "WRB", "WST", "WTW", "WY", "WYNN",
     # X-Z
-    "XEL", "XOM", "XYL", "YUM", "ZBH", "ZBRA", "ZTS",
+    "XEL", "XOM", "XYL", "YUM", "ZBH", "ZBRA", "ZS", "ZTS",
 ]
 
 # 宏观/ETF 指标（用于市场状态特征）

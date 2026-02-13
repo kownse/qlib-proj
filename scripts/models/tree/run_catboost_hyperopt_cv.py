@@ -113,9 +113,22 @@ SEARCH_SPACE = {
     'min_data_in_leaf': scope.int(hp.quniform('min_data_in_leaf', 5, 100, 1)),
 }
 
+# 带 sample weight 搜索的扩展空间
+SEARCH_SPACE_WITH_WEIGHT = {
+    **SEARCH_SPACE,
+    'sample_weight_halflife': hp.choice('sample_weight_halflife', [
+        0,     # 不使用样本权重
+        3,     # 3年半衰期 (激进衰减)
+        5,     # 5年半衰期
+        8,     # 8年半衰期
+        10,    # 10年半衰期
+        15,    # 15年半衰期 (温和衰减)
+    ]),
+}
 
-def create_catboost_params(hyperparams: dict) -> dict:
-    """将 hyperopt 参数转换为 CatBoost 参数"""
+
+def create_catboost_params(hyperparams: dict, thread_count: int = 16) -> dict:
+    """将 hyperopt 参数转换为 CatBoost 参数（不含 sample_weight_halflife）"""
     return {
         'loss_function': 'RMSE',
         'iterations': 1000,
@@ -127,16 +140,33 @@ def create_catboost_params(hyperparams: dict) -> dict:
         'subsample': hyperparams['subsample'],
         'colsample_bylevel': hyperparams['colsample_bylevel'],
         'min_data_in_leaf': int(hyperparams['min_data_in_leaf']),
-        'thread_count': 16,
+        'thread_count': thread_count,
         'verbose': False,
         'random_seed': 42,
     }
 
 
+def compute_time_decay_weights(index, half_life_years, min_weight=0.1):
+    """计算时间衰减权重（不依赖 Reweighter 类，直接计算）"""
+    if isinstance(index, pd.MultiIndex):
+        datetimes = index.get_level_values(0)
+    else:
+        datetimes = index
+    ref_date = datetimes.max()
+    days_ago = (ref_date - datetimes).days
+    years_ago = days_ago / 365.25
+    decay_rate = np.log(2) / half_life_years
+    weights = np.exp(-decay_rate * years_ago.values.astype(float))
+    if min_weight > 0:
+        weights = np.maximum(weights, min_weight)
+    return weights
+
+
 class CVHyperoptObjective:
     """时间序列交叉验证的 Hyperopt 目标函数"""
 
-    def __init__(self, args, handler_config, symbols, top_features=None, verbose=False):
+    def __init__(self, args, handler_config, symbols, top_features=None, verbose=False,
+                 fixed_halflife=0, search_weight=False):
         self.args = args
         self.handler_config = handler_config
         self.symbols = symbols
@@ -144,6 +174,8 @@ class CVHyperoptObjective:
         self.verbose = verbose
         self.trial_count = 0
         self.best_mean_ic = -float('inf')
+        self.fixed_halflife = fixed_halflife  # 固定 halflife（>0 时启用）
+        self.search_weight = search_weight    # 是否搜索 halflife
 
         # 预先准备所有 fold 的数据
         print("\n[*] Preparing data for all CV folds...")
@@ -190,14 +222,23 @@ class CVHyperoptObjective:
                 label_std_per_date = valid_label_df.groupby(level='datetime')['label'].std()
                 print(f"        valid_label std per date: min={label_std_per_date.min():.6f}, max={label_std_per_date.max():.6f}, mean={label_std_per_date.mean():.6f}")
 
+            # 预计算固定 halflife 权重（如果指定）
+            train_weight = None
+            valid_weight = None
+            if self.fixed_halflife > 0:
+                train_weight = compute_time_decay_weights(train_data.index, self.fixed_halflife)
+                valid_weight = compute_time_decay_weights(valid_data.index, self.fixed_halflife)
+
             self.fold_data.append({
                 'name': fold['name'],
                 'train_data': train_data,
                 'valid_data': valid_data,
                 'train_label': train_label,
                 'valid_label': valid_label,
-                'train_pool': Pool(train_data, label=train_label),
-                'valid_pool': Pool(valid_data, label=valid_label),
+                'train_weight': train_weight,
+                'valid_weight': valid_weight,
+                'train_pool': Pool(train_data, label=train_label, weight=train_weight),
+                'valid_pool': Pool(valid_data, label=valid_label, weight=valid_weight),
             })
 
             print(f"      Train: {train_data.shape}, Valid: {valid_data.shape}")
@@ -207,15 +248,23 @@ class CVHyperoptObjective:
     def __call__(self, hyperparams):
         """目标函数: 在所有 fold 上训练并返回平均验证集 IC"""
         self.trial_count += 1
-        cb_params = create_catboost_params(hyperparams)
+        cb_params = create_catboost_params(hyperparams, thread_count=self.args.thread_count)
+
+        # 确定本次 trial 的 halflife
+        trial_halflife = 0
+        if self.search_weight:
+            trial_halflife = hyperparams.get('sample_weight_halflife', 0)
+        elif self.fixed_halflife > 0:
+            trial_halflife = self.fixed_halflife
 
         # 打印 Trial 开始信息
+        weight_str = f", halflife={trial_halflife}" if trial_halflife > 0 else ""
         if self.verbose:
             print(f"\n{'='*60}")
             print(f"Trial {self.trial_count}/{self.args.max_evals} | Best IC so far: {self.best_mean_ic:.4f}")
             print(f"{'='*60}")
             print(f"  Params: lr={hyperparams['learning_rate']:.4f}, depth={int(hyperparams['max_depth'])}, "
-                  f"l2={hyperparams['l2_leaf_reg']:.2f}, subsample={hyperparams['subsample']:.2f}")
+                  f"l2={hyperparams['l2_leaf_reg']:.2f}, subsample={hyperparams['subsample']:.2f}{weight_str}")
             sys.stdout.flush()
 
         fold_ics = []
@@ -227,13 +276,24 @@ class CVHyperoptObjective:
                     print(f"\n  [{fold_idx+1}/{len(self.fold_data)}] {fold['name']}...")
                     sys.stdout.flush()
 
+                # 确定使用的 Pool（搜索权重时需要动态创建）
+                if self.search_weight and trial_halflife > 0:
+                    tw = compute_time_decay_weights(fold['train_data'].index, trial_halflife)
+                    vw = compute_time_decay_weights(fold['valid_data'].index, trial_halflife)
+                    train_pool = Pool(fold['train_data'], label=fold['train_label'], weight=tw)
+                    valid_pool = Pool(fold['valid_data'], label=fold['valid_label'], weight=vw)
+                else:
+                    # 使用预创建的 pool（含固定权重或无权重）
+                    train_pool = fold['train_pool']
+                    valid_pool = fold['valid_pool']
+
                 # 训练模型
                 model = CatBoostRegressor(**cb_params)
 
                 # verbose 控制训练日志输出
                 model.fit(
-                    fold['train_pool'],
-                    eval_set=fold['valid_pool'],
+                    train_pool,
+                    eval_set=valid_pool,
                     early_stopping_rounds=50,
                     verbose=100 if self.verbose else False,
                 )
@@ -289,7 +349,7 @@ class CVHyperoptObjective:
                 print(f"  {'─'*50}")
             else:
                 # 简洁输出: 一行显示 trial 结果
-                print(f"Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) [{fold_ic_str}] lr={hyperparams['learning_rate']:.4f}{is_best}")
+                print(f"Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) [{fold_ic_str}] lr={hyperparams['learning_rate']:.4f}{weight_str}{is_best}")
             sys.stdout.flush()
 
             return {
@@ -351,7 +411,7 @@ def first_pass_feature_selection(args, handler_config, symbols):
         max_depth=6,
         l2_leaf_reg=3,
         random_strength=1,
-        thread_count=16,
+        thread_count=args.thread_count,
         verbose=False,
     )
 
@@ -381,6 +441,9 @@ def first_pass_feature_selection(args, handler_config, symbols):
 
 def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
     """运行时间序列交叉验证的超参数搜索"""
+    fixed_halflife = getattr(args, 'sample_weight_halflife', 0)
+    search_weight = getattr(args, 'search_sample_weight', False)
+
     print("\n" + "=" * 70)
     print("HYPEROPT SEARCH WITH TIME-SERIES CROSS-VALIDATION")
     print("=" * 70)
@@ -389,10 +452,20 @@ def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
         print(f"  - {fold['name']}: train {fold['train_start']}~{fold['train_end']}, "
               f"valid {fold['valid_start']}~{fold['valid_end']}")
     print(f"Max evaluations: {args.max_evals}")
+    if search_weight:
+        print(f"Sample weight: SEARCH [0, 3, 5, 8, 10, 15 years halflife]")
+    elif fixed_halflife > 0:
+        print(f"Sample weight: fixed halflife={fixed_halflife} years")
     print("=" * 70)
 
     # 创建目标函数
-    objective = CVHyperoptObjective(args, handler_config, symbols, top_features, verbose=args.verbose)
+    objective = CVHyperoptObjective(
+        args, handler_config, symbols, top_features, verbose=args.verbose,
+        fixed_halflife=fixed_halflife, search_weight=search_weight,
+    )
+
+    # 选择搜索空间
+    search_space = SEARCH_SPACE_WITH_WEIGHT if search_weight else SEARCH_SPACE
 
     # 运行搜索
     trials = Trials()
@@ -400,7 +473,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
 
     best = fmin(
         fn=objective,
-        space=SEARCH_SPACE,
+        space=search_space,
         algo=tpe.suggest,
         max_evals=args.max_evals,
         trials=trials,
@@ -408,9 +481,21 @@ def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
     )
 
     # 获取最佳结果
-    best_params = create_catboost_params(best)
+    best_params = create_catboost_params(best, thread_count=args.thread_count)
     best_trial_idx = np.argmin([t['result']['loss'] for t in trials.trials])
     best_trial = trials.trials[best_trial_idx]['result']
+
+    # 提取最佳 halflife
+    best_halflife = 0
+    if search_weight:
+        # hp.choice 返回索引, 映射回实际值
+        halflife_choices = [0, 3, 5, 8, 10, 15]
+        halflife_idx = best.get('sample_weight_halflife', 0)
+        best_halflife = halflife_choices[halflife_idx]
+        best_trial['best_halflife'] = best_halflife
+    elif fixed_halflife > 0:
+        best_halflife = fixed_halflife
+        best_trial['best_halflife'] = best_halflife
 
     print("\n" + "=" * 70)
     print("CV HYPEROPT SEARCH COMPLETE")
@@ -423,18 +508,22 @@ def run_hyperopt_cv_search(args, handler_config, symbols, top_features=None):
     for key, value in best_params.items():
         if key not in ['thread_count', 'verbose', 'loss_function', 'random_seed']:
             print(f"  {key}: {value}")
+    if best_halflife > 0:
+        print(f"  sample_weight_halflife: {best_halflife}")
     print("=" * 70)
 
     return best_params, trials, best_trial
 
 
-def train_final_model(args, handler_config, symbols, best_params, top_features=None):
+def train_final_model(args, handler_config, symbols, best_params, top_features=None, halflife=0):
     """使用最优参数在完整数据上训练最终模型"""
     print("\n[*] Training final model on full data...")
     print("    Parameters:")
     for key, value in best_params.items():
         if key not in ['thread_count', 'verbose', 'loss_function', 'random_seed']:
             print(f"      {key}: {value}")
+    if halflife > 0:
+        print(f"      sample_weight_halflife: {halflife}")
 
     # 创建最终数据集
     handler = create_data_handler_for_fold(args, handler_config, symbols, FINAL_TEST)
@@ -473,8 +562,15 @@ def train_final_model(args, handler_config, symbols, best_params, top_features=N
     print(f"      Valid: {valid_data.shape} ({FINAL_TEST['valid_start']} ~ {FINAL_TEST['valid_end']})")
     print(f"      Test:  {test_data.shape} ({FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']})")
 
-    train_pool = Pool(train_data, label=train_label)
-    valid_pool = Pool(valid_data, label=valid_label)
+    train_weight = None
+    valid_weight = None
+    if halflife > 0:
+        train_weight = compute_time_decay_weights(train_data.index, halflife)
+        valid_weight = compute_time_decay_weights(valid_data.index, halflife)
+        print(f"\n    Using sample weights: halflife={halflife} years")
+
+    train_pool = Pool(train_data, label=train_label, weight=train_weight)
+    valid_pool = Pool(valid_data, label=valid_label, weight=valid_weight)
 
     # 训练
     print("\n    Training progress:")
@@ -520,6 +616,16 @@ def main():
 
     # Hyperopt 参数
     parser.add_argument('--max-evals', type=int, default=50)
+
+    # 样本权重参数
+    parser.add_argument('--sample-weight-halflife', type=float, default=0,
+                        help='Fixed time-decay half-life in years (0=disabled)')
+    parser.add_argument('--search-sample-weight', action='store_true',
+                        help='Include sample weight halflife in hyperopt search space')
+
+    # 训练参数
+    parser.add_argument('--thread-count', type=int, default=16,
+                        help='Number of threads for CatBoost training (default: 16)')
 
     # 回测参数
     parser.add_argument('--backtest', action='store_true')
@@ -689,6 +795,10 @@ def main():
     print(f"Top-K features: {args.top_k}")
     print(f"Max evaluations: {args.max_evals}")
     print(f"CV Folds: {len(CV_FOLDS)}")
+    if args.search_sample_weight:
+        print(f"Sample weight: SEARCH [0, 3, 5, 8, 10, 15 years]")
+    elif args.sample_weight_halflife > 0:
+        print(f"Sample weight: fixed halflife={args.sample_weight_halflife} years")
     print("=" * 70)
 
     # 初始化
@@ -706,6 +816,11 @@ def main():
         args, handler_config, symbols, top_features
     )
 
+    # 确定最终模型使用的 halflife
+    final_halflife = best_trial.get('best_halflife', 0)
+    if not final_halflife and args.sample_weight_halflife > 0:
+        final_halflife = args.sample_weight_halflife
+
     # 保存搜索结果
     output_dir = PROJECT_ROOT / "outputs" / "hyperopt_cv"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -716,6 +831,7 @@ def main():
     params_to_save = {
         'params': {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
                    for k, v in best_params.items()},
+        'sample_weight_halflife': final_halflife,
         'cv_results': {
             'mean_ic': best_trial['mean_ic'],
             'std_ic': best_trial['std_ic'],
@@ -745,7 +861,8 @@ def main():
 
     # 训练最终模型
     model, feature_names, test_pred, dataset = train_final_model(
-        args, handler_config, symbols, best_params, top_features
+        args, handler_config, symbols, best_params, top_features,
+        halflife=final_halflife,
     )
 
     # 评估
@@ -772,6 +889,8 @@ def main():
 
     meta_data = create_meta_data(args, handler_config, time_splits, feature_names, "catboost_cv", args.top_k)
     meta_data['cv_params'] = best_params
+    if final_halflife > 0:
+        meta_data['sample_weight_halflife'] = final_halflife
     meta_data['cv_results'] = {
         'mean_ic': best_trial['mean_ic'],
         'std_ic': best_trial['std_ic'],
@@ -804,6 +923,8 @@ def main():
     print("CV HYPEROPT COMPLETE")
     print("=" * 70)
     print(f"CV Mean IC: {best_trial['mean_ic']:.4f} (±{best_trial['std_ic']:.4f})")
+    if final_halflife > 0:
+        print(f"Sample weight halflife: {final_halflife} years")
     print(f"Model saved to: {model_path}")
     print(f"Best parameters: {params_file}")
     print("=" * 70)

@@ -2,9 +2,12 @@
 Custom trading strategies for backtesting.
 
 Extends Qlib's built-in strategies with additional features like
-configurable rebalance frequency and dynamic risk control.
+configurable rebalance frequency, dynamic risk control,
+and portfolio optimization (MVO, Risk Parity, etc.).
 """
 
+import copy
+import warnings
 import numpy as np
 import pandas as pd
 from qlib.data import D
@@ -657,6 +660,323 @@ class MomentumVolatilityRiskStrategy:
         return MomentumVolatilityTopkStrategy
 
 
+class OptimizedWeightStrategy:
+    """
+    基于 PortfolioOptimizer 的权重优化策略。
+
+    支持 4 种优化方法:
+    - mvo: Mean-Variance Optimization (利用模型预测 + 协方差矩阵)
+    - rp: Risk Parity (等风险贡献)
+    - gmv: Global Minimum Variance (最小化组合波动)
+    - inv: Inverse Volatility (反波动率加权)
+
+    支持 rebalance_freq 控制调仓频率。
+    """
+
+    @staticmethod
+    def create_strategy_class(
+        opt_method="mvo",
+        lamb=2.0,
+        delta=0.2,
+        alpha=0.01,
+        scale_return=True,
+        cov_lookback=60,
+        rebalance_freq=1,
+        risk_degree=0.95,
+        max_weight=0.0,
+    ):
+        """
+        Create a WeightStrategyBase subclass with portfolio optimization.
+
+        Parameters
+        ----------
+        opt_method : str
+            Optimization method: "mvo", "rp", "gmv", "inv"
+        lamb : float
+            Risk aversion for MVO (higher = more risk-averse)
+        delta : float
+            Turnover limit per rebalance (0.2 = max 20% turnover)
+        alpha : float
+            L2 regularization to prevent weight concentration
+        scale_return : bool
+            Scale prediction scores to match covariance magnitude
+        cov_lookback : int
+            Days of history for covariance estimation
+        rebalance_freq : int
+            Rebalance every N days
+        risk_degree : float
+            Fraction of capital to deploy (default 0.95)
+        max_weight : float
+            Maximum weight per stock (0 = no limit, 0.15 = max 15% per stock).
+            Excess weight is redistributed proportionally to other stocks.
+
+        Returns
+        -------
+        type
+            A strategy class with portfolio optimization
+        """
+        from qlib.contrib.strategy.signal_strategy import WeightStrategyBase
+        from qlib.contrib.strategy.optimizer import PortfolioOptimizer
+        from qlib.backtest.decision import TradeDecisionWO
+
+        _opt_method = opt_method
+        _lamb = lamb
+        _delta = delta
+        _alpha = alpha
+        _scale_return = scale_return
+        _cov_lookback = cov_lookback
+        _rebalance_freq = rebalance_freq
+        _risk_degree = risk_degree
+        _max_weight = max_weight
+
+        class OptimizedWeightStrategyImpl(WeightStrategyBase):
+            def __init__(self, *, topk=30, rebalance_freq=1, **kwargs):
+                super().__init__(**kwargs)
+                self._topk = topk
+                self._rebalance_freq = _rebalance_freq
+                print(f"[MVO-INIT] OptimizedWeightStrategyImpl created: topk={topk}, rebalance_freq={_rebalance_freq}, method={_opt_method}")
+                self._risk_degree = _risk_degree
+                self._max_weight = _max_weight
+                self._optimizer = PortfolioOptimizer(
+                    method=_opt_method,
+                    lamb=_lamb,
+                    delta=_delta,
+                    alpha=_alpha,
+                    scale_return=_scale_return,
+                )
+                self._cov_lookback = _cov_lookback
+                self._prev_weights = {}
+
+            def get_risk_degree(self, trade_step=None):
+                return self._risk_degree
+
+            def generate_trade_decision(self, execute_result=None):
+                trade_step = self.trade_calendar.get_trade_step()
+
+                # Rebalance frequency control
+                if self._rebalance_freq > 1 and trade_step % self._rebalance_freq != 0:
+                    return TradeDecisionWO([], self)
+
+                # On rebalance days, replicate WeightStrategyBase logic with debug
+                trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+                pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+                pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+
+                if pred_score is None:
+                    print(f"[MVO-DEBUG] Step={trade_step}: pred_score is None, no trade")
+                    return TradeDecisionWO([], self)
+
+                if isinstance(pred_score, pd.DataFrame):
+                    pred_score = pred_score.iloc[:, 0]
+
+                current_temp = copy.deepcopy(self.trade_position)
+
+                target_weight_position = self.generate_target_weight_position(
+                    score=pred_score, current=current_temp,
+                    trade_start_time=trade_start_time, trade_end_time=trade_end_time
+                )
+
+                if trade_step < 8:
+                    print(f"[MVO-DEBUG] Step={trade_step}: target_weights={len(target_weight_position)} stocks, "
+                          f"weights={dict(list(target_weight_position.items())[:3])}...")
+
+                order_list = self.order_generator.generate_order_list_from_target_weight_position(
+                    current=current_temp,
+                    trade_exchange=self.trade_exchange,
+                    risk_degree=self.get_risk_degree(trade_step),
+                    target_weight_position=target_weight_position,
+                    pred_start_time=pred_start_time,
+                    pred_end_time=pred_end_time,
+                    trade_start_time=trade_start_time,
+                    trade_end_time=trade_end_time,
+                )
+
+                if trade_step < 8:
+                    print(f"[MVO-DEBUG] Step={trade_step}: order_list={len(order_list)} orders")
+
+                return TradeDecisionWO(order_list, self)
+
+            def generate_target_weight_position(self, score, current,
+                                                 trade_start_time, trade_end_time):
+                if score is None or len(score) == 0:
+                    return {}
+
+                # Handle DataFrame (multiple signals) - use first column
+                if isinstance(score, pd.DataFrame):
+                    score = score.iloc[:, 0]
+
+                # 1. Select top-K stocks by prediction score
+                topk_scores = score.nlargest(self._topk)
+                stock_ids = list(topk_scores.index)
+
+                if len(stock_ids) < 2:
+                    # Too few stocks for optimization, equal weight
+                    return {sid: 1.0 / max(len(stock_ids), 1) for sid in stock_ids}
+
+                # 2. Get covariance matrix from historical returns
+                try:
+                    cov_matrix = self._compute_covariance(stock_ids, trade_start_time)
+                except Exception as e:
+                    warnings.warn(f"Covariance computation failed: {e}, using equal weight")
+                    return {sid: 1.0 / len(stock_ids) for sid in stock_ids}
+
+                # 3. Build current weight vector for turnover constraint
+                cur_weights = current.get_stock_weight_dict(only_stock=True)
+                if cur_weights and any(sid in cur_weights for sid in stock_ids):
+                    w0 = pd.Series(
+                        [cur_weights.get(sid, 0.0) for sid in stock_ids],
+                        index=stock_ids
+                    )
+                    total = w0.sum()
+                    if total > 0:
+                        w0 = w0 / total
+                    else:
+                        w0 = None
+                else:
+                    w0 = None
+
+                # 4. Run optimizer
+                try:
+                    r = topk_scores if _opt_method == "mvo" else None
+                    weights = self._optimizer(S=cov_matrix, r=r, w0=w0)
+
+                    if isinstance(weights, pd.Series):
+                        opt_weights = {sid: weights[sid] if sid in weights.index else 0.0
+                                       for sid in stock_ids}
+                    else:
+                        opt_weights = dict(zip(stock_ids, weights))
+
+                    # Normalize optimizer weights
+                    total_w = sum(opt_weights.values())
+                    if total_w > 0:
+                        opt_weights = {k: v / total_w for k, v in opt_weights.items()}
+                    else:
+                        opt_weights = {k: 1.0 / len(stock_ids) for k in stock_ids}
+
+                    # Blend with equal weight to ensure diversification
+                    if self._max_weight > 0:
+                        eq_w = 1.0 / len(stock_ids)
+                        # blend factor: how much optimizer to trust
+                        # max_weight determines the blend: higher cap = more optimizer trust
+                        # At max_weight=1/topk (equal weight), blend=0
+                        # At max_weight=1.0 (no cap), blend=1
+                        blend = min(1.0, self._max_weight * len(stock_ids) - 1.0)
+                        blend = max(0.0, blend)
+                        result = {}
+                        for sid in stock_ids:
+                            w = blend * opt_weights.get(sid, 0.0) + (1 - blend) * eq_w
+                            result[sid] = w
+                        # Hard cap after blending
+                        result = self._apply_max_weight_cap(result)
+                    else:
+                        # No cap: use optimizer weights directly, drop near-zero
+                        result = {k: v for k, v in opt_weights.items() if v > 1e-6}
+                        total_w = sum(result.values())
+                        if total_w > 0:
+                            result = {k: v / total_w for k, v in result.items()}
+
+                    self._prev_weights = result
+                    return result
+
+                except Exception as e:
+                    warnings.warn(f"Optimization failed: {e}, using equal weight")
+                    return {sid: 1.0 / len(stock_ids) for sid in stock_ids}
+
+            def _apply_max_weight_cap(self, weights):
+                """Cap individual stock weights and redistribute excess.
+                Iteratively caps and redistributes until all weights are within limit."""
+                cap = self._max_weight
+                n = len(weights)
+                if n == 0 or cap <= 0 or cap >= 1.0:
+                    return weights
+
+                # If cap * n < 1, cap is too tight; use equal weight
+                if cap * n < 1.0:
+                    return {k: 1.0 / n for k in weights}
+
+                weights = dict(weights)
+                for _ in range(20):
+                    over = {k: v for k, v in weights.items() if v > cap + 1e-9}
+                    if not over:
+                        break
+                    excess = sum(v - cap for v in over.values())
+                    under = {k: v for k, v in weights.items() if v <= cap + 1e-9}
+                    # Cap the overweight stocks
+                    for k in over:
+                        weights[k] = cap
+                    # Redistribute excess equally among underweight stocks
+                    if under:
+                        per_stock = excess / len(under)
+                        for k in under:
+                            weights[k] = weights[k] + per_stock
+                return weights
+
+            def _compute_covariance(self, stock_ids, trade_date):
+                """Compute covariance matrix from historical daily returns."""
+                end_date = pd.Timestamp(trade_date) - pd.Timedelta(days=1)
+                start_date = end_date - pd.Timedelta(days=self._cov_lookback * 2)
+
+                close_data = D.features(
+                    stock_ids,
+                    fields=["$close"],
+                    start_time=start_date.strftime("%Y-%m-%d"),
+                    end_time=end_date.strftime("%Y-%m-%d"),
+                )
+
+                if close_data is None or close_data.empty:
+                    raise ValueError("No historical data available")
+
+                close_df = close_data["$close"].unstack(level=0)
+
+                # Drop stocks with insufficient data
+                min_obs = max(self._cov_lookback // 2, 20)
+                close_df = close_df.dropna(axis=1, thresh=min_obs)
+
+                if close_df.shape[1] < 2:
+                    raise ValueError("Too few stocks with sufficient history")
+
+                # Use last cov_lookback days
+                close_df = close_df.tail(self._cov_lookback)
+
+                # Compute daily returns
+                returns = close_df.pct_change().dropna()
+
+                if len(returns) < min_obs:
+                    raise ValueError(f"Only {len(returns)} return observations, need {min_obs}")
+
+                # Shrinkage estimator: blend sample cov with diagonal (Ledoit-Wolf lite)
+                sample_cov = returns.cov()
+                shrink_factor = 0.3
+                diag = pd.DataFrame(
+                    np.diag(np.diag(sample_cov.values)),
+                    index=sample_cov.index,
+                    columns=sample_cov.columns,
+                )
+                cov_matrix = (1 - shrink_factor) * sample_cov + shrink_factor * diag
+
+                # Align to stock_ids order, fill missing with average variance
+                available = [s for s in stock_ids if s in cov_matrix.index]
+                missing = [s for s in stock_ids if s not in cov_matrix.index]
+
+                if len(available) < 2:
+                    raise ValueError("Too few stocks in covariance matrix")
+
+                if missing:
+                    avg_var = np.mean(np.diag(cov_matrix.loc[available, available].values))
+                    full_index = available + missing
+                    full_cov = pd.DataFrame(0.0, index=full_index, columns=full_index)
+                    full_cov.loc[available, available] = cov_matrix.loc[available, available]
+                    for s in missing:
+                        full_cov.loc[s, s] = avg_var
+                    cov_matrix = full_cov
+
+                # Reorder to match stock_ids
+                ordered = [s for s in stock_ids if s in cov_matrix.index]
+                return cov_matrix.loc[ordered, ordered]
+
+        return OptimizedWeightStrategyImpl
+
+
 class TopkDropoutStrategyWithRebalance:
     """
     TopkDropoutStrategy with configurable rebalance frequency.
@@ -714,6 +1034,7 @@ def get_strategy_config(
     rebalance_freq=1,
     strategy_type="topk",
     dynamic_risk_params=None,
+    optimizer_params=None,
 ):
     """
     Get strategy configuration for backtest.
@@ -729,16 +1050,41 @@ def get_strategy_config(
     rebalance_freq : int
         Rebalance frequency in days (default: 1)
     strategy_type : str
-        Strategy type: "topk", "dynamic_risk", or "vol_stoploss"
+        Strategy type: "topk", "dynamic_risk", "vol_stoploss",
+        "mvo", "rp", "gmv", "inv"
     dynamic_risk_params : dict, optional
         Parameters for risk strategies
+    optimizer_params : dict, optional
+        Parameters for portfolio optimization strategies
 
     Returns
     -------
     dict
         Strategy configuration for qlib backtest
     """
-    if strategy_type == "vol_stoploss":
+    # Portfolio optimization strategies
+    if strategy_type in ("mvo", "rp", "gmv", "inv"):
+        params = optimizer_params or {}
+        OptStrategy = OptimizedWeightStrategy.create_strategy_class(
+            opt_method=strategy_type,
+            lamb=params.get("lamb", 2.0),
+            delta=params.get("delta", 0.2),
+            alpha=params.get("alpha", 0.01),
+            scale_return=params.get("scale_return", True),
+            cov_lookback=params.get("cov_lookback", 60),
+            rebalance_freq=rebalance_freq,
+            risk_degree=params.get("risk_degree", 0.95),
+            max_weight=params.get("max_weight", 0.0),
+        )
+        return {
+            "class": OptStrategy,
+            "kwargs": {
+                "signal": pred_df,
+                "topk": topk,
+                "rebalance_freq": rebalance_freq,
+            },
+        }
+    elif strategy_type == "vol_stoploss":
         # 使用波动率预警+止损策略（推荐）
         params = dynamic_risk_params or {}
         VolStrategy = VolatilityStopLossStrategy.create_strategy_class(

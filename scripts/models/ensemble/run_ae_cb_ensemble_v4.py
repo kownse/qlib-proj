@@ -564,8 +564,9 @@ def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
     from qlib.backtest import backtest as qlib_backtest
     from qlib.contrib.evaluate import risk_analysis
 
+    strategy_label = args.strategy.upper() if args.strategy in ('mvo', 'rp', 'gmv', 'inv') else args.strategy
     print("\n" + "=" * 70)
-    print("BACKTEST with TopkDropoutStrategy (3-Model Ensemble V4)")
+    print(f"BACKTEST with {strategy_label} Strategy (3-Model Ensemble V4)")
     print("=" * 70)
 
     pred_df = pred.to_frame("score")
@@ -573,10 +574,32 @@ def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
     print(f"\n[BT-1] Configuring backtest...")
     print(f"    Strategy: {args.strategy}")
     print(f"    Topk: {args.topk}")
-    print(f"    N_drop: {args.n_drop}")
+    if args.strategy not in ('mvo', 'rp', 'gmv', 'inv'):
+        print(f"    N_drop: {args.n_drop}")
     print(f"    Account: ${args.account:,.0f}")
     print(f"    Rebalance Freq: every {args.rebalance_freq} day(s)")
     print(f"    Period: {time_splits['test_start']} to {time_splits['test_end']}")
+
+    # Portfolio optimization params
+    optimizer_params = None
+    if args.strategy in ("mvo", "rp", "gmv", "inv"):
+        optimizer_params = {
+            "lamb": args.opt_lamb,
+            "delta": args.opt_delta,
+            "alpha": args.opt_alpha,
+            "cov_lookback": args.cov_lookback,
+            "max_weight": args.max_weight,
+        }
+        print(f"    Portfolio Optimization:")
+        if args.strategy == "mvo":
+            print(f"      Risk aversion (lamb): {args.opt_lamb}")
+        print(f"      Turnover limit (delta): {args.opt_delta:.0%}")
+        print(f"      L2 regularization (alpha): {args.opt_alpha}")
+        print(f"      Covariance lookback: {args.cov_lookback} days")
+        if args.max_weight > 0:
+            print(f"      Max weight per stock: {args.max_weight:.0%}")
+        else:
+            print(f"      Max weight per stock: unlimited")
 
     dynamic_risk_params = None
     if args.strategy == "vol_stoploss":
@@ -605,7 +628,8 @@ def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
     strategy_config = get_strategy_config(
         pred_df, args.topk, args.n_drop, args.rebalance_freq,
         strategy_type=args.strategy,
-        dynamic_risk_params=dynamic_risk_params
+        dynamic_risk_params=dynamic_risk_params,
+        optimizer_params=optimizer_params,
     )
 
     executor_config = {
@@ -718,6 +742,75 @@ def _analyze_backtest_results(report_df: pd.DataFrame, positions, freq: str,
     print(f"    Total Trading Days:  {len(report_df):>10d}")
     print(f"    " + "-" * 50)
 
+    # Position concentration analysis
+    print(f"\n    Position Concentration Analysis:")
+    print(f"    " + "-" * 50)
+    if positions is not None:
+        try:
+            # Sample positions at regular intervals
+            pos_dates = sorted(positions.keys()) if isinstance(positions, dict) else []
+            if not pos_dates:
+                # positions might be a list or other structure
+                pos_dates = []
+
+            if pos_dates:
+                daily_top1 = []
+                daily_top3 = []
+                daily_top5 = []
+                daily_n_stocks = []
+                stock_freq = {}
+
+                for date in pos_dates:
+                    pos = positions[date]
+                    if hasattr(pos, 'get_stock_weight_dict'):
+                        weights = pos.get_stock_weight_dict(only_stock=True)
+                    elif isinstance(pos, dict):
+                        weights = {k: v for k, v in pos.items() if k != 'cash'}
+                    else:
+                        continue
+
+                    if not weights:
+                        continue
+
+                    sorted_w = sorted(weights.values(), reverse=True)
+                    total_w = sum(sorted_w)
+                    if total_w <= 0:
+                        continue
+
+                    sorted_w = [w / total_w for w in sorted_w]
+                    daily_top1.append(sorted_w[0])
+                    daily_top3.append(sum(sorted_w[:3]))
+                    daily_top5.append(sum(sorted_w[:5]))
+                    daily_n_stocks.append(len([w for w in sorted_w if w > 0.01]))
+
+                    for stock in weights:
+                        stock_freq[stock] = stock_freq.get(stock, 0) + 1
+
+                if daily_top1:
+                    import numpy as _np
+                    print(f"    Avg stocks held (>1% weight): {_np.mean(daily_n_stocks):.1f}")
+                    print(f"    Top-1 stock weight:  {_np.mean(daily_top1):>8.1%} (max {_np.max(daily_top1):.1%})")
+                    print(f"    Top-3 stocks weight: {_np.mean(daily_top3):>8.1%} (max {_np.max(daily_top3):.1%})")
+                    print(f"    Top-5 stocks weight: {_np.mean(daily_top5):>8.1%} (max {_np.max(daily_top5):.1%})")
+                    print(f"    Unique stocks traded: {len(stock_freq)}")
+
+                    # HHI (Herfindahl index) - measure of concentration
+                    # HHI = 1/N means equal weight, HHI = 1 means single stock
+                    # Not computed here for simplicity
+
+                    # Most frequently held stocks
+                    top_held = sorted(stock_freq.items(), key=lambda x: -x[1])[:5]
+                    print(f"    Most frequently held:")
+                    for stock, days in top_held:
+                        print(f"      {stock}: {days}/{len(pos_dates)} days ({days/len(pos_dates):.0%})")
+                else:
+                    print(f"    Unable to extract position weights")
+            else:
+                print(f"    Position data format not supported for analysis")
+        except Exception as e:
+            print(f"    Position analysis failed: {e}")
+    print(f"    " + "-" * 50)
+
     output_path = PROJECT_ROOT / "outputs" / f"ensemble_v4_backtest_report_{freq}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report_df.to_csv(output_path)
@@ -799,8 +892,13 @@ def main():
     parser.add_argument('--rebalance-freq', type=int, default=5,
                         help='Rebalance frequency in days (default: 5)')
     parser.add_argument('--strategy', type=str, default='topk',
-                        choices=['topk', 'dynamic_risk', 'vol_stoploss'],
+                        choices=['topk', 'dynamic_risk', 'vol_stoploss',
+                                 'mvo', 'rp', 'gmv', 'inv'],
                         help='Trading strategy (default: topk)')
+
+    # Skip CV evaluation
+    parser.add_argument('--skip-cv', action='store_true',
+                        help='Skip cross-validation evaluation, go directly to ensemble + backtest')
 
     # Strategy parameters
     parser.add_argument('--risk-lookback', type=int, default=20)
@@ -814,6 +912,18 @@ def main():
     parser.add_argument('--vol-medium', type=float, default=0.25)
     parser.add_argument('--stop-loss', type=float, default=-0.15)
     parser.add_argument('--no-sell-after-drop', type=float, default=-0.20)
+
+    # Portfolio optimization parameters (for mvo/rp/gmv/inv strategies)
+    parser.add_argument('--opt-lamb', type=float, default=2.0,
+                        help='[mvo] Risk aversion (higher=safer, default: 2.0)')
+    parser.add_argument('--opt-delta', type=float, default=0.2,
+                        help='[mvo/rp/gmv] Max turnover per rebalance (default: 0.2)')
+    parser.add_argument('--opt-alpha', type=float, default=0.01,
+                        help='[mvo/rp/gmv] L2 regularization (default: 0.01)')
+    parser.add_argument('--cov-lookback', type=int, default=60,
+                        help='[mvo/rp/gmv/inv] Covariance lookback days (default: 60)')
+    parser.add_argument('--max-weight', type=float, default=0.0,
+                        help='[mvo/rp/gmv/inv] Max weight per stock, 0=no limit (default: 0, try 0.15)')
 
     args = parser.parse_args()
 
@@ -921,8 +1031,11 @@ def main():
             models[key] = load_catboost_model(cfg['path'])
 
     # [6] CV evaluation
-    print("\n[6] Cross-validation evaluation...")
-    run_cv_evaluation(models, handlers_dict, args, symbols)
+    if args.skip_cv:
+        print("\n[6] Skipping cross-validation evaluation (--skip-cv)")
+    else:
+        print("\n[6] Cross-validation evaluation...")
+        run_cv_evaluation(models, handlers_dict, args, symbols)
 
     # [7] Generate predictions
     print("\n[7] Generating predictions...")

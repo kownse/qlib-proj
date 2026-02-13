@@ -3,6 +3,8 @@ DataHandler with macro features for time series prediction
 
 Extends Alpha158_Volatility_TALib_Lite with market regime indicators.
 Designed for time series prediction of individual stock returns/volatility.
+
+Optionally includes sector/AI affinity features (per-instrument, constant across dates).
 """
 
 import sys
@@ -26,6 +28,9 @@ PROJECT_ROOT = script_dir.parent
 
 # Default macro features path
 DEFAULT_MACRO_PATH = PROJECT_ROOT / "my_data" / "macro_processed" / "macro_features.parquet"
+
+# Default sector features path
+DEFAULT_SECTOR_PATH = PROJECT_ROOT / "my_data" / "sector_data" / "sector_features.parquet"
 
 
 class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
@@ -58,6 +63,17 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
 
     # Sector symbols for dynamic feature generation
     SECTOR_SYMBOLS = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLP", "XLY", "XLU", "XLRE", "XLB", "XLC"]
+
+    # Sector one-hot feature names (11 sectors)
+    SECTOR_FEATURES = [
+        "sector_technology", "sector_healthcare", "sector_financials",
+        "sector_consumer_discretionary", "sector_consumer_staples",
+        "sector_communication_services", "sector_industrials",
+        "sector_energy", "sector_utilities", "sector_real_estate", "sector_materials",
+    ]
+
+    # AI affinity feature
+    AI_AFFINITY_FEATURE = "ai_affinity"
 
     # Macro feature column names (~105 total)
     ALL_MACRO_FEATURES = [
@@ -165,6 +181,9 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         # Macro feature parameters
         macro_data_path: Union[str, Path] = None,
         macro_features: str = "all",  # "all", "core", "vix_only", "none"
+        # Sector/AI feature parameters
+        sector_data_path: Union[str, Path] = None,
+        sector_features: str = "none",  # "none", "sector", "ai_only", "sector+ai"
         **kwargs,
     ):
         """
@@ -178,14 +197,25 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
                 - "core": Core features (~25)
                 - "vix_only": VIX features only (~13)
                 - "none": No macro features (same as TALib_Lite)
+            sector_data_path: Path to sector features parquet file
+            sector_features: Sector feature set to use
+                - "none": No sector features (default)
+                - "sector": 11 sector one-hot features only
+                - "ai_only": AI affinity score only (1 feature)
+                - "sector+ai": All 12 features (11 sector + 1 AI affinity)
             **kwargs: Additional arguments for parent class
         """
         self.volatility_window = volatility_window
         self.macro_data_path = Path(macro_data_path) if macro_data_path else DEFAULT_MACRO_PATH
         self.macro_features = macro_features
+        self.sector_data_path = Path(sector_data_path) if sector_data_path else DEFAULT_SECTOR_PATH
+        self.sector_features = sector_features
 
         # Load macro features
         self._macro_df = self._load_macro_features()
+
+        # Load sector features
+        self._sector_df = self._load_sector_features()
 
         from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
 
@@ -221,9 +251,9 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
 
     def process_data(self, with_fit: bool = False):
         """
-        Override process_data to add macro features AFTER processors run.
+        Override process_data to add macro + sector features AFTER processors run.
 
-        This ensures macro features are included in _learn and _infer.
+        This ensures macro and sector features are included in _learn and _infer.
         """
         # First, call parent's process_data
         super().process_data(with_fit=with_fit)
@@ -231,6 +261,10 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         # Then add macro features to _learn and _infer
         if self._macro_df is not None and self.macro_features != "none":
             self._add_macro_to_processed_data()
+
+        # Then add sector features
+        if self._sector_df is not None and self.sector_features != "none":
+            self._add_sector_to_processed_data()
 
     def _add_macro_to_processed_data(self):
         """Add macro features to _learn and _infer after processors run."""
@@ -254,30 +288,122 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
             print(f"Warning: Error adding macro features: {e}")
 
     def _merge_macro_to_df(self, df: pd.DataFrame, cols: list) -> pd.DataFrame:
-        """Merge macro features into a DataFrame using pd.concat to avoid fragmentation."""
+        """Merge macro features into a DataFrame using vectorized reindex."""
+        import numpy as np
+
         datetime_col = df.index.names[0]
         main_datetimes = df.index.get_level_values(datetime_col)
         has_multi_columns = isinstance(df.columns, pd.MultiIndex)
 
-        # Build all macro columns at once to avoid DataFrame fragmentation
-        macro_data = {}
-        for col in cols:
-            macro_series = self._macro_df[col]
-            aligned_values = macro_series.reindex(main_datetimes).values
+        # Reindex macro data to unique datetimes once for all columns
+        unique_dt = main_datetimes.unique()
+        macro_subset = self._macro_df[cols].reindex(unique_dt)
 
-            if has_multi_columns:
-                macro_data[('feature', col)] = aligned_values
-            else:
-                macro_data[col] = aligned_values
+        # Vectorized positional lookup (C-level, replaces Python loop)
+        positions = unique_dt.get_indexer(main_datetimes)
+        aligned = macro_subset.values[positions]
 
-        # Create DataFrame with all macro columns
-        macro_df = pd.DataFrame(macro_data, index=df.index)
+        # Build column names
+        if has_multi_columns:
+            col_names = pd.MultiIndex.from_tuples([('feature', c) for c in cols])
+        else:
+            col_names = cols
 
-        # Use pd.concat to merge all columns at once (avoids fragmentation warning)
-        merged = pd.concat([df, macro_df], axis=1, copy=False)
+        macro_df = pd.DataFrame(aligned, index=df.index, columns=col_names)
+        return pd.concat([df, macro_df], axis=1, copy=False)
 
-        # Return a copy to ensure defragmentation
-        return merged.copy()
+    def _load_sector_features(self) -> Optional[pd.DataFrame]:
+        """Load sector features from parquet file."""
+        if self.sector_features == "none":
+            return None
+
+        if not self.sector_data_path.exists():
+            print(f"Warning: Sector features file not found: {self.sector_data_path}")
+            print("Run: python scripts/data/download_sector_data.py && python scripts/data/process_sector_data.py")
+            return None
+
+        try:
+            df = pd.read_parquet(self.sector_data_path)
+            print(f"Loaded sector features: {df.shape} for {len(df)} stocks")
+            return df
+        except Exception as e:
+            print(f"Warning: Failed to load sector features: {e}")
+            return None
+
+    def _get_sector_feature_columns(self) -> List[str]:
+        """Get sector feature columns based on configuration."""
+        if self.sector_features == "sector":
+            return list(self.SECTOR_FEATURES)
+        elif self.sector_features == "ai_only":
+            return [self.AI_AFFINITY_FEATURE]
+        elif self.sector_features == "sector+ai":
+            return list(self.SECTOR_FEATURES) + [self.AI_AFFINITY_FEATURE]
+        else:  # "none"
+            return []
+
+    def _add_sector_to_processed_data(self):
+        """Add sector features to _learn and _infer after processors run."""
+        try:
+            sector_cols = self._get_sector_feature_columns()
+            available_cols = [c for c in sector_cols if c in self._sector_df.columns]
+
+            if not available_cols:
+                print("Warning: No sector features available in parquet")
+                return
+
+            # Add to _learn
+            if hasattr(self, "_learn") and self._learn is not None:
+                self._learn = self._merge_sector_to_df(self._learn, available_cols)
+                print(f"Added {len(available_cols)} sector features to learn data")
+
+            # Add to _infer
+            if hasattr(self, "_infer") and self._infer is not None:
+                self._infer = self._merge_sector_to_df(self._infer, available_cols)
+                print(f"Added {len(available_cols)} sector features to infer data")
+
+        except Exception as e:
+            print(f"Warning: Error adding sector features: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # AI affinity time-scaling: AI impact didn't exist before ~2020,
+    # ramped up through 2024 as AI transformed markets.
+    AI_AFFINITY_RAMP_START = pd.Timestamp("2020-01-01")
+    AI_AFFINITY_RAMP_END = pd.Timestamp("2024-01-01")
+
+    def _merge_sector_to_df(self, df: pd.DataFrame, cols: list) -> pd.DataFrame:
+        """
+        Merge sector features into a DataFrame by instrument (vectorized).
+
+        Unlike macro features (aligned by datetime), sector features are
+        aligned by instrument (same value across all dates for a stock).
+
+        AI affinity is time-scaled: 0 before 2020, linear ramp 2020-2024, full after 2024.
+        """
+        import numpy as np
+
+        instruments = df.index.get_level_values(1)  # instrument level
+        has_multi_columns = isinstance(df.columns, pd.MultiIndex)
+
+        # Vectorized: reindex sector_df by instruments, fill missing with 0
+        aligned = self._sector_df[cols].reindex(instruments, fill_value=0.0)
+        aligned.index = df.index  # restore original MultiIndex
+
+        # Time-scale AI affinity if present
+        if self.AI_AFFINITY_FEATURE in cols:
+            datetimes = df.index.get_level_values(0)
+            ramp_start = self.AI_AFFINITY_RAMP_START.value
+            ramp_end = self.AI_AFFINITY_RAMP_END.value
+            ramp_duration = ramp_end - ramp_start
+            dt_values = datetimes.values.astype("int64")
+            ai_scale = ((dt_values - ramp_start) / ramp_duration).clip(0.0, 1.0)
+            aligned[self.AI_AFFINITY_FEATURE] = aligned[self.AI_AFFINITY_FEATURE].values * ai_scale
+
+        # Rename columns to match df's column format
+        if has_multi_columns:
+            aligned.columns = pd.MultiIndex.from_tuples([('feature', c) for c in cols])
+
+        return pd.concat([df, aligned], axis=1, copy=False)
 
     def _load_macro_features(self) -> Optional[pd.DataFrame]:
         """Load macro features from parquet file."""
@@ -440,6 +566,9 @@ class Alpha158_Macro(DataHandlerLP):
         # Macro feature parameters
         macro_data_path: Union[str, Path] = None,
         macro_features: str = "all",
+        # Sector/AI feature parameters
+        sector_data_path: Union[str, Path] = None,
+        sector_features: str = "none",
         **kwargs,
     ):
         """
@@ -449,13 +578,20 @@ class Alpha158_Macro(DataHandlerLP):
             volatility_window: Prediction window (days)
             macro_data_path: Path to macro features parquet file
             macro_features: Macro feature set ("all", "core", "vix_only", "none")
+            sector_data_path: Path to sector features parquet file
+            sector_features: Sector feature set ("none", "sector", "ai_only", "sector+ai")
         """
         self.volatility_window = volatility_window
         self.macro_data_path = Path(macro_data_path) if macro_data_path else DEFAULT_MACRO_PATH
         self.macro_features = macro_features
+        self.sector_data_path = Path(sector_data_path) if sector_data_path else DEFAULT_SECTOR_PATH
+        self.sector_features = sector_features
 
         # Load macro features
         self._macro_df = self._load_macro_features()
+
+        # Load sector features
+        self._sector_df = self._load_sector_features()
 
         from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
 
@@ -507,12 +643,14 @@ class Alpha158_Macro(DataHandlerLP):
     _get_macro_feature_columns = Alpha158_Volatility_TALib_Macro._get_macro_feature_columns
     _add_macro_to_processed_data = Alpha158_Volatility_TALib_Macro._add_macro_to_processed_data
     _merge_macro_to_df = Alpha158_Volatility_TALib_Macro._merge_macro_to_df
+    _load_sector_features = Alpha158_Volatility_TALib_Macro._load_sector_features
+    _get_sector_feature_columns = Alpha158_Volatility_TALib_Macro._get_sector_feature_columns
+    _add_sector_to_processed_data = Alpha158_Volatility_TALib_Macro._add_sector_to_processed_data
+    _merge_sector_to_df = Alpha158_Volatility_TALib_Macro._merge_sector_to_df
 
     def process_data(self, with_fit: bool = False):
         """
-        Override process_data to add macro features AFTER processors run.
-
-        This ensures macro features are included in _learn and _infer.
+        Override process_data to add macro + sector features AFTER processors run.
         """
         # First, call parent's process_data (DataHandlerLP)
         DataHandlerLP.process_data(self, with_fit=with_fit)
@@ -520,6 +658,10 @@ class Alpha158_Macro(DataHandlerLP):
         # Then add macro features to _learn and _infer
         if self._macro_df is not None and self.macro_features != "none":
             self._add_macro_to_processed_data()
+
+        # Then add sector features
+        if self._sector_df is not None and self.sector_features != "none":
+            self._add_sector_to_processed_data()
 
     def get_label_config(self):
         """Return N-day volatility label."""

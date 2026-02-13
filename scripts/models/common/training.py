@@ -107,8 +107,15 @@ Examples:
 
     # 策略类型参数
     parser.add_argument('--strategy', type=str, default='topk',
-                        choices=['topk', 'dynamic_risk', 'vol_stoploss'],
-                        help='Strategy type: topk (default), dynamic_risk (momentum-based), vol_stoploss (volatility+stop-loss, recommended)')
+                        choices=['topk', 'dynamic_risk', 'vol_stoploss',
+                                 'mvo', 'rp', 'gmv', 'inv'],
+                        help='Strategy type: topk (default), dynamic_risk, vol_stoploss, '
+                             'mvo (mean-variance), rp (risk parity), gmv (min variance), inv (inverse vol)')
+
+    # Sample weighting 参数
+    parser.add_argument('--sample-weight-halflife', type=float, default=0,
+                        help='Time-decay sample weight half-life in years. '
+                             '0 = no decay (default). Try 5 for 5-year half-life.')
 
     # 动态风险策略参数
     parser.add_argument('--risk-lookback', type=int, default=20,
@@ -135,6 +142,18 @@ Examples:
                         help='[vol_stoploss] Stop loss threshold per stock (default: -0.15, i.e., -15%%)')
     parser.add_argument('--no-sell-after-drop', type=float, default=-0.20,
                         help='[vol_stoploss] Do not sell if already dropped more than this (default: -0.20)')
+
+    # Portfolio optimization 策略参数 (mvo/rp/gmv/inv)
+    parser.add_argument('--opt-lamb', type=float, default=2.0,
+                        help='[mvo] Risk aversion (higher=safer, default: 2.0)')
+    parser.add_argument('--opt-delta', type=float, default=0.2,
+                        help='[mvo/rp/gmv] Max turnover per rebalance (default: 0.2)')
+    parser.add_argument('--opt-alpha', type=float, default=0.01,
+                        help='[mvo/rp/gmv] L2 regularization to prevent concentration (default: 0.01)')
+    parser.add_argument('--cov-lookback', type=int, default=60,
+                        help='[mvo/rp/gmv/inv] Days of history for covariance estimation (default: 60)')
+    parser.add_argument('--max-weight', type=float, default=0.0,
+                        help='[mvo/rp/gmv/inv] Max weight per stock, 0=no limit (default: 0, try 0.15)')
 
     return parser
 
@@ -280,6 +299,13 @@ def create_data_handler(args, handler_config: dict, symbols: list, time_splits: 
         handler_kwargs['news_features'] = args.news_features
         handler_kwargs['add_news_rolling'] = args.news_rolling
         print(f"    News data path: {NEWS_DATA_PATH}")
+
+    # Apply default kwargs from handler registry (e.g., sector_features for sector handlers)
+    if 'default_kwargs' in handler_config:
+        for key, value in handler_config['default_kwargs'].items():
+            if key not in handler_kwargs:
+                handler_kwargs[key] = value
+        print(f"    Default kwargs: {handler_config['default_kwargs']}")
 
     # 创建 handler
     HandlerClass = handler_config['class']

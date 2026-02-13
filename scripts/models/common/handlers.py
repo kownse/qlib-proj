@@ -122,6 +122,29 @@ HANDLER_REGISTRY = {
         'use_talib': False,
     },
 
+    # Sector/AI handlers
+    'alpha158-talib-macro-sector': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha158_Volatility_TALib_Macro',
+        'description': 'Alpha158 + TA-Lib + Macro + sector one-hot + AI affinity (~287 features)',
+        'use_talib': True,
+        'default_kwargs': {'sector_features': 'sector+ai'},
+    },
+    'alpha158-talib-macro-ai': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha158_Volatility_TALib_Macro',
+        'description': 'Alpha158 + TA-Lib + Macro + AI affinity only (~276 features)',
+        'use_talib': True,
+        'default_kwargs': {'sector_features': 'ai_only'},
+    },
+    'alpha158-macro-sector': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha158_Macro',
+        'description': 'Alpha158 + Macro + sector one-hot + AI affinity (~275 features)',
+        'use_talib': False,
+        'default_kwargs': {'sector_features': 'sector+ai'},
+    },
+
     # Enhanced handlers
     'alpha158-enhanced': {
         'module': 'data.datahandler_enhanced',
@@ -360,11 +383,14 @@ def get_handler_config(handler_name: str) -> Dict[str, Any]:
         raise KeyError(f"Unknown handler: {handler_name}")
 
     entry = HANDLER_REGISTRY[handler_name]
-    return {
+    config = {
         'class': get_handler_class(handler_name),
         'description': entry['description'],
         'use_talib': entry['use_talib'],
     }
+    if 'default_kwargs' in entry:
+        config['default_kwargs'] = entry['default_kwargs']
+    return config
 
 
 def get_available_handlers() -> List[str]:

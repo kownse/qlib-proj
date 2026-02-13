@@ -95,6 +95,24 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
     print(f"    Rebalance Freq: every {args.rebalance_freq} day(s)")
     print(f"    Period: {time_splits['test_start']} to {time_splits['test_end']}")
 
+    # Portfolio optimization 策略参数
+    optimizer_params = None
+    if args.strategy in ("mvo", "rp", "gmv", "inv"):
+        optimizer_params = {
+            "lamb": args.opt_lamb,
+            "delta": args.opt_delta,
+            "alpha": args.opt_alpha,
+            "cov_lookback": args.cov_lookback,
+            "max_weight": args.max_weight,
+        }
+        print(f"    Portfolio Optimization Params:")
+        print(f"      Method: {args.strategy.upper()}")
+        if args.strategy == "mvo":
+            print(f"      Risk aversion (lamb): {args.opt_lamb}")
+        print(f"      Turnover limit (delta): {args.opt_delta:.0%}")
+        print(f"      L2 regularization (alpha): {args.opt_alpha}")
+        print(f"      Covariance lookback: {args.cov_lookback} days")
+
     # 动态风险策略参数
     dynamic_risk_params = None
     if args.strategy == "vol_stoploss":
@@ -136,7 +154,8 @@ def run_backtest(model_path, dataset, pred, args, time_splits: dict, model_name:
     strategy_config = get_strategy_config(
         pred_df, args.topk, args.n_drop, args.rebalance_freq,
         strategy_type=args.strategy,
-        dynamic_risk_params=dynamic_risk_params
+        dynamic_risk_params=dynamic_risk_params,
+        optimizer_params=optimizer_params,
     )
 
     # 配置执行器

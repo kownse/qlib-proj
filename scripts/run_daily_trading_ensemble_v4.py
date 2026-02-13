@@ -19,10 +19,10 @@
 7. 运行回测，输出每日交易信息
 
 使用方法:
-    python scripts/run_daily_trading_ensemble_4.py
-    python scripts/run_daily_trading_ensemble_4.py --skip-download
-    python scripts/run_daily_trading_ensemble_4.py --predict-only
-    python scripts/run_daily_trading_ensemble_4.py --send-email
+    python scripts/run_daily_trading_ensemble_v4.py
+    python scripts/run_daily_trading_ensemble_v4.py --skip-download
+    python scripts/run_daily_trading_ensemble_v4.py --predict-only
+    python scripts/run_daily_trading_ensemble_v4.py --send-email
 """
 
 import sys
@@ -284,6 +284,8 @@ def run_trading_backtest(
     topk: int = 5,
     n_drop: int = 1,
     rebalance_freq: int = 5,
+    strategy_type: str = "topk",
+    optimizer_params: dict = None,
 ) -> list:
     """运行交易回测，返回交易详情列表"""
     from qlib.backtest import backtest as qlib_backtest
@@ -291,14 +293,21 @@ def run_trading_backtest(
     from data.stock_pools import STOCK_POOLS
     from utils.strategy import get_strategy_config
 
+    strategy_label = strategy_type.upper() if strategy_type in ('mvo', 'rp', 'gmv', 'inv') else strategy_type
     print(f"\n{'='*70}")
-    print("TRADING BACKTEST (Ensemble V4)")
+    print(f"TRADING BACKTEST - {strategy_label} (Ensemble V4)")
     print(f"{'='*70}")
     print(f"Period: {test_start} to {test_end}")
     print(f"Initial Account: ${account:,.2f}")
+    print(f"Strategy: {strategy_type}")
     print(f"Rebalance Frequency: every {rebalance_freq} day(s)")
     print(f"Top-K stocks: {topk}")
-    print(f"N-drop: {n_drop}")
+    if strategy_type not in ('mvo', 'rp', 'gmv', 'inv'):
+        print(f"N-drop: {n_drop}")
+    if optimizer_params:
+        if strategy_type == "mvo":
+            print(f"MVO lamb: {optimizer_params.get('lamb', 2.0)}")
+        print(f"Max weight: {optimizer_params.get('max_weight', 0):.0%}" if optimizer_params.get('max_weight', 0) > 0 else "Max weight: unlimited")
 
     # 转换为 DataFrame
     pred_df = pred_ensemble.to_frame("score")
@@ -324,11 +333,14 @@ def run_trading_backtest(
         print(f"  {i:2d}. {stock.upper():<8s}  Score: {row['score']:>8.4f}")
 
     # 调整回测日期
-    if len(pred_dates) > 0:
+    # 注意: qlib 的 signal_strategy 使用 shift=1 获取预测信号,
+    # 即交易日 T 使用 T-1 的预测。因此回测起始日需要从第二个预测日开始,
+    # 这样第一个预测日的信号才能在回测首日被使用。
+    if len(pred_dates) > 1:
         actual_test_end = pred_dates[-1].strftime("%Y-%m-%d")
-        actual_test_start = pred_dates[0].strftime("%Y-%m-%d")
+        actual_test_start = pred_dates[1].strftime("%Y-%m-%d")  # 从第二个预测日开始
 
-        if pd.Timestamp(test_start) > pred_dates[0]:
+        if pd.Timestamp(test_start) > pred_dates[1]:
             actual_test_start = test_start
 
         if actual_test_start != test_start or actual_test_end != test_end:
@@ -341,7 +353,8 @@ def run_trading_backtest(
     # 配置策略
     strategy_config = get_strategy_config(
         pred_df, topk, n_drop, rebalance_freq=rebalance_freq,
-        strategy_type="topk"
+        strategy_type=strategy_type,
+        optimizer_params=optimizer_params,
     )
 
     executor_config = {
@@ -375,6 +388,9 @@ def run_trading_backtest(
 
     # 运行回测
     print(f"\n[*] Running backtest...")
+    print(f"[DEBUG] Strategy class: {strategy_config['class'].__name__ if hasattr(strategy_config['class'], '__name__') else strategy_config['class']}")
+    print(f"[DEBUG] Strategy kwargs keys: {list(strategy_config.get('kwargs', {}).keys())}")
+    print(f"[DEBUG] Backtest start_time={test_start}, end_time={test_end}")
     portfolio_metric_dict, indicator_dict = qlib_backtest(
         executor=executor_config,
         strategy=strategy_config,
@@ -490,6 +506,22 @@ def main():
                         help='Number of stocks to drop each rebalance')
     parser.add_argument('--rebalance-freq', type=int, default=5,
                         help='Rebalance frequency in days')
+
+    # Strategy parameters
+    parser.add_argument('--strategy', type=str, default='topk',
+                        choices=['topk', 'mvo', 'rp', 'gmv', 'inv'],
+                        help='Trading strategy (default: topk)')
+    parser.add_argument('--opt-lamb', type=float, default=15.0,
+                        help='[mvo] Risk aversion (default: 15.0)')
+    parser.add_argument('--opt-delta', type=float, default=0.2,
+                        help='[mvo/rp/gmv] Max turnover per rebalance (default: 0.2)')
+    parser.add_argument('--opt-alpha', type=float, default=0.05,
+                        help='[mvo/rp/gmv] L2 regularization (default: 0.05)')
+    parser.add_argument('--cov-lookback', type=int, default=60,
+                        help='[mvo/rp/gmv/inv] Covariance lookback days (default: 60)')
+    parser.add_argument('--max-weight', type=float, default=0.30,
+                        help='[mvo/rp/gmv/inv] Max weight per stock (default: 0.30)')
+
     parser.add_argument('--backtest-start', type=str, default='2026-02-01',
                         help='Backtest start date')
     parser.add_argument('--test-end', type=str, default=None,
@@ -702,6 +734,17 @@ def main():
             account=args.account,
         )
     else:
+        # Build optimizer params if using portfolio optimization strategy
+        optimizer_params = None
+        if args.strategy in ('mvo', 'rp', 'gmv', 'inv'):
+            optimizer_params = {
+                "lamb": args.opt_lamb,
+                "delta": args.opt_delta,
+                "alpha": args.opt_alpha,
+                "cov_lookback": args.cov_lookback,
+                "max_weight": args.max_weight,
+            }
+
         trading_details = run_trading_backtest(
             pred_ensemble=pred_ensemble,
             stock_pool=args.stock_pool,
@@ -711,6 +754,8 @@ def main():
             topk=args.topk,
             n_drop=args.n_drop,
             rebalance_freq=args.rebalance_freq,
+            strategy_type=args.strategy,
+            optimizer_params=optimizer_params,
         )
 
     print(f"\n{'='*70}")

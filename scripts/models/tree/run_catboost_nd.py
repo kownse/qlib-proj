@@ -144,7 +144,7 @@ from models.common import (
 )
 
 
-def train_catboost(dataset, valid_cols, cb_params=None):
+def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None):
     """
     训练 CatBoost 模型
 
@@ -156,6 +156,8 @@ def train_catboost(dataset, valid_cols, cb_params=None):
         有效特征列
     cb_params : dict, optional
         CatBoost 参数，如果为 None 则使用默认参数
+    reweighter : Reweighter, optional
+        样本权重器 (e.g., TimeDecayReweighter)
 
     Returns
     -------
@@ -196,12 +198,16 @@ def train_catboost(dataset, valid_cols, cb_params=None):
 
     model = CatBoostModel(**model_kwargs)
 
+    if reweighter is not None:
+        print(f"    Using sample weights: {reweighter.__class__.__name__}")
+
     print("\n    Training progress:")
     model.fit(
         dataset,
         num_boost_round=1000,
         early_stopping_rounds=50,
         verbose_eval=100,
+        reweighter=reweighter,
     )
     print("    ✓ Model training completed")
 
@@ -233,7 +239,7 @@ def train_catboost(dataset, valid_cols, cb_params=None):
     return model, feature_names, importance_df, num_model_features
 
 
-def retrain_with_top_features(dataset, importance_df, args, cb_params=None):
+def retrain_with_top_features(dataset, importance_df, args, cb_params=None, reweighter=None):
     """
     使用 top-k 特征重新训练
 
@@ -247,6 +253,8 @@ def retrain_with_top_features(dataset, importance_df, args, cb_params=None):
         命令行参数
     cb_params : dict, optional
         CatBoost 参数，如果为 None 则使用默认参数
+    reweighter : Reweighter, optional
+        样本权重器
 
     Returns
     -------
@@ -266,11 +274,22 @@ def retrain_with_top_features(dataset, importance_df, args, cb_params=None):
     train_label = dataset.prepare("train", col_set="label")
     valid_label = dataset.prepare("valid", col_set="label")
 
+    # Compute sample weights if reweighter provided
+    w_train = None
+    w_valid = None
+    if reweighter is not None:
+        df_train = pd.concat([train_data_selected, train_label], axis=1)
+        df_valid = pd.concat([valid_data_selected, valid_label], axis=1)
+        w_train = reweighter.reweight(df_train).values
+        w_valid = reweighter.reweight(df_valid).values
+        print(f"    Sample weights: train [{w_train.min():.4f}, {w_train.max():.4f}], "
+              f"valid [{w_valid.min():.4f}, {w_valid.max():.4f}]")
+
     print(f"    ✓ Selected train features shape: {train_data_selected.shape}")
 
     print("\n    Retraining with selected features...")
-    train_pool = Pool(train_data_selected, label=train_label.values.ravel())
-    valid_pool = Pool(valid_data_selected, label=valid_label.values.ravel())
+    train_pool = Pool(train_data_selected, label=train_label.values.ravel(), weight=w_train)
+    valid_pool = Pool(valid_data_selected, label=valid_label.values.ravel(), weight=w_valid)
 
     # 使用传入的参数或默认参数
     if cb_params is None:
@@ -362,12 +381,29 @@ def main_train_impl():
     train_data, valid_cols, dropped_cols = analyze_features(dataset)
     analyze_label_distribution(dataset)
 
+    # 创建样本权重器
+    reweighter = None
+    if args.sample_weight_halflife > 0:
+        from utils.reweighter import TimeDecayReweighter
+        reweighter = TimeDecayReweighter(half_life_years=args.sample_weight_halflife, min_weight=0.1)
+        print(f"\n[*] Sample weighting: exponential decay, half-life = {args.sample_weight_halflife} years, min_weight = 0.1")
+
     # 训练模型
-    model, feature_names, importance_df, num_model_features = train_catboost(dataset, valid_cols, cb_params)
+    model, feature_names, importance_df, num_model_features = train_catboost(
+        dataset, valid_cols, cb_params, reweighter=reweighter)
+
+    # 保存特征重要性
+    outputs_dir = PROJECT_ROOT / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    importance_filename = generate_model_filename("catboost_importance", args, 0, ".csv")
+    importance_path = outputs_dir / importance_filename
+    importance_df.to_csv(importance_path, index=False)
+    print(f"    Feature importance saved to: {importance_path}")
 
     # 特征选择和重新训练
     if args.top_k > 0 and args.top_k < len(feature_names):
-        cb_model, top_features, test_pred = retrain_with_top_features(dataset, importance_df, args, cb_params)
+        cb_model, top_features, test_pred = retrain_with_top_features(
+            dataset, importance_df, args, cb_params, reweighter=reweighter)
 
         # 评估
         print("\n[10] Evaluation with selected features...")
