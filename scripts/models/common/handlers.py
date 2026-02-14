@@ -153,7 +153,20 @@ HANDLER_REGISTRY = {
         'use_talib': True,
         'default_kwargs': {'ai_basket': True},
     },
-
+    'alpha158-talib-macro-aibasket-v2': {
+        'module': 'data.datahandler_aibasket_v2',
+        'class_name': 'Alpha158_Volatility_TALib_Macro_AIBasket_V2',
+        'description': 'Alpha158 + TA-Lib + Macro + AI basket V2 (~166 features, importance >= 0.01)',
+        'use_talib': True,
+        'default_kwargs': {'ai_basket': True},
+    },
+    'alpha158-talib-macro-aibasket-v3': {
+        'module': 'data.datahandler_aibasket_v3',
+        'class_name': 'Alpha158_Volatility_TALib_Macro_AIBasket_V3',
+        'description': 'Alpha158 + TA-Lib + Macro + AI basket V3 (top 100 features)',
+        'use_talib': True,
+        'default_kwargs': {'ai_basket': True},
+    },
     # Enhanced handlers
     'alpha158-enhanced': {
         'module': 'data.datahandler_enhanced',
