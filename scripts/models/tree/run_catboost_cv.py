@@ -145,7 +145,7 @@ def load_params_from_json(params_file: str):
     final_params = DEFAULT_CATBOOST_PARAMS.copy()
     for key in ['learning_rate', 'max_depth', 'l2_leaf_reg', 'random_strength',
                 'bagging_temperature', 'subsample', 'colsample_bylevel',
-                'min_data_in_leaf', 'iterations']:
+                'min_data_in_leaf', 'iterations', 'bootstrap_type', 'thread_count']:
         if key in params:
             final_params[key] = params[key]
 
@@ -320,6 +320,10 @@ def run_cv_training(args, handler_config, symbols, params, halflife=0):
         print(f"Random seed: {args.seed}")
     if halflife > 0:
         print(f"Sample weight halflife: {halflife} years")
+    print(f"\nCatBoost params:")
+    for key, value in params.items():
+        if key not in ('verbose',):
+            print(f"  {key}: {value}")
     print("=" * 70)
 
     # 准备 2025 测试集
@@ -354,10 +358,10 @@ def run_cv_training(args, handler_config, symbols, params, halflife=0):
         train_pool = Pool(X_train, label=y_train, weight=train_weight)
         valid_pool = Pool(X_valid, label=y_valid, weight=valid_weight)
 
-        # 设置种子
+        # 设置种子 (与 hyperopt CV 一致, 所有 fold 使用相同种子)
         fold_params = params.copy()
         if args.seed is not None:
-            fold_params['random_seed'] = args.seed + fold_idx
+            fold_params['random_seed'] = args.seed
 
         model = CatBoostRegressor(**fold_params)
         model.fit(
@@ -445,7 +449,7 @@ def train_final_model(args, handler_config, symbols, params, halflife=0):
 
     final_params = params.copy()
     if args.seed is not None:
-        final_params['random_seed'] = args.seed + 100
+        final_params['random_seed'] = args.seed
 
     print("\n    Training progress:")
     model = CatBoostRegressor(**final_params)
@@ -595,7 +599,7 @@ def main():
     # 确定 halflife: CLI 显式设置优先，否则用文件中的值
     halflife = args.sample_weight_halflife if args.sample_weight_halflife > 0 else file_halflife
 
-    # 覆盖 thread_count
+    # thread_count: CLI --thread-count 覆盖文件中的值
     params['thread_count'] = args.thread_count
 
     print("\n" + "=" * 70)

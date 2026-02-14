@@ -324,6 +324,8 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
 
         try:
             df = pd.read_parquet(self.sector_data_path)
+            # Normalize index to lowercase to match qlib instrument names
+            df.index = df.index.str.lower()
             print(f"Loaded sector features: {df.shape} for {len(df)} stocks")
             return df
         except Exception as e:
