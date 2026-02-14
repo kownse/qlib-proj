@@ -50,6 +50,7 @@ from daily_trading_common import (
     collect_trading_details_from_positions,
     print_trading_details,
 )
+from utils.ai_filter import apply_ai_affinity_filter
 
 
 def load_model_meta(model_path: Path) -> dict:
@@ -522,7 +523,7 @@ def main():
     parser.add_argument('--max-weight', type=float, default=0.30,
                         help='[mvo/rp/gmv/inv] Max weight per stock (default: 0.30)')
 
-    parser.add_argument('--backtest-start', type=str, default='2026-02-01',
+    parser.add_argument('--backtest-start', type=str, default='2026-01-28',
                         help='Backtest start date')
     parser.add_argument('--test-end', type=str, default=None,
                         help='Backtest end date')
@@ -538,6 +539,19 @@ def main():
                         help='Email recipient (default: kownse@gmail.com)')
     parser.add_argument('--email-days', type=int, default=5,
                         help='Number of recent days to include in email (default: 5)')
+
+    # AI affinity filter
+    parser.add_argument('--ai-filter', type=str, default='none',
+                        choices=['none', 'penalty', 'exclude'],
+                        help='AI affinity filter mode (default: none)')
+    parser.add_argument('--ai-penalty-weight', type=float, default=0.5,
+                        help='Penalty multiplier for negative-affinity stocks (default: 0.5)')
+    parser.add_argument('--ai-bonus-weight', type=float, default=0.0,
+                        help='Bonus multiplier for positive-affinity stocks (default: 0.0)')
+    parser.add_argument('--ai-exclude-threshold', type=int, default=-1,
+                        help='Affinity threshold for exclude mode, drop if <= this (default: -1)')
+    parser.add_argument('--no-ai-time-scale', action='store_true',
+                        help='Disable AI affinity time scaling (ramp 2020-2024)')
 
     args = parser.parse_args()
 
@@ -720,6 +734,22 @@ def main():
     pred_ensemble = ensemble_predictions_multi(pred_dict, args.ensemble_method, weights)
     print(f"  Ensemble shape: {len(pred_ensemble)}")
     print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
+
+    # AI affinity filter
+    if args.ai_filter != 'none':
+        print(f"\n{'='*60}")
+        print(f"[STEP] Applying AI affinity filter ({args.ai_filter})")
+        print(f"{'='*60}")
+        pred_ensemble = apply_ai_affinity_filter(
+            pred_ensemble,
+            mode=args.ai_filter,
+            penalty_weight=args.ai_penalty_weight,
+            bonus_weight=args.ai_bonus_weight,
+            exclude_threshold=args.ai_exclude_threshold,
+            time_scale=not args.no_ai_time_scale,
+        )
+        print(f"  Filtered shape: {len(pred_ensemble)}")
+        print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
     # Step 9: 运行预测或回测
     trading_details = []

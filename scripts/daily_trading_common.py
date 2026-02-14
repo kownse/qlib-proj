@@ -390,13 +390,15 @@ def collect_trading_details_from_positions(positions: dict, report_df: pd.DataFr
 
         for stock, amount in current_holdings.items():
             prev_amount = prev_holdings.get(stock, 0)
-            if amount > prev_amount:
-                buys.append((stock, amount - prev_amount, amount))
+            diff = amount - prev_amount
+            if diff >= 0.5:
+                buys.append((stock, diff, amount))
 
         for stock, prev_amount in prev_holdings.items():
             current_amount = current_holdings.get(stock, 0)
-            if current_amount < prev_amount:
-                sells.append((stock, prev_amount - current_amount, current_amount))
+            diff = prev_amount - current_amount
+            if diff >= 0.5:
+                sells.append((stock, diff, current_amount))
 
         date_str = str(date)[:10]
         daily_return = report_df.loc[date, 'return'] if date in report_df.index else 0

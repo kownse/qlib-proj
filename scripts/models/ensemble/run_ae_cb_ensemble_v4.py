@@ -50,6 +50,7 @@ from qlib.data.dataset.handler import DataHandlerLP
 from utils.talib_ops import TALIB_OPS
 from utils.strategy import get_strategy_config
 from utils.backtest_utils import plot_backtest_curve, generate_trade_records
+from utils.ai_filter import apply_ai_affinity_filter
 from data.stock_pools import STOCK_POOLS
 
 from models.common import (
@@ -925,6 +926,19 @@ def main():
     parser.add_argument('--max-weight', type=float, default=0.0,
                         help='[mvo/rp/gmv/inv] Max weight per stock, 0=no limit (default: 0, try 0.15)')
 
+    # AI affinity filter
+    parser.add_argument('--ai-filter', type=str, default='none',
+                        choices=['none', 'penalty', 'exclude'],
+                        help='AI affinity filter mode (default: none)')
+    parser.add_argument('--ai-penalty-weight', type=float, default=0.5,
+                        help='Penalty multiplier for negative-affinity stocks (default: 0.5)')
+    parser.add_argument('--ai-bonus-weight', type=float, default=0.0,
+                        help='Bonus multiplier for positive-affinity stocks (default: 0.0)')
+    parser.add_argument('--ai-exclude-threshold', type=int, default=-1,
+                        help='Affinity threshold for exclude mode, drop if <= this (default: -1)')
+    parser.add_argument('--no-ai-time-scale', action='store_true',
+                        help='Disable AI affinity time scaling (ramp 2020-2024)')
+
     args = parser.parse_args()
 
     # Use FINAL_TEST time splits
@@ -1134,6 +1148,22 @@ def main():
     pred_ensemble = ensemble_predictions_multi(pred_dict, args.ensemble_method, weights)
     print(f"    Ensemble shape: {len(pred_ensemble)}, Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
+    # AI affinity filter
+    pred_raw = None
+    if args.ai_filter != 'none':
+        step_num += 1
+        print(f"\n[{step_num}] Applying AI affinity filter ({args.ai_filter})...")
+        pred_raw = pred_ensemble.copy()
+        pred_ensemble = apply_ai_affinity_filter(
+            pred_ensemble,
+            mode=args.ai_filter,
+            penalty_weight=args.ai_penalty_weight,
+            bonus_weight=args.ai_bonus_weight,
+            exclude_threshold=args.ai_exclude_threshold,
+            time_scale=not args.no_ai_time_scale,
+        )
+        print(f"    Filtered shape: {len(pred_ensemble)}, Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
+
     # IC metrics
     step_num += 1
     print(f"\n[{step_num}] Calculating IC metrics...")
@@ -1172,6 +1202,16 @@ def main():
     print(f"\n    Ensemble Performance vs Best Single Model:")
     print(f"    IC improvement:   {ic_improvement:>+.2f}%")
     print(f"    ICIR improvement: {icir_improvement:>+.2f}%")
+
+    # Dual IC comparison when AI filter is active
+    if pred_raw is not None:
+        raw_ic, raw_std, raw_icir, _ = compute_ic(pred_raw, label)
+        print(f"\n    AI Filter Impact on IC:")
+        print(f"      Before filter: IC={raw_ic:.4f}, ICIR={raw_icir:.4f}")
+        print(f"      After filter:  IC={ens_ic:.4f}, ICIR={ens_icir:.4f}")
+        ic_delta = ens_ic - raw_ic
+        icir_delta = ens_icir - raw_icir
+        print(f"      Delta:         IC={ic_delta:+.4f}, ICIR={icir_delta:+.4f}")
 
     # Summary
     print("\n" + "=" * 80)

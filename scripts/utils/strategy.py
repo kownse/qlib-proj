@@ -684,6 +684,7 @@ class OptimizedWeightStrategy:
         rebalance_freq=1,
         risk_degree=0.95,
         max_weight=0.0,
+        n_drop=None,
     ):
         """
         Create a WeightStrategyBase subclass with portfolio optimization.
@@ -709,6 +710,10 @@ class OptimizedWeightStrategy:
         max_weight : float
             Maximum weight per stock (0 = no limit, 0.15 = max 15% per stock).
             Excess weight is redistributed proportionally to other stocks.
+        n_drop : int, optional
+            Max number of positions to replace per rebalance.
+            When set and holdings exist, keeps top (topk - n_drop) current
+            holdings and fills n_drop slots with new best-scoring stocks.
 
         Returns
         -------
@@ -728,13 +733,15 @@ class OptimizedWeightStrategy:
         _rebalance_freq = rebalance_freq
         _risk_degree = risk_degree
         _max_weight = max_weight
+        _n_drop = n_drop
 
         class OptimizedWeightStrategyImpl(WeightStrategyBase):
             def __init__(self, *, topk=30, rebalance_freq=1, **kwargs):
                 super().__init__(**kwargs)
                 self._topk = topk
                 self._rebalance_freq = _rebalance_freq
-                print(f"[MVO-INIT] OptimizedWeightStrategyImpl created: topk={topk}, rebalance_freq={_rebalance_freq}, method={_opt_method}")
+                self._n_drop = _n_drop
+                print(f"[MVO-INIT] OptimizedWeightStrategyImpl created: topk={topk}, rebalance_freq={_rebalance_freq}, method={_opt_method}, n_drop={_n_drop}")
                 self._risk_degree = _risk_degree
                 self._max_weight = _max_weight
                 self._optimizer = PortfolioOptimizer(
@@ -805,9 +812,26 @@ class OptimizedWeightStrategy:
                 if isinstance(score, pd.DataFrame):
                     score = score.iloc[:, 0]
 
-                # 1. Select top-K stocks by prediction score
-                topk_scores = score.nlargest(self._topk)
-                stock_ids = list(topk_scores.index)
+                # 1. Select top-K stocks by prediction score, with n_drop constraint
+                cur_weights = current.get_stock_weight_dict(only_stock=True)
+                held_stocks = [s for s in cur_weights if cur_weights[s] > 1e-6]
+
+                if self._n_drop is not None and len(held_stocks) > 0:
+                    # Score current holdings
+                    held_with_score = {s: score.get(s, -np.inf) for s in held_stocks}
+                    # Keep top (topk - n_drop) by score
+                    n_keep = max(0, self._topk - self._n_drop)
+                    keepers = sorted(held_with_score, key=held_with_score.get, reverse=True)[:n_keep]
+                    # Fill remaining n_drop slots from best non-held stocks
+                    candidates = score.drop(labels=[s for s in keepers if s in score.index], errors='ignore')
+                    new_stocks = list(candidates.nlargest(self._n_drop).index)
+                    stock_ids = keepers + new_stocks
+                    topk_scores = score.reindex(stock_ids).dropna()
+                    stock_ids = list(topk_scores.index)
+                else:
+                    # First rebalance or n_drop not set: original behavior
+                    topk_scores = score.nlargest(self._topk)
+                    stock_ids = list(topk_scores.index)
 
                 if len(stock_ids) < 2:
                     # Too few stocks for optimization, equal weight
@@ -1075,6 +1099,7 @@ def get_strategy_config(
             rebalance_freq=rebalance_freq,
             risk_degree=params.get("risk_degree", 0.95),
             max_weight=params.get("max_weight", 0.0),
+            n_drop=n_drop,
         )
         return {
             "class": OptStrategy,
