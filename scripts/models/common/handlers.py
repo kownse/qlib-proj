@@ -145,6 +145,15 @@ HANDLER_REGISTRY = {
         'default_kwargs': {'sector_features': 'sector+ai'},
     },
 
+    # AI basket handlers
+    'alpha158-talib-macro-aibasket': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha158_Volatility_TALib_Macro',
+        'description': 'Alpha158 + TA-Lib + Macro + AI basket features (~286 features)',
+        'use_talib': True,
+        'default_kwargs': {'ai_basket': True},
+    },
+
     # Enhanced handlers
     'alpha158-enhanced': {
         'module': 'data.datahandler_enhanced',

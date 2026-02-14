@@ -32,6 +32,9 @@ DEFAULT_MACRO_PATH = PROJECT_ROOT / "my_data" / "macro_processed" / "macro_featu
 # Default sector features path
 DEFAULT_SECTOR_PATH = PROJECT_ROOT / "my_data" / "sector_data" / "sector_features.parquet"
 
+# Default AI basket features path
+DEFAULT_AI_BASKET_PATH = PROJECT_ROOT / "my_data" / "ai_basket" / "ai_basket_features.parquet"
+
 
 class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
     """
@@ -184,6 +187,9 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         # Sector/AI feature parameters
         sector_data_path: Union[str, Path] = None,
         sector_features: str = "none",  # "none", "sector", "ai_only", "sector+ai"
+        # AI basket feature parameters
+        ai_basket_data_path: Union[str, Path] = None,
+        ai_basket: bool = False,
         **kwargs,
     ):
         """
@@ -203,6 +209,8 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
                 - "sector": 11 sector one-hot features only
                 - "ai_only": AI affinity score only (1 feature)
                 - "sector+ai": All 12 features (11 sector + 1 AI affinity)
+            ai_basket_data_path: Path to AI basket features parquet file
+            ai_basket: Whether to include AI basket features (~11 features)
             **kwargs: Additional arguments for parent class
         """
         self.volatility_window = volatility_window
@@ -210,12 +218,17 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         self.macro_features = macro_features
         self.sector_data_path = Path(sector_data_path) if sector_data_path else DEFAULT_SECTOR_PATH
         self.sector_features = sector_features
+        self.ai_basket_data_path = Path(ai_basket_data_path) if ai_basket_data_path else DEFAULT_AI_BASKET_PATH
+        self.ai_basket = ai_basket
 
         # Load macro features
         self._macro_df = self._load_macro_features()
 
         # Load sector features
         self._sector_df = self._load_sector_features()
+
+        # Load AI basket features
+        self._ai_basket_df = self._load_ai_basket_features()
 
         from qlib.contrib.data.handler import check_transform_proc, _DEFAULT_LEARN_PROCESSORS
 
@@ -251,9 +264,9 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
 
     def process_data(self, with_fit: bool = False):
         """
-        Override process_data to add macro + sector features AFTER processors run.
+        Override process_data to add macro + sector + AI basket features AFTER processors run.
 
-        This ensures macro and sector features are included in _learn and _infer.
+        This ensures macro, sector, and AI basket features are included in _learn and _infer.
         """
         # First, call parent's process_data
         super().process_data(with_fit=with_fit)
@@ -265,6 +278,10 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         # Then add sector features
         if self._sector_df is not None and self.sector_features != "none":
             self._add_sector_to_processed_data()
+
+        # Then add AI basket features
+        if self._ai_basket_df is not None:
+            self._add_ai_basket_to_processed_data()
 
     def _add_macro_to_processed_data(self):
         """Add macro features to _learn and _infer after processors run."""
@@ -287,9 +304,12 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         except Exception as e:
             print(f"Warning: Error adding macro features: {e}")
 
-    def _merge_macro_to_df(self, df: pd.DataFrame, cols: list) -> pd.DataFrame:
-        """Merge macro features into a DataFrame using vectorized reindex."""
+    def _merge_macro_to_df(self, df: pd.DataFrame, cols: list, source_df=None) -> pd.DataFrame:
+        """Merge date-aligned features into a DataFrame using vectorized reindex."""
         import numpy as np
+
+        if source_df is None:
+            source_df = self._macro_df
 
         datetime_col = df.index.names[0]
         main_datetimes = df.index.get_level_values(datetime_col)
@@ -297,7 +317,7 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
 
         # Reindex macro data to unique datetimes once for all columns
         unique_dt = main_datetimes.unique()
-        macro_subset = self._macro_df[cols].reindex(unique_dt)
+        macro_subset = source_df[cols].reindex(unique_dt)
 
         # Vectorized positional lookup (C-level, replaces Python loop)
         positions = unique_dt.get_indexer(main_datetimes)
@@ -425,6 +445,44 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         except Exception as e:
             print(f"Warning: Failed to load macro features: {e}")
             return None
+
+    def _load_ai_basket_features(self) -> Optional[pd.DataFrame]:
+        """Load AI basket features from parquet file."""
+        if not self.ai_basket:
+            return None
+
+        if not self.ai_basket_data_path.exists():
+            print(f"Warning: AI basket features file not found: {self.ai_basket_data_path}")
+            print("Run: python scripts/data/process_ai_basket.py")
+            return None
+
+        try:
+            df = pd.read_parquet(self.ai_basket_data_path)
+            print(f"Loaded AI basket features: {df.shape}, "
+                  f"date range: {df.index.min()} to {df.index.max()}")
+            return df
+        except Exception as e:
+            print(f"Warning: Failed to load AI basket features: {e}")
+            return None
+
+    def _add_ai_basket_to_processed_data(self):
+        """Add AI basket features to _learn and _infer after processors run."""
+        try:
+            cols = self._ai_basket_df.columns.tolist()
+
+            # Add to _learn
+            if hasattr(self, "_learn") and self._learn is not None:
+                self._learn = self._merge_macro_to_df(
+                    self._learn, cols, source_df=self._ai_basket_df)
+                print(f"Added {len(cols)} AI basket features to learn data")
+
+            # Add to _infer
+            if hasattr(self, "_infer") and self._infer is not None:
+                self._infer = self._merge_macro_to_df(
+                    self._infer, cols, source_df=self._ai_basket_df)
+
+        except Exception as e:
+            print(f"Warning: Error adding AI basket features: {e}")
 
     def _get_macro_feature_columns(self) -> List[str]:
         """Get macro feature columns based on configuration."""

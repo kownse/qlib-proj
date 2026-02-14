@@ -409,5 +409,152 @@ class TestMacroFeatures:
         assert macro_data.abs().sum().sum() > 0, "All macro features are zero"
 
 
+AI_BASKET_PATH = PROJECT_ROOT / "my_data" / "ai_basket" / "ai_basket_features.parquet"
+
+AI_BASKET_COLS = [
+    "ai_basket_ret_1d", "ai_basket_ret_5d", "ai_basket_ret_20d",
+    "ai_basket_ma5_ratio", "ai_basket_ma20_ratio",
+    "ai_basket_vol20",
+    "ai_basket_vs_spy", "ai_basket_vs_qqq",
+    "ai_basket_breadth", "ai_basket_dd60", "ai_basket_dispersion",
+]
+
+
+# ============================================================================
+# 6. AI basket features
+# ============================================================================
+
+class TestAIBasketParquetData:
+    """Test the raw AI basket parquet data quality."""
+
+    @pytest.fixture(autouse=True)
+    def load_data(self):
+        if not AI_BASKET_PATH.exists():
+            pytest.skip("AI basket data not available")
+        self.df = pd.read_parquet(AI_BASKET_PATH)
+
+    def test_expected_columns(self):
+        for col in AI_BASKET_COLS:
+            assert col in self.df.columns, f"Missing column: {col}"
+
+    def test_index_is_datetime(self):
+        assert isinstance(self.df.index, pd.DatetimeIndex)
+
+    def test_sufficient_date_range(self):
+        """Should cover at least 2000-2024."""
+        assert self.df.index.min().year <= 2001
+        assert self.df.index.max().year >= 2024
+
+    def test_returns_are_reasonable(self):
+        """Daily returns should be within -50% to +50%."""
+        ret = self.df["ai_basket_ret_1d"].dropna()
+        assert ret.min() > -0.5, f"Extreme negative return: {ret.min()}"
+        assert ret.max() < 0.5, f"Extreme positive return: {ret.max()}"
+
+    def test_volatility_positive(self):
+        vol = self.df["ai_basket_vol20"].dropna()
+        assert (vol > 0).all(), "Volatility should always be positive"
+
+    def test_breadth_in_zero_one(self):
+        breadth = self.df["ai_basket_breadth"].dropna()
+        assert breadth.min() >= 0.0
+        assert breadth.max() <= 1.0
+
+    def test_drawdown_non_positive(self):
+        dd = self.df["ai_basket_dd60"].dropna()
+        assert dd.max() <= 0.001, "Drawdown should be <= 0"
+
+    def test_lagged_by_one_day(self):
+        """First row date should be start+1 (due to 1-day lag)."""
+        # The first non-NaN ret_1d should be after the first trading day
+        first_valid = self.df["ai_basket_ret_1d"].first_valid_index()
+        assert first_valid > self.df.index[0], "Data should be lagged (first_valid > first_index)"
+
+
+class TestAIBasketHandlerIntegration:
+    """End-to-end test: AI basket features appear in handler output."""
+
+    @pytest.fixture(autouse=True)
+    def check_data(self):
+        if not AI_BASKET_PATH.exists():
+            pytest.skip("AI basket data not available")
+        if not MACRO_PATH.exists():
+            pytest.skip("Macro data not available")
+
+    def test_ai_basket_features_in_handler(self):
+        import qlib
+        from qlib.constant import REG_US
+        from utils.talib_ops import TALIB_OPS
+        qlib.init(
+            provider_uri=str(PROJECT_ROOT / "my_data" / "qlib_us"),
+            region=REG_US,
+            custom_ops=TALIB_OPS,
+            kernels=1,
+        )
+        from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
+
+        handler = Alpha158_Volatility_TALib_Macro(
+            instruments="sp500",
+            start_time="2024-01-01",
+            end_time="2024-01-31",
+            fit_start_time="2024-01-01",
+            fit_end_time="2024-01-31",
+            macro_features="core",
+            sector_features="none",
+            ai_basket=True,
+        )
+
+        learn_df = handler.fetch(col_set="feature", data_key="learn")
+        cols = learn_df.columns
+        if isinstance(cols, pd.MultiIndex):
+            feature_names = [c[1] if len(c) > 1 else c[0] for c in cols]
+        else:
+            feature_names = cols.tolist()
+
+        # All AI basket features should be present
+        for col in AI_BASKET_COLS:
+            assert col in feature_names, f"AI basket feature '{col}' missing from handler"
+
+        # Values should NOT all be zero
+        ai_cols_in_df = [c for c in learn_df.columns
+                         if (c[1] if isinstance(c, tuple) else c).startswith("ai_basket_")]
+        ai_data = learn_df[ai_cols_in_df]
+        assert ai_data.abs().sum().sum() > 0, "All AI basket features are zero"
+
+    def test_ai_basket_disabled_by_default(self):
+        """Without ai_basket=True, no AI basket features should appear."""
+        import qlib
+        from qlib.constant import REG_US
+        from utils.talib_ops import TALIB_OPS
+        qlib.init(
+            provider_uri=str(PROJECT_ROOT / "my_data" / "qlib_us"),
+            region=REG_US,
+            custom_ops=TALIB_OPS,
+            kernels=1,
+        )
+        from data.datahandler_macro import Alpha158_Volatility_TALib_Macro
+
+        handler = Alpha158_Volatility_TALib_Macro(
+            instruments="sp500",
+            start_time="2024-01-01",
+            end_time="2024-01-31",
+            fit_start_time="2024-01-01",
+            fit_end_time="2024-01-31",
+            macro_features="core",
+            sector_features="none",
+            ai_basket=False,
+        )
+
+        learn_df = handler.fetch(col_set="feature", data_key="learn")
+        cols = learn_df.columns
+        if isinstance(cols, pd.MultiIndex):
+            feature_names = [c[1] if len(c) > 1 else c[0] for c in cols]
+        else:
+            feature_names = cols.tolist()
+
+        ai_features = [c for c in feature_names if c.startswith("ai_basket_")]
+        assert len(ai_features) == 0, f"AI basket features should not be present: {ai_features}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
