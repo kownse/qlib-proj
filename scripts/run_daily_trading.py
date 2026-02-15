@@ -18,27 +18,22 @@
 import sys
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
-import numpy as np
 
 # 导入公共模块（会自动设置环境变量和路径）
 from daily_trading_common import (
     PROJECT_ROOT,
-    SCRIPTS_DIR,
-    send_email,
-    format_trading_details_html,
-    format_trading_details_text,
-    run_command,
-    get_latest_data_date,
-    get_latest_calendar_dates,
+    add_common_trading_args,
     download_data,
     init_qlib_for_talib,
     create_dataset_for_trading,
     collect_trading_details_from_positions,
     print_trading_details,
     generate_detailed_trade_records,
+    detect_and_validate_dates,
+    send_trading_email,
 )
 
 
@@ -187,7 +182,6 @@ def run_trading_backtest(
     """
     from qlib.backtest import backtest as qlib_backtest
     from qlib.contrib.evaluate import risk_analysis
-    from data.stock_pools import STOCK_POOLS
     from utils.strategy import get_strategy_config
 
     print(f"\n{'='*70}")
@@ -224,7 +218,6 @@ def run_trading_backtest(
     pred_df = pred.to_frame("score")
 
     # ============ 将股票符号转为小写以匹配 Qlib 数据格式 ============
-    # Qlib 内部总是使用小写符号来查找数据文件
     pred_df = pred_df.reset_index()
     pred_df['instrument'] = pred_df['instrument'].str.lower()
     pred_df = pred_df.set_index(['datetime', 'instrument'])
@@ -247,13 +240,10 @@ def run_trading_backtest(
         print(f"  {i:2d}. {stock.upper():<8s}  Score: {row['score']:>8.4f}")
 
     # ============ 调整回测日期 ============
-    # 由于需要 N-day forward return 作为标签，最近几天可能没有完整数据
-    # 将回测结束日期调整为有足够预测数据的最后一天
     if len(pred_dates) > 0:
         actual_test_end = pred_dates[-1].strftime("%Y-%m-%d")
         actual_test_start = pred_dates[0].strftime("%Y-%m-%d")
 
-        # 如果 test_start 晚于实际预测数据，调整它
         if pd.Timestamp(test_start) > pred_dates[0]:
             actual_test_start = test_start
 
@@ -282,7 +272,6 @@ def run_trading_backtest(
     }
 
     # 创建空的 benchmark series（避免 Qlib 默认使用 SH000300）
-    # 当 benchmark 是 pd.Series 时，Qlib 会直接使用它而不是查询数据
     empty_benchmark = pd.Series(dtype=float)
 
     # 回测配置
@@ -290,12 +279,12 @@ def run_trading_backtest(
         "start_time": test_start,
         "end_time": test_end,
         "account": account,
-        "benchmark": empty_benchmark,  # 传入空 Series 避免默认使用 SH000300
+        "benchmark": empty_benchmark,
         "exchange_kwargs": {
             "freq": "day",
             "limit_threshold": None,
             "deal_price": "close",
-            "open_cost": 0.0005,  # 0.05% 手续费
+            "open_cost": 0.0005,
             "close_cost": 0.0005,
             "min_cost": 1,
         },
@@ -384,40 +373,19 @@ def main():
         description='Daily trading script - update data and run model predictions',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--skip-download', action='store_true',
-                        help='Skip data download step')
-    parser.add_argument('--predict-only', action='store_true',
-                        help='Only generate predictions for today, skip backtest (for live trading)')
+    add_common_trading_args(parser)
+
+    # Override defaults for base script
+    parser.set_defaults(
+        n_drop=1,
+        backtest_start='2026-01-01',
+    )
+
     parser.add_argument('--model-path', type=str,
                         default='my_models/ae_mlp_cv_alpha158-enhanced-v7_sp500_5d_best.keras',
                         help='Path to trained model')
     parser.add_argument('--handler', type=str, default='alpha158-enhanced-v7',
                         help='Handler name')
-    parser.add_argument('--stock-pool', type=str, default='sp500',
-                        choices=['test', 'tech', 'sp100', 'sp500'],
-                        help='Stock pool')
-    parser.add_argument('--account', type=float, default=8000,
-                        help='Initial account balance (default: 8000)')
-    parser.add_argument('--topk', type=int, default=10,
-                        help='Number of stocks to hold (default: 5)')
-    parser.add_argument('--n-drop', type=int, default=1,
-                        help='Number of stocks to drop each rebalance (default: 1)')
-    parser.add_argument('--rebalance-freq', type=int, default=5,
-                        help='Rebalance frequency in days (default: 5)')
-    parser.add_argument('--backtest-start', type=str, default='2026-01-01',
-                        help='Backtest start date (default: 2026-01-01)')
-    parser.add_argument('--test-end', type=str, default=None,
-                        help='Backtest end date (default: latest available data date - 1 day)')
-    parser.add_argument('--nday', type=int, default=5,
-                        help='N-day forward prediction (default: 5)')
-    parser.add_argument('--feature-lookback', type=int, default=5,
-                        help='Days before backtest-start for feature calculation (default: 5)')
-    parser.add_argument('--send-email', action='store_true',
-                        help='Send trading report via email')
-    parser.add_argument('--email-to', type=str, default='kownse@gmail.com',
-                        help='Email recipient (default: kownse@gmail.com)')
-    parser.add_argument('--email-days', type=int, default=5,
-                        help='Number of recent days to include in email (default: 5)')
     args = parser.parse_args()
 
     print("="*70)
@@ -440,54 +408,8 @@ def main():
     else:
         print("\n[SKIP] Data download skipped")
 
-    # 自动检测日期范围（基于实际可用数据和 Qlib 日历）
-    print(f"\n{'='*60}")
-    print("[STEP] Detecting data date range")
-    print(f"{'='*60}")
-    latest_data_str = get_latest_data_date()
-    latest_calendar_str, usable_calendar_str = get_latest_calendar_dates()
-    latest_data = datetime.strptime(latest_data_str, "%Y-%m-%d")
-    latest_calendar = datetime.strptime(latest_calendar_str, "%Y-%m-%d")
-    usable_calendar = datetime.strptime(usable_calendar_str, "%Y-%m-%d")
-
-    print(f"Latest available data date: {latest_data_str}")
-    print(f"Latest Qlib calendar date: {latest_calendar_str}")
-    print(f"Usable calendar date (for backtest end): {usable_calendar_str}")
-    print(f"  (Qlib needs next day data, so backtest must end 1 trading day before calendar end)")
-
-    # 有效的回测开始日期上限 = min(数据日期, 可用日历日期)
-    max_backtest_date = min(latest_data, usable_calendar)
-    max_backtest_str = max_backtest_date.strftime("%Y-%m-%d")
-
-    # 回测开始日期
-    backtest_start_date = datetime.strptime(args.backtest_start, "%Y-%m-%d")
-
-    # 如果回测开始日期超出可用范围，自动调整
-    if backtest_start_date > max_backtest_date:
-        print(f"\nWARNING: Backtest start date {args.backtest_start} exceeds usable range!")
-        print(f"         Automatically adjusting to: {max_backtest_str}")
-        backtest_start_date = max_backtest_date
-        args.backtest_start = max_backtest_str
-
-    # 数据开始日期（回测开始前 feature_lookback 天，用于计算 TA-Lib 特征）
-    data_start_date = backtest_start_date - timedelta(days=args.feature_lookback)
-    args.test_start = data_start_date.strftime("%Y-%m-%d")
-
-    if args.test_end is None:
-        # 回测结束日期 = 可用的最大日期
-        args.test_end = max_backtest_str
-
-    # 确保 test_end 不超过可用范围
-    test_end_date = datetime.strptime(args.test_end, "%Y-%m-%d")
-    if test_end_date > max_backtest_date:
-        print(f"\nWARNING: Test end date {args.test_end} exceeds usable range!")
-        print(f"         Automatically adjusting to: {max_backtest_str}")
-        args.test_end = max_backtest_str
-
-    print(f"\nFinal date settings:")
-    print(f"  Data start (for features): {args.test_start}")
-    print(f"  Backtest start: {args.backtest_start}")
-    print(f"  Backtest end: {args.test_end}")
+    # 自动检测日期范围
+    detect_and_validate_dates(args)
 
     # Step 2: 初始化 Qlib
     print(f"\n{'='*60}")
@@ -531,13 +453,11 @@ def main():
         )
     else:
         # 回测模式：运行完整回测
-        # 注意：回测从 backtest_start 开始，而不是 test_start
-        # test_start 比 backtest_start 早几天，仅用于计算特征
         trading_details = run_trading_backtest(
             model=model,
             dataset=dataset,
             stock_pool=args.stock_pool,
-            test_start=args.backtest_start,  # 回测从 backtest_start 开始
+            test_start=args.backtest_start,
             test_end=args.test_end,
             account=args.account,
             topk=args.topk,
@@ -550,33 +470,7 @@ def main():
         print(f"{'='*70}")
 
     # Step 6: 发送邮件报告
-    if args.send_email and trading_details:
-        print(f"\n{'='*60}")
-        print("[STEP] Sending email report")
-        print(f"{'='*60}")
-
-        # 获取最近 N 天的交易详情
-        recent_details = trading_details[-args.email_days:] if len(trading_details) > args.email_days else trading_details
-
-        if recent_details:
-            # 生成邮件内容
-            text_body = format_trading_details_text(recent_details)
-            html_body = format_trading_details_html(recent_details)
-
-            # 构建邮件主题
-            start_date = recent_details[0]['date']
-            end_date = recent_details[-1]['date']
-            subject = f"Daily Trading Report: {start_date} to {end_date}"
-
-            # 发送邮件
-            send_email(
-                subject=subject,
-                body=text_body,
-                to_email=args.email_to,
-                html_body=html_body
-            )
-        else:
-            print("No trading details to send.")
+    send_trading_email(args, trading_details)
 
 
 if __name__ == "__main__":
