@@ -32,7 +32,17 @@ from .training import (
     prepare_test_data_for_prediction,
     load_catboost_model,
     get_catboost_feature_count,
+    load_lightgbm_model,
+    get_lightgbm_feature_count,
+    load_xgboost_model,
+    get_xgboost_feature_count,
     print_prediction_stats,
+    prepare_top_k_data,
+    print_retrained_importance,
+    TreeModelAdapter,
+    tree_main_train_impl,
+    tree_backtest_only_impl,
+    tree_main,
 )
 
 from .backtest import run_backtest
@@ -48,4 +58,8 @@ from .cv_utils import (
     compute_ic,
     print_cv_info,
     prepare_cv_fold_data,
+    BaseCVHyperoptObjective,
+    run_hyperopt_cv_search_generic,
+    first_pass_feature_selection_generic,
+    train_final_model_generic,
 )

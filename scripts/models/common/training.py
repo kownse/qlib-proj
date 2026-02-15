@@ -16,6 +16,8 @@ import argparse
 import pickle
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
@@ -608,3 +610,362 @@ def print_prediction_stats(pred: pd.Series):
     """打印预测结果统计"""
     print(f"    ✓ Prediction shape: {pred.shape}")
     print(f"    ✓ Prediction range: [{pred.min():.4f}, {pred.max():.4f}]")
+
+
+# ============================================================================
+# 树模型通用基础设施
+# ============================================================================
+
+def load_lightgbm_model(model_path):
+    """加载 LightGBM 模型"""
+    import lightgbm as lgb
+    return lgb.Booster(model_file=str(model_path))
+
+
+def get_lightgbm_feature_count(model):
+    """获取 LightGBM 模型特征数量"""
+    return model.num_feature()
+
+
+def load_xgboost_model(model_path):
+    """加载 XGBoost 模型"""
+    import xgboost as xgb
+    model = xgb.Booster()
+    model.load_model(str(model_path))
+    return model
+
+
+def get_xgboost_feature_count(model):
+    """获取 XGBoost 模型特征数量"""
+    return model.num_features()
+
+
+def prepare_top_k_data(dataset, importance_df, top_k):
+    """
+    从 importance_df 中选择 top-k 特征，准备重训练所需的数据。
+
+    Parameters
+    ----------
+    dataset : DatasetH
+        数据集
+    importance_df : pd.DataFrame
+        特征重要性 DataFrame
+    top_k : int
+        要选择的特征数量
+
+    Returns
+    -------
+    tuple
+        (top_features, train_data, valid_data, test_data, train_label, valid_label)
+    """
+    print(f"\n[8] Feature Selection and Retraining...")
+    print(f"    Selecting top {top_k} features...")
+
+    top_features = importance_df.head(top_k)['feature'].tolist()
+    print(f"    Selected features: {top_features[:10]}{'...' if len(top_features) > 10 else ''}")
+
+    train_data = dataset.prepare("train", col_set="feature")[top_features]
+    valid_data = dataset.prepare("valid", col_set="feature")[top_features]
+    test_data = dataset.prepare("test", col_set="feature")[top_features]
+
+    train_label = dataset.prepare("train", col_set="label")
+    valid_label = dataset.prepare("valid", col_set="label")
+
+    print(f"    ✓ Selected train features shape: {train_data.shape}")
+
+    return top_features, train_data, valid_data, test_data, train_label, valid_label
+
+
+def print_retrained_importance(feature_names, importance_values):
+    """
+    打印重新训练后的特征重要性。
+
+    Parameters
+    ----------
+    feature_names : list
+        特征名称列表
+    importance_values : array-like
+        特征重要性值
+
+    Returns
+    -------
+    pd.DataFrame
+    """
+    print("\n    Feature Importance after Retraining:")
+    print("    " + "-" * 50)
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importance_values
+    }).sort_values('importance', ascending=False)
+
+    for i, row in importance_df.iterrows():
+        print(f"    {importance_df.index.get_loc(i)+1:3d}. {row['feature']:<40s} {row['importance']:>10.2f}")
+    print("    " + "-" * 50)
+
+    return importance_df
+
+
+@dataclass
+class TreeModelAdapter:
+    """
+    树模型适配器 - 封装模型特定操作，使通用训练流程与模型实现解耦。
+
+    Callbacks
+    ---------
+    train_model : (dataset, valid_cols, **extra_kwargs) ->
+        (model_or_wrapper, feature_names, importance_df, num_features)
+    predict : (raw_model, test_data_df) -> np.ndarray
+    retrain_predict : (dataset, importance_df, args, **extra_kwargs) ->
+        (raw_model, top_features, test_pred)
+    load_model : (path) -> raw_model
+    get_feature_count : (raw_model) -> int
+    unwrap_model : (wrapper) -> raw_model, None means model is already raw
+    add_arguments : (parser) -> None, add model-specific CLI arguments
+    post_parse_args : (args, handler_config, symbols) -> 5-tuple | dict | None
+        5-tuple: short-circuit return (e.g., CatBoost --params-file mode)
+        dict: extra_kwargs passed to train_model/retrain_predict
+        None: no extra kwargs
+    """
+    model_name: str
+    model_prefix: str
+    model_extension: str
+    model_type: str
+    script_name: str
+
+    train_model: Callable
+    predict: Callable
+    retrain_predict: Callable
+    load_model: Callable
+    get_feature_count: Callable
+
+    unwrap_model: Optional[Callable] = None
+    add_arguments: Optional[Callable] = None
+    post_parse_args: Optional[Callable] = None
+
+
+def tree_main_train_impl(adapter, args):
+    """
+    通用树模型训练流程。
+
+    Parameters
+    ----------
+    adapter : TreeModelAdapter
+    args : argparse.Namespace
+
+    Returns
+    -------
+    tuple
+        (model_path, dataset, test_pred, args, time_splits)
+    """
+    from utils.utils import evaluate_model
+
+    # 获取配置
+    handler_config = HANDLER_CONFIG[args.handler]
+    symbols = STOCK_POOLS[args.stock_pool]
+
+    # 处理 post_parse_args
+    extra_kwargs = {}
+    if adapter.post_parse_args:
+        result = adapter.post_parse_args(args, handler_config, symbols)
+        if isinstance(result, tuple) and len(result) == 5:
+            return result  # Short-circuit (e.g., CatBoost --params-file)
+        elif isinstance(result, dict):
+            extra_kwargs = result
+
+    time_splits = get_time_splits(args.max_train)
+
+    # 打印头部信息
+    print_training_header(adapter.model_name, args, symbols, handler_config, time_splits)
+
+    # 初始化和数据准备
+    init_qlib(handler_config['use_talib'])
+    check_data_availability(time_splits)
+    handler = create_data_handler(args, handler_config, symbols, time_splits)
+    dataset = create_dataset(handler, time_splits)
+    train_data, valid_cols, dropped_cols = analyze_features(dataset)
+    analyze_label_distribution(dataset)
+
+    # 训练模型
+    model_wrapper, feature_names, importance_df, num_features = adapter.train_model(
+        dataset, valid_cols, **extra_kwargs)
+
+    # 保存特征重要性
+    outputs_dir = PROJECT_ROOT / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    importance_filename = generate_model_filename(
+        f"{adapter.model_prefix}_importance", args, 0, ".csv")
+    importance_path = outputs_dir / importance_filename
+    importance_df.to_csv(importance_path, index=False)
+    print(f"    Feature importance saved to: {importance_path}")
+
+    # 特征选择和重新训练
+    if args.top_k > 0 and args.top_k < len(feature_names):
+        retrained_model, top_features, test_pred = adapter.retrain_predict(
+            dataset, importance_df, args, **extra_kwargs)
+
+        # 评估
+        print(f"\n[10] Evaluation with selected features...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+
+        # 保存模型
+        print(f"\n[11] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_filename = generate_model_filename(
+            adapter.model_prefix, args, args.top_k, adapter.model_extension)
+        model_path = MODEL_SAVE_PATH / model_filename
+        meta_data = create_meta_data(
+            args, handler_config, time_splits, top_features, adapter.model_type, args.top_k)
+        save_model_with_meta(retrained_model, model_path, meta_data)
+
+        return model_path, dataset, test_pred, args, time_splits
+    else:
+        # 原始模型预测
+        raw_model = adapter.unwrap_model(model_wrapper) if adapter.unwrap_model else model_wrapper
+        test_data_filtered = prepare_test_data_for_prediction(dataset, num_features)
+
+        pred_values = adapter.predict(raw_model, test_data_filtered)
+        test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')
+        print_prediction_stats(test_pred)
+
+        # 评估
+        print(f"\n[9] Evaluation...")
+        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
+
+        # 保存模型
+        print(f"\n[10] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_filename = generate_model_filename(
+            adapter.model_prefix, args, 0, adapter.model_extension)
+        model_path = MODEL_SAVE_PATH / model_filename
+        meta_data = create_meta_data(
+            args, handler_config, time_splits, valid_cols, adapter.model_type, 0)
+        save_model_with_meta(raw_model, model_path, meta_data)
+
+        return model_path, dataset, test_pred, args, time_splits
+
+
+def tree_backtest_only_impl(adapter, args):
+    """
+    跳过训练，直接加载模型进行预测和回测。
+
+    Parameters
+    ----------
+    adapter : TreeModelAdapter
+    args : argparse.Namespace
+
+    Returns
+    -------
+    tuple or None
+        (model_path, dataset, test_pred, args, time_splits)
+    """
+    from utils.utils import evaluate_model
+
+    model_path = Path(args.model_path)
+    meta_path = model_path.with_suffix('.meta.pkl')
+
+    print("=" * 70)
+    print("BACKTEST ONLY MODE (Skip Training)")
+    print("=" * 70)
+
+    # 加载模型元数据
+    if not meta_path.exists():
+        print(f"Error: Metadata file not found: {meta_path}")
+        print("Please provide a model with .meta.pkl file")
+        return None
+
+    with open(meta_path, 'rb') as f:
+        meta_data = pickle.load(f)
+
+    print(f"\n[1] Loading model metadata...")
+    print(f"    Model path: {model_path}")
+    print(f"    Handler: {meta_data.get('handler', 'N/A')}")
+    print(f"    Stock pool: {meta_data.get('stock_pool', 'N/A')}")
+    print(f"    N-day: {meta_data.get('nday', 'N/A')}")
+    print(f"    Top-k features: {meta_data.get('top_k', 0)}")
+
+    # 使用元数据中的配置，但允许 CLI 覆盖部分参数
+    handler_name = meta_data.get('handler', args.handler)
+    stock_pool = meta_data.get('stock_pool', args.stock_pool)
+
+    handler_config = HANDLER_CONFIG[handler_name]
+    symbols = STOCK_POOLS[stock_pool]
+    time_splits = get_time_splits(args.max_train)
+
+    # 初始化 Qlib
+    print(f"\n[2] Initializing Qlib...")
+    init_qlib(handler_config['use_talib'])
+
+    # 创建数据集
+    print(f"\n[3] Creating dataset for prediction...")
+    handler = create_data_handler(args, handler_config, symbols, time_splits)
+    dataset = create_dataset(handler, time_splits)
+
+    # 加载模型
+    print(f"\n[4] Loading model...")
+    model = adapter.load_model(model_path)
+    num_features = adapter.get_feature_count(model)
+    print(f"    ✓ Model loaded, features: {num_features}")
+
+    # 准备测试数据
+    print(f"\n[5] Preparing test data...")
+    feature_names = meta_data.get('feature_names', [])
+    top_k = meta_data.get('top_k', 0)
+
+    if top_k > 0 and feature_names:
+        test_data = dataset.prepare("test", col_set="feature")
+        available_features = [f for f in feature_names if f in test_data.columns]
+        if len(available_features) < len(feature_names):
+            print(f"    ⚠ Some features missing: {len(available_features)}/{len(feature_names)}")
+        test_data_filtered = test_data[available_features]
+    else:
+        test_data_filtered = prepare_test_data_for_prediction(dataset, num_features)
+
+    print(f"    Test data shape: {test_data_filtered.shape}")
+
+    # 生成预测
+    print(f"\n[6] Generating predictions...")
+    pred_values = adapter.predict(model, test_data_filtered)
+    test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')
+    print_prediction_stats(test_pred)
+
+    # 评估
+    print(f"\n[7] Evaluation...")
+    evaluate_model(dataset, test_pred, PROJECT_ROOT, meta_data.get('nday', args.nday))
+
+    return model_path, dataset, test_pred, args, time_splits
+
+
+def tree_main(adapter):
+    """
+    通用树模型入口函数。
+
+    处理命令行参数解析，分发到训练或回测流程，并在需要时运行回测。
+
+    Parameters
+    ----------
+    adapter : TreeModelAdapter
+    """
+    from .backtest import run_backtest
+
+    parser = create_argument_parser(adapter.model_name, adapter.script_name)
+    if adapter.add_arguments:
+        adapter.add_arguments(parser)
+    args = parser.parse_args()
+
+    if args.model_path:
+        if not args.backtest:
+            print("Warning: --model-path provided but --backtest not set. Enabling backtest automatically.")
+            args.backtest = True
+        result = tree_backtest_only_impl(adapter, args)
+    else:
+        result = tree_main_train_impl(adapter, args)
+
+    if result is not None:
+        model_path, dataset, pred, args, time_splits = result
+        if args.backtest:
+            run_backtest(
+                model_path, dataset, pred, args, time_splits,
+                model_name=adapter.model_name,
+                load_model_func=adapter.load_model,
+                get_feature_count_func=adapter.get_feature_count
+            )

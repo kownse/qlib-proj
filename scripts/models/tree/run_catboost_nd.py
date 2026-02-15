@@ -66,6 +66,32 @@ print("[DEBUG] 导入 CatBoostModel...")
 from qlib.contrib.model.catboost_model import CatBoostModel
 from qlib.data.dataset.handler import DataHandlerLP
 
+from utils.utils import evaluate_model
+from data.stock_pools import STOCK_POOLS
+
+from models.common import (
+    HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
+    print_feature_importance,
+    print_prediction_stats,
+    init_qlib,
+    print_training_header,
+    save_model_with_meta,
+    create_meta_data,
+    generate_model_filename,
+    load_catboost_model,
+    get_catboost_feature_count,
+    prepare_top_k_data,
+    print_retrained_importance,
+    # CV utilities (for --params-file aligned path)
+    FINAL_TEST,
+    create_data_handler_for_fold,
+    create_dataset_for_fold,
+    compute_time_decay_weights,
+    prepare_features_and_labels,
+    compute_ic,
+)
+from models.common.training import TreeModelAdapter, tree_main
+
 
 # ============================================================================
 # 默认 CatBoost 参数
@@ -128,49 +154,12 @@ def load_params_from_file(params_file: str) -> tuple:
 
     return final_params, sample_weight_halflife
 
-from utils.utils import evaluate_model
-from data.stock_pools import STOCK_POOLS
-
-from models.common import (
-    HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
-    create_argument_parser,
-    get_time_splits,
-    print_training_header,
-    init_qlib,
-    check_data_availability,
-    create_data_handler,
-    create_dataset,
-    analyze_features,
-    analyze_label_distribution,
-    print_feature_importance,
-    save_model_with_meta,
-    create_meta_data,
-    generate_model_filename,
-    prepare_test_data_for_prediction,
-    print_prediction_stats,
-    run_backtest,
-    load_catboost_model,
-    get_catboost_feature_count,
-    # CV utilities (for --params-file aligned path)
-    FINAL_TEST,
-    create_data_handler_for_fold,
-    create_dataset_for_fold,
-    compute_time_decay_weights,
-    prepare_features_and_labels,
-    compute_ic,
-)
-
 
 def train_catboost_native(args, handler_config, symbols, cb_params, halflife=0):
     """
     使用原生 CatBoostRegressor 训练模型（与 hyperopt CV 的 train_final_model 一致）
 
-    当 --params-file 提供时使用此函数，确保训练流程与 hyperopt CV 完全对齐:
-    - 使用 FINAL_TEST 时间划分
-    - 使用原生 CatBoostRegressor (非 qlib CatBoostModel wrapper)
-    - 使用 compute_time_decay_weights (非 TimeDecayReweighter)
-    - fillna(0).replace([np.inf, -np.inf], 0) 预处理
-    - DK_L 数据键
+    当 --params-file 提供时使用此函数，确保训练流程与 hyperopt CV 完全对齐。
 
     Returns
     -------
@@ -256,20 +245,9 @@ def train_catboost_native(args, handler_config, symbols, cb_params, halflife=0):
     return model, feature_names, test_pred, dataset
 
 
-def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None):
+def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None, **kwargs):
     """
     训练 CatBoost 模型
-
-    Parameters
-    ----------
-    dataset : DatasetH
-        数据集
-    valid_cols : list
-        有效特征列
-    cb_params : dict, optional
-        CatBoost 参数，如果为 None 则使用默认参数
-    reweighter : Reweighter, optional
-        样本权重器 (e.g., TimeDecayReweighter)
 
     Returns
     -------
@@ -359,57 +337,25 @@ def train_catboost(dataset, valid_cols, cb_params=None, reweighter=None):
     return model, feature_names, importance_df, num_model_features
 
 
-def retrain_with_top_features(dataset, importance_df, args, cb_params=None, reweighter=None):
-    """
-    使用 top-k 特征重新训练
-
-    Parameters
-    ----------
-    dataset : DatasetH
-        数据集
-    importance_df : pd.DataFrame
-        特征重要性 DataFrame
-    args : argparse.Namespace
-        命令行参数
-    cb_params : dict, optional
-        CatBoost 参数，如果为 None 则使用默认参数
-    reweighter : Reweighter, optional
-        样本权重器
-
-    Returns
-    -------
-    tuple
-        (model, top_features, test_pred)
-    """
-    print(f"\n[8] Feature Selection and Retraining...")
-    print(f"    Selecting top {args.top_k} features...")
-
-    top_features = importance_df.head(args.top_k)['feature'].tolist()
-    print(f"    Selected features: {top_features[:10]}{'...' if len(top_features) > 10 else ''}")
-
-    train_data_selected = dataset.prepare("train", col_set="feature")[top_features]
-    valid_data_selected = dataset.prepare("valid", col_set="feature")[top_features]
-    test_data_selected = dataset.prepare("test", col_set="feature")[top_features]
-
-    train_label = dataset.prepare("train", col_set="label")
-    valid_label = dataset.prepare("valid", col_set="label")
+def retrain_predict_catboost(dataset, importance_df, args, cb_params=None, reweighter=None, **kwargs):
+    """使用 top-k 特征重新训练 CatBoost"""
+    top_features, train_data, valid_data, test_data, train_label, valid_label = \
+        prepare_top_k_data(dataset, importance_df, args.top_k)
 
     # Compute sample weights if reweighter provided
     w_train = None
     w_valid = None
     if reweighter is not None:
-        df_train = pd.concat([train_data_selected, train_label], axis=1)
-        df_valid = pd.concat([valid_data_selected, valid_label], axis=1)
+        df_train = pd.concat([train_data, train_label], axis=1)
+        df_valid = pd.concat([valid_data, valid_label], axis=1)
         w_train = reweighter.reweight(df_train).values
         w_valid = reweighter.reweight(df_valid).values
         print(f"    Sample weights: train [{w_train.min():.4f}, {w_train.max():.4f}], "
               f"valid [{w_valid.min():.4f}, {w_valid.max():.4f}]")
 
-    print(f"    ✓ Selected train features shape: {train_data_selected.shape}")
-
     print("\n    Retraining with selected features...")
-    train_pool = Pool(train_data_selected, label=train_label.values.ravel(), weight=w_train)
-    valid_pool = Pool(valid_data_selected, label=valid_label.values.ravel(), weight=w_valid)
+    train_pool = Pool(train_data, label=train_label.values.ravel(), weight=w_train)
+    valid_pool = Pool(valid_data, label=valid_label.values.ravel(), weight=w_valid)
 
     # 使用传入的参数或默认参数
     if cb_params is None:
@@ -426,17 +372,14 @@ def retrain_with_top_features(dataset, importance_df, args, cb_params=None, rewe
         'verbose': False,
     }
 
-    # 只添加非 None 的可选参数
     optional_params = ['bagging_temperature', 'subsample', 'colsample_bylevel']
     for key in optional_params:
         if key in cb_params and cb_params[key] is not None:
             model_kwargs[key] = cb_params[key]
 
-    # subsample 需要非 Bayesian bootstrap type
     if 'subsample' in model_kwargs:
         model_kwargs['bootstrap_type'] = 'MVS'
 
-    # colsample_bylevel (RSM) 在 GPU 上不支持回归模式，强制使用 CPU
     if 'colsample_bylevel' in model_kwargs:
         model_kwargs['task_type'] = 'CPU'
 
@@ -454,44 +397,42 @@ def retrain_with_top_features(dataset, importance_df, args, cb_params=None, rewe
     print("    ✓ Retraining completed")
 
     # 打印重新训练后的特征重要性
-    print("\n    Feature Importance after Retraining:")
-    print("    " + "-" * 50)
     importance_retrained = cb_model.get_feature_importance()
-    importance_retrained_df = pd.DataFrame({
-        'feature': top_features,
-        'importance': importance_retrained
-    }).sort_values('importance', ascending=False)
-
-    for i, row in importance_retrained_df.iterrows():
-        print(f"    {importance_retrained_df.index.get_loc(i)+1:3d}. {row['feature']:<40s} {row['importance']:>10.2f}")
-    print("    " + "-" * 50)
+    print_retrained_importance(top_features, importance_retrained)
 
     # 预测
     print("\n[9] Generating predictions with selected features...")
-    test_pred_values = cb_model.predict(test_data_selected)
-    test_pred = pd.Series(test_pred_values, index=test_data_selected.index, name='score')
+    test_pred_values = cb_model.predict(test_data)
+    test_pred = pd.Series(test_pred_values, index=test_data.index, name='score')
     print_prediction_stats(test_pred)
 
     return cb_model, top_features, test_pred
 
 
-def main_train_impl():
-    # 解析命令行参数
-    parser = create_argument_parser("CatBoost", "run_catboost_nd.py")
+def predict_catboost(model, test_data):
+    """CatBoost 预测"""
+    return model.predict(test_data.values)
 
-    # 添加 CatBoost 特定参数
+
+def add_catboost_arguments(parser):
+    """添加 CatBoost 特定的命令行参数"""
     parser.add_argument('--params-file', type=str, default=None,
                         help='Path to JSON file with CatBoost params (from hyperopt CV search)')
 
-    args = parser.parse_args()
 
-    # 获取配置
-    handler_config = HANDLER_CONFIG[args.handler]
-    symbols = STOCK_POOLS[args.stock_pool]
+def catboost_post_parse_args(args, handler_config, symbols):
+    """
+    CatBoost 特定的参数后处理。
 
-    # 加载 CatBoost 参数
+    如果提供了 --params-file:
+    - 加载参数
+    - 若在 params-file 模式下，运行完整的 native 训练流程并返回 5-tuple 短路
+    否则:
+    - 准备 cb_params 和 reweighter 作为 extra_kwargs
+    """
     cb_params = None
     sample_weight_halflife_from_file = None
+
     if args.params_file:
         print(f"\n[*] Loading CatBoost params from: {args.params_file}")
         cb_params, sample_weight_halflife_from_file = load_params_from_file(args.params_file)
@@ -500,9 +441,7 @@ def main_train_impl():
     if sample_weight_halflife_from_file is not None and args.sample_weight_halflife == 0:
         args.sample_weight_halflife = sample_weight_halflife_from_file
 
-    # =========================================================================
     # --params-file 模式: 使用与 hyperopt CV train_final_model 完全对齐的流程
-    # =========================================================================
     if args.params_file:
         time_splits = FINAL_TEST
 
@@ -538,94 +477,32 @@ def main_train_impl():
 
         return model_path, dataset, test_pred, args, time_splits
 
-    # =========================================================================
-    # 默认模式: 使用 qlib CatBoostModel wrapper + DEFAULT_TIME_SPLITS
-    # =========================================================================
-    time_splits = get_time_splits(args.max_train)
-
-    # 打印头部信息
-    print_training_header("CatBoost", args, symbols, handler_config, time_splits)
-
-    # 初始化和数据准备
-    init_qlib(handler_config['use_talib'])
-    check_data_availability(time_splits)
-    handler = create_data_handler(args, handler_config, symbols, time_splits)
-    dataset = create_dataset(handler, time_splits)
-    train_data, valid_cols, dropped_cols = analyze_features(dataset)
-    analyze_label_distribution(dataset)
-
-    # 创建样本权重器
+    # 默认模式: 准备 extra_kwargs
     reweighter = None
     if args.sample_weight_halflife > 0:
         from utils.reweighter import TimeDecayReweighter
         reweighter = TimeDecayReweighter(half_life_years=args.sample_weight_halflife, min_weight=0.1)
         print(f"\n[*] Sample weighting: exponential decay, half-life = {args.sample_weight_halflife} years, min_weight = 0.1")
 
-    # 训练模型
-    model, feature_names, importance_df, num_model_features = train_catboost(
-        dataset, valid_cols, cb_params, reweighter=reweighter)
-
-    # 保存特征重要性
-    outputs_dir = PROJECT_ROOT / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
-    importance_filename = generate_model_filename("catboost_importance", args, 0, ".csv")
-    importance_path = outputs_dir / importance_filename
-    importance_df.to_csv(importance_path, index=False)
-    print(f"    Feature importance saved to: {importance_path}")
-
-    # 特征选择和重新训练
-    if args.top_k > 0 and args.top_k < len(feature_names):
-        cb_model, top_features, test_pred = retrain_with_top_features(
-            dataset, importance_df, args, cb_params, reweighter=reweighter)
-
-        # 评估
-        print("\n[10] Evaluation with selected features...")
-        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
-
-        # 保存模型
-        print("\n[11] Saving model...")
-        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-        model_filename = generate_model_filename("catboost", args, args.top_k, ".cbm")
-        model_path = MODEL_SAVE_PATH / model_filename
-        meta_data = create_meta_data(args, handler_config, time_splits, top_features, "catboost", args.top_k)
-        save_model_with_meta(cb_model, model_path, meta_data)
-
-        return model_path, dataset, test_pred, args, time_splits
-    else:
-        # 原始模型预测
-        test_data_filtered = prepare_test_data_for_prediction(dataset, num_model_features)
-
-        pred_values = model.model.predict(test_data_filtered.values)
-        test_pred = pd.Series(pred_values, index=test_data_filtered.index, name='score')
-        print_prediction_stats(test_pred)
-
-        # 评估
-        print("\n[9] Evaluation...")
-        evaluate_model(dataset, test_pred, PROJECT_ROOT, args.nday)
-
-        # 保存模型
-        print("\n[10] Saving model...")
-        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-        model_filename = generate_model_filename("catboost", args, 0, ".cbm")
-        model_path = MODEL_SAVE_PATH / model_filename
-        meta_data = create_meta_data(args, handler_config, time_splits, valid_cols, "catboost", 0)
-        save_model_with_meta(model.model, model_path, meta_data)
-
-        return model_path, dataset, test_pred, args, time_splits
+    return {'cb_params': cb_params, 'reweighter': reweighter}
 
 
-def main():
-    result = main_train_impl()
-    if result is not None:
-        model_path, dataset, pred, args, time_splits = result
-        if args.backtest:
-            run_backtest(
-                model_path, dataset, pred, args, time_splits,
-                model_name="CatBoost",
-                load_model_func=load_catboost_model,
-                get_feature_count_func=get_catboost_feature_count
-            )
+adapter = TreeModelAdapter(
+    model_name="CatBoost",
+    model_prefix="catboost",
+    model_extension=".cbm",
+    model_type="catboost",
+    script_name="run_catboost_nd.py",
+    train_model=train_catboost,
+    predict=predict_catboost,
+    retrain_predict=retrain_predict_catboost,
+    load_model=load_catboost_model,
+    get_feature_count=get_catboost_feature_count,
+    unwrap_model=lambda wrapper: wrapper.model,
+    add_arguments=add_catboost_arguments,
+    post_parse_args=catboost_post_parse_args,
+)
 
 
 if __name__ == "__main__":
-    main()
+    tree_main(adapter)
