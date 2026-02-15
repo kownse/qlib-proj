@@ -464,9 +464,11 @@ class MHCVHyperoptObjective:
                 is_best = ""
 
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
+            fold_ep_str = ", ".join([str(r['best_epoch']) for r in fold_results])
             ic_w = model_params.get('ic_loss_weight', 0.0)
             print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
-                  f"[{fold_ic_str}] lr={hyperparams['learning_rate']:.5f} "
+                  f"IC[{fold_ic_str}] ep[{fold_ep_str}] "
+                  f"lr={hyperparams['learning_rate']:.5f} "
                   f"aux={hyperparams['aux_weight']:.3f} ic_w={ic_w:.1f}{is_best}")
 
             return {
