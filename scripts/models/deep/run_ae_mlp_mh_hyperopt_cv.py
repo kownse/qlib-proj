@@ -85,6 +85,7 @@ from models.common.cv_utils import (
     create_dataset_for_fold,
     compute_ic,
 )
+from models.deep.ic_loss_utils import make_mixed_ic_mse_loss, ICEarlyStoppingCallback
 
 
 # ============================================================================
@@ -185,9 +186,13 @@ SEARCH_SPACE = {
 
     # Multi-horizon 辅助权重
     'aux_weight': hp.uniform('aux_weight', 0.05, 0.8),
+
+    # IC loss weight (0.0 = pure MSE baseline)
+    'ic_loss_weight': hp.choice('ic_loss_weight', [0.0, 0.1, 0.2, 0.5, 1.0]),
 }
 
 BATCH_SIZE_CHOICES = [1024, 2048, 4096, 8192]
+IC_LOSS_WEIGHT_CHOICES = [0.0, 0.1, 0.2, 0.5, 1.0]
 
 
 def create_mh_model_params(hyperparams, num_columns, horizons, primary_horizon):
@@ -232,6 +237,7 @@ def create_mh_model_params(hyperparams, num_columns, horizons, primary_horizon):
         'horizons': horizons,
         'primary_horizon': primary_horizon,
         'aux_weight': hyperparams['aux_weight'],
+        'ic_loss_weight': hyperparams.get('ic_loss_weight', 0.0),
     }
 
 
@@ -244,6 +250,7 @@ def build_mh_model(params):
     loss_weights = params['loss_weights']
     head_dim = params['head_dim']
     horizons = params['horizons']
+    ic_loss_weight = params.get('ic_loss_weight', 0.0)
 
     inp = layers.Input(shape=(num_columns,), name='input')
 
@@ -290,9 +297,12 @@ def build_mh_model(params):
 
     model = Model(inputs=inp, outputs=outputs, name='AE_MLP_MultiHorizon')
 
+    # Decoder and ae_action always use MSE (reconstruction tasks)
+    # Action heads use mixed IC+MSE loss when ic_loss_weight > 0
+    action_loss = make_mixed_ic_mse_loss(ic_loss_weight)
     losses = {'decoder': 'mse', 'ae_action': 'mse'}
     for h in horizons:
-        losses[f'action_{h}d'] = 'mse'
+        losses[f'action_{h}d'] = action_loss
 
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr),
@@ -404,18 +414,16 @@ class MHCVHyperoptObjective:
                     train_outputs[key] = fold['y_train_dict'][h]
                     valid_outputs[key] = fold['y_valid_dict'][h]
 
-                # 回调: 监控 primary horizon 的 validation loss
-                primary_loss_name = f'val_action_{self.primary_horizon}d_loss'
-                cb_list = [
-                    callbacks.EarlyStopping(
-                        monitor=primary_loss_name,
-                        patience=self.early_stop,
-                        min_delta=1e-5,
-                        restore_best_weights=True,
-                        verbose=0,
-                        mode='min',
-                    ),
-                ]
+                # 回调: IC-based early stopping on primary horizon
+                ic_cb = ICEarlyStoppingCallback(
+                    X_valid=fold['X_valid'],
+                    y_valid=fold['y_valid_dict'][self.primary_horizon],
+                    valid_index=fold['valid_index'],
+                    primary_output_idx=primary_idx,
+                    patience=self.early_stop,
+                    batch_size=batch_size,
+                    verbose=0,
+                )
 
                 history = model.fit(
                     fold['X_train'],
@@ -423,7 +431,7 @@ class MHCVHyperoptObjective:
                     validation_data=(fold['X_valid'], valid_outputs),
                     epochs=self.n_epochs,
                     batch_size=batch_size,
-                    callbacks=cb_list,
+                    callbacks=[ic_cb],
                     verbose=0,
                 )
 
@@ -436,9 +444,7 @@ class MHCVHyperoptObjective:
                     valid_pred, fold['y_valid_dict'][self.primary_horizon], fold['valid_index']
                 )
 
-                best_epoch = len(history.history['loss']) - self.early_stop
-                if best_epoch < 1:
-                    best_epoch = len(history.history['loss'])
+                best_epoch = ic_cb.best_epoch if ic_cb.best_epoch > 0 else len(history.history['loss'])
 
                 fold_ics.append(mean_ic)
                 fold_results.append({
@@ -458,9 +464,10 @@ class MHCVHyperoptObjective:
                 is_best = ""
 
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
+            ic_w = model_params.get('ic_loss_weight', 0.0)
             print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
                   f"[{fold_ic_str}] lr={hyperparams['learning_rate']:.5f} "
-                  f"aux={hyperparams['aux_weight']:.3f}{is_best}")
+                  f"aux={hyperparams['aux_weight']:.3f} ic_w={ic_w:.1f}{is_best}")
 
             return {
                 'loss': -mean_ic_all,
@@ -522,6 +529,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, horizons, primary_hori
     # 获取最佳结果
     best_params = create_mh_model_params(best, objective.num_columns, horizons, primary_horizon)
     best_params['batch_size'] = BATCH_SIZE_CHOICES[best['batch_size']]
+    best_params['ic_loss_weight'] = IC_LOSS_WEIGHT_CHOICES[best['ic_loss_weight']]
 
     best_trial_idx = np.argmin([t['result']['loss'] for t in trials.trials])
     best_trial = trials.trials[best_trial_idx]['result']
@@ -541,6 +549,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, horizons, primary_hori
     print(f"  dropout: {best_params['dropout_rates'][1]:.4f}")
     print(f"  noise_std: {best_params['dropout_rates'][0]:.4f}")
     print(f"  aux_weight: {best_params['aux_weight']:.4f}")
+    print(f"  ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
     print(f"  loss_weights: {best_params['loss_weights']}")
     print("=" * 70)
 
@@ -556,6 +565,7 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
     print(f"    learning_rate: {best_params['lr']:.6f}")
     print(f"    batch_size: {best_params['batch_size']}")
     print(f"    aux_weight: {best_params['aux_weight']:.4f}")
+    print(f"    ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
 
     # 创建最终数据集
     handler = create_mh_data_handler_for_fold(
@@ -564,7 +574,7 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
     X_train, y_train_dict, _ = prepare_mh_data_from_dataset(dataset, "train", horizons)
-    X_valid, y_valid_dict, _ = prepare_mh_data_from_dataset(dataset, "valid", horizons)
+    X_valid, y_valid_dict, valid_index = prepare_mh_data_from_dataset(dataset, "valid", horizons)
     X_test, _, test_index = prepare_mh_data_from_dataset(dataset, "test", horizons)
 
     print(f"\n    Final training data:")
@@ -577,19 +587,21 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
     tf.keras.backend.clear_session()
     model = build_mh_model(best_params)
 
-    # 回调
-    primary_loss_name = f'val_action_{primary_horizon}d_loss'
+    # 回调: IC-based early stopping + LR reduction
+    primary_idx = 2 + horizons.index(primary_horizon)
+    ic_cb = ICEarlyStoppingCallback(
+        X_valid=X_valid,
+        y_valid=y_valid_dict[primary_horizon],
+        valid_index=valid_index,
+        primary_output_idx=primary_idx,
+        patience=args.early_stop,
+        batch_size=best_params['batch_size'],
+        verbose=1,
+    )
     cb_list = [
-        callbacks.EarlyStopping(
-            monitor=primary_loss_name,
-            patience=args.early_stop,
-            min_delta=1e-5,
-            restore_best_weights=True,
-            verbose=1,
-            mode='min',
-        ),
+        ic_cb,
         callbacks.ReduceLROnPlateau(
-            monitor=primary_loss_name,
+            monitor='val_loss',
             factor=0.5,
             patience=5,
             min_lr=1e-6,
@@ -623,16 +635,18 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
         verbose=1,
     )
 
-    # 验证集 IC (primary horizon)
-    primary_idx = 2 + horizons.index(primary_horizon)
+    # 验证集 IC (from IC callback's best)
+    print(f"\n    [Validation Set - for reference]")
+    print(f"    Valid IC ({primary_horizon}d):   {ic_cb.best_ic:.4f} (from IC early stopping)")
+    print(f"    Best epoch: {ic_cb.best_epoch}")
+
+    # Also compute IC on final model for confirmation
     valid_preds = model.predict(X_valid, batch_size=best_params['batch_size'], verbose=0)
     valid_pred = valid_preds[primary_idx].flatten()
-    valid_ic, valid_ic_std, valid_icir = compute_ic(
-        valid_pred, y_valid_dict[primary_horizon],
-        dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L).index
+    valid_ic, _, valid_icir = compute_ic(
+        valid_pred, y_valid_dict[primary_horizon], valid_index
     )
-    print(f"\n    [Validation Set - for reference]")
-    print(f"    Valid IC ({primary_horizon}d):   {valid_ic:.4f}")
+    print(f"    Valid IC ({primary_horizon}d):   {valid_ic:.4f} (final model)")
     print(f"    Valid ICIR ({primary_horizon}d): {valid_icir:.4f}")
 
     # 测试集预测 (所有 horizons)
@@ -791,6 +805,7 @@ def main():
             'lr': best_params['lr'],
             'batch_size': best_params['batch_size'],
             'aux_weight': best_params['aux_weight'],
+            'ic_loss_weight': best_params.get('ic_loss_weight', 0.0),
             'loss_weights': {k: float(v) for k, v in best_params['loss_weights'].items()},
         },
         'cv_results': {
@@ -815,6 +830,7 @@ def main():
                 'lr': t['result']['params']['lr'],
                 'batch_size': t['result']['params']['batch_size'],
                 'aux_weight': t['result']['params']['aux_weight'],
+                'ic_loss_weight': t['result']['params'].get('ic_loss_weight', 0.0),
             })
 
     history_df = pd.DataFrame(history)

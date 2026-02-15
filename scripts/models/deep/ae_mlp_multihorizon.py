@@ -30,6 +30,11 @@ from tensorflow.keras import layers, callbacks, Model
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
+try:
+    from models.deep.ic_loss_utils import make_mixed_ic_mse_loss, ICEarlyStoppingCallback
+except ImportError:
+    from ic_loss_utils import make_mixed_ic_mse_loss, ICEarlyStoppingCallback
+
 
 class AEMLPMultiHorizon:
     """
@@ -56,6 +61,7 @@ class AEMLPMultiHorizon:
         GPU: int = 0,
         seed: int = 42,
         verbose: int = 1,
+        ic_loss_weight: float = 0.0,
     ):
         """
         Args:
@@ -73,6 +79,7 @@ class AEMLPMultiHorizon:
             GPU: GPU 设备 ID（-1 表示 CPU）
             seed: 随机种子
             verbose: 日志级别
+            ic_loss_weight: weight for IC loss component in action heads (0=pure MSE)
         """
         self.num_columns = num_columns
         self.horizons = horizons or [2, 5, 10]
@@ -87,6 +94,7 @@ class AEMLPMultiHorizon:
         self.GPU = GPU
         self.seed = seed
         self.verbose = verbose
+        self.ic_loss_weight = ic_loss_weight
 
         # 构建 loss_weights
         if loss_weights is not None:
@@ -191,7 +199,8 @@ class AEMLPMultiHorizon:
         # 构建模型
         model = Model(inputs=inp, outputs=outputs, name='AE_MLP_MultiHorizon')
 
-        # 编译
+        # 编译: decoder/ae_action use MSE, action heads use mixed IC+MSE
+        action_loss = make_mixed_ic_mse_loss(self.ic_loss_weight)
         losses = {
             'decoder': 'mse',
             'ae_action': 'mse',
@@ -202,7 +211,7 @@ class AEMLPMultiHorizon:
         }
         for h in self.horizons:
             head_name = f'action_{h}d'
-            losses[head_name] = 'mse'
+            losses[head_name] = action_loss
             metrics_dict[head_name] = keras.metrics.MeanAbsoluteError(name='MAE')
 
         model.compile(
@@ -286,18 +295,22 @@ class AEMLPMultiHorizon:
         if self.verbose > 1:
             self.model.summary(print_fn=lambda x: print(f"    {x}"))
 
-        # 回调函数: 监控主目标的 validation loss
-        primary_loss_name = f'val_action_{self.primary_horizon}d_loss'
+        # 回调函数: IC-based early stopping on primary horizon
+        primary_idx = 2 + self.horizons.index(self.primary_horizon)
+        valid_index = dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L).index
+        ic_cb = ICEarlyStoppingCallback(
+            X_valid=X_valid,
+            y_valid=y_valid_dict[self.primary_horizon],
+            valid_index=valid_index,
+            primary_output_idx=primary_idx,
+            patience=self.early_stop,
+            batch_size=self.batch_size,
+            verbose=self.verbose,
+        )
         cb_list = [
-            callbacks.EarlyStopping(
-                monitor=primary_loss_name,
-                patience=self.early_stop,
-                restore_best_weights=True,
-                verbose=self.verbose,
-                mode='min',
-            ),
+            ic_cb,
             callbacks.ReduceLROnPlateau(
-                monitor=primary_loss_name,
+                monitor='val_loss',
                 factor=0.5,
                 patience=5,
                 min_lr=1e-6,
