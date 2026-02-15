@@ -64,20 +64,19 @@ from models.common import (
     FINAL_TEST,
 )
 
-# Import ensemble utilities from V1
-from models.ensemble.run_ae_cb_ensemble import (
+from models.common.ensemble import (
     load_ae_mlp_model,
-    load_catboost_model,
-    create_data_handler,
-    create_dataset,
+    create_ensemble_data_handler,
+    create_ensemble_dataset,
     predict_with_ae_mlp,
     predict_with_catboost,
     calculate_pairwise_correlations,
-    learn_optimal_weights_multi,
-    ensemble_predictions_multi,
+    learn_optimal_weights,
+    ensemble_predictions,
     compute_ic,
     run_ensemble_backtest,
 )
+from models.common.training import load_catboost_model
 
 
 # ============================================================================
@@ -274,8 +273,8 @@ def main():
     datasets = {}
     for name, config in active_models.items():
         print(f"    Creating {config['handler']} dataset for {name}...")
-        handler = create_data_handler(config['handler'], symbols, time_splits, args.nday, include_valid)
-        datasets[name] = create_dataset(handler, time_splits, include_valid)
+        handler = create_ensemble_data_handler(config['handler'], symbols, time_splits, args.nday, include_valid)
+        datasets[name] = create_ensemble_dataset(handler, time_splits, include_valid)
 
     # Load models
     print("\n[4] Loading models...")
@@ -340,7 +339,7 @@ def main():
             val_label = val_label.iloc[:, 0]
 
         # Learn weights
-        weights, learn_info = learn_optimal_weights_multi(
+        weights, learn_info = learn_optimal_weights(
             val_preds, val_label,
             method=args.weight_method,
             min_weight=args.min_weight,
@@ -364,7 +363,7 @@ def main():
 
     # Ensemble predictions
     print(f"\n[8] Ensembling predictions ({args.ensemble_method})...")
-    pred_ensemble = ensemble_predictions_multi(preds, args.ensemble_method, weights)
+    pred_ensemble = ensemble_predictions(preds, args.ensemble_method, weights)
     print(f"    Ensemble shape: {len(pred_ensemble)}, Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
     # Get labels from raw-return handler for evaluation

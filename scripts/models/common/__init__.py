@@ -63,3 +63,18 @@ from .cv_utils import (
     first_pass_feature_selection_generic,
     train_final_model_generic,
 )
+
+from .ensemble import (
+    zscore_by_day,
+    load_ae_mlp_model,
+    load_model_meta,
+    create_ensemble_data_handler,
+    create_ensemble_dataset,
+    predict_with_ae_mlp,
+    predict_with_catboost,
+    compute_ic as compute_ensemble_ic,
+    calculate_pairwise_correlations,
+    ensemble_predictions,
+    learn_optimal_weights,
+    run_ensemble_backtest,
+)

@@ -37,19 +37,14 @@ script_dir = Path(__file__).parent.parent.parent  # scripts directory
 sys.path.insert(0, str(script_dir))
 
 import argparse
-import pickle
 import numpy as np
 import pandas as pd
-from catboost import CatBoostRegressor
 
 import qlib
 from qlib.constant import REG_US
-from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 from utils.talib_ops import TALIB_OPS
-from utils.strategy import get_strategy_config
-from utils.backtest_utils import plot_backtest_curve, generate_trade_records
 from utils.ai_filter import apply_ai_affinity_filter
 from data.stock_pools import STOCK_POOLS
 
@@ -60,93 +55,24 @@ from models.common import (
     CV_FOLDS,
     FINAL_TEST,
 )
-from models.deep.ae_mlp_model import AEMLP
+from models.common.ensemble import (
+    load_ae_mlp_model,
+    load_model_meta,
+    create_ensemble_data_handler,
+    create_ensemble_dataset,
+    predict_with_ae_mlp,
+    predict_with_catboost,
+    zscore_by_day,
+    calculate_pairwise_correlations,
+    compute_ic,
+    ensemble_predictions,
+    learn_optimal_weights,
+    run_ensemble_backtest,
+)
+from models.common.training import load_catboost_model
 
 
-# ── Model loading ──────────────────────────────────────────────────────
-
-def load_ae_mlp_model(model_path: Path):
-    """Load AE-MLP (.keras) model"""
-    print(f"    Loading AE-MLP model from: {model_path}")
-    model = AEMLP.load(str(model_path))
-    return model
-
-
-def load_catboost_model(model_path: Path):
-    """Load CatBoost (.cbm) model"""
-    print(f"    Loading CatBoost model from: {model_path}")
-    model = CatBoostRegressor()
-    model.load_model(str(model_path))
-    return model
-
-
-def load_model_meta(model_path: Path) -> dict:
-    """Load model metadata"""
-    meta_path = model_path.with_suffix('.meta.pkl')
-    if meta_path.exists():
-        with open(meta_path, 'rb') as f:
-            return pickle.load(f)
-
-    stem = model_path.stem
-    if stem.endswith('_best'):
-        alt_meta_path = model_path.parent / (stem[:-5] + '.meta.pkl')
-        if alt_meta_path.exists():
-            with open(alt_meta_path, 'rb') as f:
-                return pickle.load(f)
-
-    return {}
-
-
-# ── Data handling ──────────────────────────────────────────────────────
-
-def create_data_handler(handler_name: str, symbols: list, time_splits: dict, nday: int):
-    """Create DataHandler for a specific handler type"""
-    from models.common.handlers import get_handler_class
-
-    HandlerClass = get_handler_class(handler_name)
-
-    handler = HandlerClass(
-        volatility_window=nday,
-        instruments=symbols,
-        start_time=time_splits['train_start'],
-        end_time=time_splits['test_end'],
-        fit_start_time=time_splits['train_start'],
-        fit_end_time=time_splits['train_end'],
-        infer_processors=[],
-    )
-
-    return handler
-
-
-def create_dataset(handler, time_splits: dict) -> DatasetH:
-    """Create Qlib DatasetH"""
-    return DatasetH(
-        handler=handler,
-        segments={
-            "train": (time_splits['train_start'], time_splits['train_end']),
-            "valid": (time_splits['valid_start'], time_splits['valid_end']),
-            "test": (time_splits['test_start'], time_splits['test_end']),
-        }
-    )
-
-
-# ── Prediction ─────────────────────────────────────────────────────────
-
-def predict_with_ae_mlp(model: AEMLP, dataset: DatasetH, segment: str = "test") -> pd.Series:
-    """Generate predictions with AE-MLP model"""
-    pred = model.predict(dataset, segment=segment)
-    pred.name = 'score'
-    return pred
-
-
-def predict_with_catboost(model: CatBoostRegressor, dataset: DatasetH, segment: str = "test") -> pd.Series:
-    """Generate predictions with CatBoost model"""
-    data = dataset.prepare(segment, col_set="feature", data_key=DataHandlerLP.DK_L)
-    data = data.fillna(0).replace([np.inf, -np.inf], 0)
-    pred_values = model.predict(data.values)
-    pred = pd.Series(pred_values, index=data.index, name='score')
-    return pred
-
+# ── V4-specific helpers (not in common module) ────────────────────────
 
 def align_features_for_catboost(X, model):
     """Align data features to match CatBoost model's expected feature names"""
@@ -174,240 +100,6 @@ def predict_catboost_raw(model, dataset, segment):
     data = align_features_for_catboost(data, model)
     pred_values = model.predict(data)
     return pd.Series(pred_values, index=data.index, name='score')
-
-
-# ── Correlation ────────────────────────────────────────────────────────
-
-def calculate_correlation(pred_dict: dict) -> pd.DataFrame:
-    """Calculate pairwise correlation between all model predictions.
-
-    Parameters
-    ----------
-    pred_dict : dict
-        {model_name: pd.Series}
-
-    Returns
-    -------
-    pd.DataFrame
-        Correlation matrix
-    """
-    names = list(pred_dict.keys())
-    # Find common index across all models
-    common_idx = pred_dict[names[0]].index
-    for name in names[1:]:
-        common_idx = common_idx.intersection(pred_dict[name].index)
-
-    df = pd.DataFrame({name: pred_dict[name].loc[common_idx] for name in names})
-
-    # Overall correlation
-    overall_corr = df.corr()
-
-    # Daily correlation mean
-    daily_corrs = {}
-    for i, n1 in enumerate(names):
-        for j, n2 in enumerate(names):
-            if j <= i:
-                continue
-            pair_key = f"{n1} vs {n2}"
-            dc = df.groupby(level='datetime').apply(
-                lambda x: x[n1].corr(x[n2]) if len(x) > 1 else np.nan
-            ).dropna()
-            daily_corrs[pair_key] = (dc.mean(), dc.std())
-
-    return overall_corr, daily_corrs
-
-
-# ── Ensemble ───────────────────────────────────────────────────────────
-
-def zscore_by_day(x):
-    mean = x.groupby(level='datetime').transform('mean')
-    std = x.groupby(level='datetime').transform('std')
-    return (x - mean) / (std + 1e-8)
-
-
-def ensemble_predictions_multi(pred_dict: dict, method: str = 'zscore_mean',
-                                weights: dict = None) -> pd.Series:
-    """
-    Ensemble multiple model predictions.
-
-    Parameters
-    ----------
-    pred_dict : dict
-        {model_name: pd.Series}
-    method : str
-        'mean', 'weighted', 'rank_mean', 'zscore_mean', 'zscore_weighted'
-    weights : dict, optional
-        {model_name: weight} for weighted methods
-
-    Returns
-    -------
-    pd.Series
-        Ensembled predictions
-    """
-    names = list(pred_dict.keys())
-
-    # Find common index
-    common_idx = pred_dict[names[0]].index
-    for name in names[1:]:
-        common_idx = common_idx.intersection(pred_dict[name].index)
-
-    preds = {name: pred_dict[name].loc[common_idx] for name in names}
-
-    if method == 'mean':
-        ensemble_pred = sum(preds.values()) / len(preds)
-    elif method == 'weighted':
-        if weights is None:
-            weights = {n: 1.0 / len(names) for n in names}
-        total = sum(weights.values())
-        ensemble_pred = sum(preds[n] * weights[n] for n in names) / total
-    elif method == 'rank_mean':
-        ranks = {n: preds[n].groupby(level='datetime').rank(pct=True) for n in names}
-        ensemble_pred = sum(ranks.values()) / len(ranks)
-    elif method == 'zscore_mean':
-        zscores = {n: zscore_by_day(preds[n]) for n in names}
-        ensemble_pred = sum(zscores.values()) / len(zscores)
-    elif method == 'zscore_weighted':
-        if weights is None:
-            weights = {n: 1.0 / len(names) for n in names}
-        total = sum(weights.values())
-        zscores = {n: zscore_by_day(preds[n]) for n in names}
-        ensemble_pred = sum(zscores[n] * weights[n] for n in names) / total
-    else:
-        raise ValueError(f"Unknown ensemble method: {method}")
-
-    ensemble_pred.name = 'score'
-    return ensemble_pred
-
-
-# ── IC ─────────────────────────────────────────────────────────────────
-
-def compute_ic(pred: pd.Series, label: pd.Series) -> tuple:
-    """Calculate IC (Information Coefficient)"""
-    common_idx = pred.index.intersection(label.index)
-    pred_aligned = pred.loc[common_idx]
-    label_aligned = label.loc[common_idx]
-
-    valid_idx = ~(pred_aligned.isna() | label_aligned.isna())
-    pred_clean = pred_aligned[valid_idx]
-    label_clean = label_aligned[valid_idx]
-
-    df = pd.DataFrame({'pred': pred_clean, 'label': label_clean})
-    ic_by_date = df.groupby(level='datetime').apply(
-        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
-    )
-    ic_by_date = ic_by_date.dropna()
-
-    if len(ic_by_date) == 0:
-        return 0.0, 0.0, 0.0, pd.Series()
-
-    mean_ic = ic_by_date.mean()
-    ic_std = ic_by_date.std()
-    icir = mean_ic / ic_std if ic_std > 0 else 0
-
-    return mean_ic, ic_std, icir, ic_by_date
-
-
-# ── Stacking (weight learning) ────────────────────────────────────────
-
-def learn_optimal_weights_multi(pred_dict: dict, label: pd.Series,
-                                 method: str = 'grid_search',
-                                 min_weight: float = 0.05,
-                                 diversity_bonus: float = 0.1) -> tuple:
-    """
-    Learn optimal ensemble weights for N models using validation data.
-
-    Parameters
-    ----------
-    pred_dict : dict
-        {model_name: pd.Series} predictions on validation set
-    label : pd.Series
-        True labels on validation set
-    method : str
-        'grid_search' or 'grid_search_icir'
-    min_weight : float
-        Minimum weight for each model
-    diversity_bonus : float
-        Bonus for balanced weights
-
-    Returns
-    -------
-    tuple
-        (weights_dict, info_dict)
-    """
-    names = list(pred_dict.keys())
-    n_models = len(names)
-
-    # Align all series
-    common_idx = label.index
-    for name in names:
-        common_idx = common_idx.intersection(pred_dict[name].index)
-
-    preds = {n: pred_dict[n].loc[common_idx] for n in names}
-    y = label.loc[common_idx]
-
-    # Remove NaN
-    valid_mask = ~y.isna()
-    for n in names:
-        valid_mask &= ~preds[n].isna()
-
-    preds = {n: preds[n][valid_mask] for n in names}
-    y = y[valid_mask]
-
-    # Z-score normalize
-    z_preds = {n: zscore_by_day(preds[n]) for n in names}
-
-    if method in ('grid_search', 'grid_search_icir'):
-        # Grid search over weight space for 3 models
-        # w1 + w2 + w3 = 1, each >= min_weight
-        step = 0.05
-        best_score = -np.inf
-        best_weights = {n: 1.0 / n_models for n in names}
-        best_ic = 0
-
-        # Generate weight grid for 3 models
-        weight_grid = []
-        for w1 in np.arange(min_weight, 1.0 - (n_models - 1) * min_weight + 0.001, step):
-            for w2 in np.arange(min_weight, 1.0 - w1 - (n_models - 2) * min_weight + 0.001, step):
-                w3 = 1.0 - w1 - w2
-                if w3 >= min_weight - 0.001:
-                    weight_grid.append((w1, w2, w3))
-
-        for ws in weight_grid:
-            w_dict = {names[i]: ws[i] for i in range(n_models)}
-            ensemble = sum(z_preds[n] * w_dict[n] for n in names)
-
-            df = pd.DataFrame({'pred': ensemble, 'label': y})
-            ic_by_date = df.groupby(level='datetime').apply(
-                lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
-            )
-            ic_series = ic_by_date.dropna()
-            mean_ic = ic_series.mean()
-
-            if method == 'grid_search':
-                # Diversity: how balanced are the weights (max when all equal)
-                diversity = 1 - np.std(list(ws)) * np.sqrt(n_models)
-                score = mean_ic + diversity_bonus * diversity
-            else:  # grid_search_icir
-                ic_std = ic_series.std()
-                score = mean_ic / ic_std if ic_std > 0 else 0
-
-            if score > best_score:
-                best_score = score
-                best_weights = w_dict
-                best_ic = mean_ic
-
-        info = {
-            'method': method,
-            'best_ic': best_ic,
-            'grid_size': len(weight_grid),
-        }
-        if method == 'grid_search':
-            info['diversity_bonus'] = diversity_bonus
-
-        return best_weights, info
-
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'grid_search' or 'grid_search_icir'.")
 
 
 # ── CV evaluation ─────────────────────────────────────────────────────
@@ -454,8 +146,9 @@ def run_cv_evaluation(models: dict, handlers: dict, args, symbols):
     # Create test datasets for each handler
     test_datasets = {}
     for key in model_names:
-        h = create_data_handler(handlers[key], symbols, test_time, args.nday)
-        test_datasets[key] = create_dataset(h, test_time)
+        h = create_ensemble_data_handler(handlers[key], symbols, test_time, args.nday,
+                                         include_valid=True)
+        test_datasets[key] = create_ensemble_dataset(h, test_time, include_valid=True)
 
     # Test predictions
     test_preds = {}
@@ -469,7 +162,7 @@ def run_cv_evaluation(models: dict, handlers: dict, args, symbols):
     if args.ensemble_method in ['weighted', 'zscore_weighted']:
         weights = {n: getattr(args, f'{n}_weight') for n in model_names}
 
-    test_pred_ens = ensemble_predictions_multi(test_preds, args.ensemble_method, weights)
+    test_pred_ens = ensemble_predictions(test_preds, args.ensemble_method, weights)
 
     # Labels from first AE-MLP dataset
     test_label_df = test_datasets['ae'].prepare("test", col_set="label", data_key=DataHandlerLP.DK_L)
@@ -501,8 +194,9 @@ def run_cv_evaluation(models: dict, handlers: dict, args, symbols):
         # Create fold datasets
         fold_datasets = {}
         for key in model_names:
-            h = create_data_handler(handlers[key], symbols, fold_time, args.nday)
-            fold_datasets[key] = create_dataset(h, fold_time)
+            h = create_ensemble_data_handler(handlers[key], symbols, fold_time, args.nday,
+                                             include_valid=True)
+            fold_datasets[key] = create_ensemble_dataset(h, fold_time, include_valid=True)
 
         # Validation predictions
         val_preds = {}
@@ -512,7 +206,7 @@ def run_cv_evaluation(models: dict, handlers: dict, args, symbols):
             else:
                 val_preds[key] = predict_with_ae_mlp(models[key], fold_datasets[key], segment="valid")
 
-        val_pred_ens = ensemble_predictions_multi(val_preds, args.ensemble_method, weights)
+        val_pred_ens = ensemble_predictions(val_preds, args.ensemble_method, weights)
 
         # Labels
         val_label_df = fold_datasets['ae'].prepare("valid", col_set="label", data_key=DataHandlerLP.DK_L)
@@ -556,274 +250,6 @@ def run_cv_evaluation(models: dict, handlers: dict, args, symbols):
     print("=" * 80)
 
     return fold_results
-
-
-# ── Backtest ──────────────────────────────────────────────────────────
-
-def run_ensemble_backtest(pred: pd.Series, args, time_splits: dict):
-    """Run backtest with ensembled predictions"""
-    from qlib.backtest import backtest as qlib_backtest
-    from qlib.contrib.evaluate import risk_analysis
-
-    strategy_label = args.strategy.upper() if args.strategy in ('mvo', 'rp', 'gmv', 'inv') else args.strategy
-    print("\n" + "=" * 70)
-    print(f"BACKTEST with {strategy_label} Strategy (3-Model Ensemble V4)")
-    print("=" * 70)
-
-    pred_df = pred.to_frame("score")
-
-    print(f"\n[BT-1] Configuring backtest...")
-    print(f"    Strategy: {args.strategy}")
-    print(f"    Topk: {args.topk}")
-    if args.strategy not in ('mvo', 'rp', 'gmv', 'inv'):
-        print(f"    N_drop: {args.n_drop}")
-    print(f"    Account: ${args.account:,.0f}")
-    print(f"    Rebalance Freq: every {args.rebalance_freq} day(s)")
-    print(f"    Period: {time_splits['test_start']} to {time_splits['test_end']}")
-
-    # Portfolio optimization params
-    optimizer_params = None
-    if args.strategy in ("mvo", "rp", "gmv", "inv"):
-        optimizer_params = {
-            "lamb": args.opt_lamb,
-            "delta": args.opt_delta,
-            "alpha": args.opt_alpha,
-            "cov_lookback": args.cov_lookback,
-            "max_weight": args.max_weight,
-        }
-        print(f"    Portfolio Optimization:")
-        if args.strategy == "mvo":
-            print(f"      Risk aversion (lamb): {args.opt_lamb}")
-        print(f"      Turnover limit (delta): {args.opt_delta:.0%}")
-        print(f"      L2 regularization (alpha): {args.opt_alpha}")
-        print(f"      Covariance lookback: {args.cov_lookback} days")
-        if args.max_weight > 0:
-            print(f"      Max weight per stock: {args.max_weight:.0%}")
-        else:
-            print(f"      Max weight per stock: unlimited")
-
-    dynamic_risk_params = None
-    if args.strategy == "vol_stoploss":
-        dynamic_risk_params = {
-            "lookback": args.risk_lookback,
-            "vol_threshold_high": args.vol_high,
-            "vol_threshold_medium": args.vol_medium,
-            "stop_loss_threshold": args.stop_loss,
-            "no_sell_after_drop": args.no_sell_after_drop,
-            "risk_degree_high": args.risk_high,
-            "risk_degree_medium": args.risk_medium,
-            "risk_degree_normal": args.risk_normal,
-            "market_proxy": args.market_proxy,
-        }
-    elif args.strategy == "dynamic_risk":
-        dynamic_risk_params = {
-            "lookback": args.risk_lookback,
-            "drawdown_threshold": args.drawdown_threshold,
-            "momentum_threshold": args.momentum_threshold,
-            "risk_degree_high": args.risk_high,
-            "risk_degree_medium": args.risk_medium,
-            "risk_degree_normal": args.risk_normal,
-            "market_proxy": args.market_proxy,
-        }
-
-    strategy_config = get_strategy_config(
-        pred_df, args.topk, args.n_drop, args.rebalance_freq,
-        strategy_type=args.strategy,
-        dynamic_risk_params=dynamic_risk_params,
-        optimizer_params=optimizer_params,
-    )
-
-    executor_config = {
-        "class": "SimulatorExecutor",
-        "module_path": "qlib.backtest.executor",
-        "kwargs": {
-            "time_per_step": "day",
-            "generate_portfolio_metrics": True,
-        },
-    }
-
-    pool_symbols = STOCK_POOLS[args.stock_pool]
-
-    backtest_config = {
-        "start_time": time_splits['test_start'],
-        "end_time": time_splits['test_end'],
-        "account": args.account,
-        "benchmark": "SPY",
-        "exchange_kwargs": {
-            "freq": "day",
-            "limit_threshold": None,
-            "deal_price": "close",
-            "open_cost": 0.0005,
-            "close_cost": 0.0005,
-            "min_cost": 1,
-            "trade_unit": None,
-            "codes": pool_symbols,
-        },
-    }
-
-    print(f"\n[BT-2] Running backtest...")
-    try:
-        portfolio_metric_dict, indicator_dict = qlib_backtest(
-            executor=executor_config,
-            strategy=strategy_config,
-            **backtest_config
-        )
-
-        print("    Backtest completed")
-
-        print(f"\n[BT-3] Analyzing results...")
-
-        for freq, (report_df, positions) in portfolio_metric_dict.items():
-            _analyze_backtest_results(report_df, positions, freq, args, time_splits)
-
-        for freq, (indicator_df, indicator_obj) in indicator_dict.items():
-            if indicator_df is not None and not indicator_df.empty:
-                print(f"\n    Trading Indicators ({freq}):")
-                print(f"    " + "-" * 50)
-                print(indicator_df.head(20).to_string(index=True))
-                if len(indicator_df) > 20:
-                    print(f"    ... ({len(indicator_df)} rows total)")
-
-        return portfolio_metric_dict
-
-    except Exception as e:
-        print(f"\n    Backtest failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def _analyze_backtest_results(report_df: pd.DataFrame, positions, freq: str,
-                              args, time_splits: dict):
-    """Analyze and report backtest results"""
-    from qlib.contrib.evaluate import risk_analysis
-
-    print(f"\n    Frequency: {freq}")
-    print(f"    Report shape: {report_df.shape}")
-    print(f"    Date range: {report_df.index.min()} to {report_df.index.max()}")
-
-    total_return = (report_df["return"] + 1).prod() - 1
-
-    has_bench = "bench" in report_df.columns and not report_df["bench"].isna().all()
-    if has_bench:
-        bench_return = (report_df["bench"] + 1).prod() - 1
-        excess_return = total_return - bench_return
-        excess_return_series = report_df["return"] - report_df["bench"]
-        analysis = risk_analysis(excess_return_series, freq=freq)
-    else:
-        bench_return = None
-        excess_return = None
-        analysis = risk_analysis(report_df["return"], freq=freq)
-
-    print(f"\n    Performance Summary:")
-    print(f"    " + "-" * 50)
-    print(f"    Total Return:      {total_return:>10.2%}")
-    if has_bench:
-        print(f"    Benchmark Return:  {bench_return:>10.2%}")
-        print(f"    Excess Return:     {excess_return:>10.2%}")
-    else:
-        print(f"    Benchmark Return:  N/A (no benchmark)")
-    print(f"    " + "-" * 50)
-
-    if analysis is not None and not analysis.empty:
-        analysis_title = "Risk Analysis (Excess Return)" if has_bench else "Risk Analysis (Strategy Return)"
-        print(f"\n    {analysis_title}:")
-        print(f"    " + "-" * 50)
-        for metric, value in analysis.items():
-            if isinstance(value, (int, float)):
-                print(f"    {metric:<25s}: {value:>10.4f}")
-        print(f"    " + "-" * 50)
-
-    print(f"\n    Daily Returns Statistics:")
-    print(f"    " + "-" * 50)
-    print(f"    Mean Daily Return:   {report_df['return'].mean():>10.4%}")
-    print(f"    Std Daily Return:    {report_df['return'].std():>10.4%}")
-    print(f"    Max Daily Return:    {report_df['return'].max():>10.4%}")
-    print(f"    Min Daily Return:    {report_df['return'].min():>10.4%}")
-    print(f"    Total Trading Days:  {len(report_df):>10d}")
-    print(f"    " + "-" * 50)
-
-    # Position concentration analysis
-    print(f"\n    Position Concentration Analysis:")
-    print(f"    " + "-" * 50)
-    if positions is not None:
-        try:
-            # Sample positions at regular intervals
-            pos_dates = sorted(positions.keys()) if isinstance(positions, dict) else []
-            if not pos_dates:
-                # positions might be a list or other structure
-                pos_dates = []
-
-            if pos_dates:
-                daily_top1 = []
-                daily_top3 = []
-                daily_top5 = []
-                daily_n_stocks = []
-                stock_freq = {}
-
-                for date in pos_dates:
-                    pos = positions[date]
-                    if hasattr(pos, 'get_stock_weight_dict'):
-                        weights = pos.get_stock_weight_dict(only_stock=True)
-                    elif isinstance(pos, dict):
-                        weights = {k: v for k, v in pos.items() if k != 'cash'}
-                    else:
-                        continue
-
-                    if not weights:
-                        continue
-
-                    sorted_w = sorted(weights.values(), reverse=True)
-                    total_w = sum(sorted_w)
-                    if total_w <= 0:
-                        continue
-
-                    sorted_w = [w / total_w for w in sorted_w]
-                    daily_top1.append(sorted_w[0])
-                    daily_top3.append(sum(sorted_w[:3]))
-                    daily_top5.append(sum(sorted_w[:5]))
-                    daily_n_stocks.append(len([w for w in sorted_w if w > 0.01]))
-
-                    for stock in weights:
-                        stock_freq[stock] = stock_freq.get(stock, 0) + 1
-
-                if daily_top1:
-                    import numpy as _np
-                    print(f"    Avg stocks held (>1% weight): {_np.mean(daily_n_stocks):.1f}")
-                    print(f"    Top-1 stock weight:  {_np.mean(daily_top1):>8.1%} (max {_np.max(daily_top1):.1%})")
-                    print(f"    Top-3 stocks weight: {_np.mean(daily_top3):>8.1%} (max {_np.max(daily_top3):.1%})")
-                    print(f"    Top-5 stocks weight: {_np.mean(daily_top5):>8.1%} (max {_np.max(daily_top5):.1%})")
-                    print(f"    Unique stocks traded: {len(stock_freq)}")
-
-                    # HHI (Herfindahl index) - measure of concentration
-                    # HHI = 1/N means equal weight, HHI = 1 means single stock
-                    # Not computed here for simplicity
-
-                    # Most frequently held stocks
-                    top_held = sorted(stock_freq.items(), key=lambda x: -x[1])[:5]
-                    print(f"    Most frequently held:")
-                    for stock, days in top_held:
-                        print(f"      {stock}: {days}/{len(pos_dates)} days ({days/len(pos_dates):.0%})")
-                else:
-                    print(f"    Unable to extract position weights")
-            else:
-                print(f"    Position data format not supported for analysis")
-        except Exception as e:
-            print(f"    Position analysis failed: {e}")
-    print(f"    " + "-" * 50)
-
-    output_path = PROJECT_ROOT / "outputs" / f"ensemble_v4_backtest_report_{freq}.csv"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    report_df.to_csv(output_path)
-    print(f"\n    Report saved to: {output_path}")
-
-    print(f"\n[BT-4] Generating performance chart...")
-    if not hasattr(args, 'handler'):
-        args.handler = "ensemble_v4"
-    plot_backtest_curve(report_df, args, freq, PROJECT_ROOT, model_name="Ensemble_V4")
-
-    print(f"\n[BT-5] Generating trade records...")
-    generate_trade_records(positions, args, freq, PROJECT_ROOT, model_name="ensemble_v4")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -1031,8 +457,9 @@ def main():
     handlers_dict = {}
     for key, cfg in MODEL_CONFIG.items():
         print(f"    Creating {cfg['handler']} dataset for {cfg['display']}...")
-        h = create_data_handler(cfg['handler'], symbols, time_splits, args.nday)
-        datasets[key] = create_dataset(h, time_splits)
+        h = create_ensemble_data_handler(cfg['handler'], symbols, time_splits, args.nday,
+                                         include_valid=True)
+        datasets[key] = create_ensemble_dataset(h, time_splits, include_valid=True)
         handlers_dict[key] = cfg['handler']
 
     # [5] Load models
@@ -1083,10 +510,28 @@ def main():
 
     # [8] Correlation
     print("\n[8] Calculating pairwise correlations...")
-    overall_corr, daily_corrs = calculate_correlation(pred_dict)
+    overall_corr = calculate_pairwise_correlations(pred_dict)
 
     print("\n    Overall Correlation Matrix:")
     print(overall_corr.to_string())
+
+    # Compute daily correlations inline (not in common module)
+    names = list(pred_dict.keys())
+    common_idx = pred_dict[names[0]].index
+    for name in names[1:]:
+        common_idx = common_idx.intersection(pred_dict[name].index)
+    corr_df = pd.DataFrame({name: pred_dict[name].loc[common_idx] for name in names})
+
+    daily_corrs = {}
+    for i, n1 in enumerate(names):
+        for j, n2 in enumerate(names):
+            if j <= i:
+                continue
+            pair_key = f"{n1} vs {n2}"
+            dc = corr_df.groupby(level='datetime').apply(
+                lambda x, _n1=n1, _n2=n2: x[_n1].corr(x[_n2]) if len(x) > 1 else np.nan
+            ).dropna()
+            daily_corrs[pair_key] = (dc.mean(), dc.std())
 
     print("\n    Daily Correlation (mean +/- std):")
     print("    " + "-" * 50)
@@ -1112,7 +557,7 @@ def main():
         if isinstance(val_label, pd.DataFrame):
             val_label = val_label.iloc[:, 0]
 
-        learned_weights, learn_info = learn_optimal_weights_multi(
+        learned_weights, learn_info = learn_optimal_weights(
             val_preds, val_label,
             method=args.stacking_method,
             min_weight=args.min_weight,
@@ -1145,7 +590,7 @@ def main():
         else:
             weights = {key: getattr(args, f'{key}_weight') for key in MODEL_CONFIG}
 
-    pred_ensemble = ensemble_predictions_multi(pred_dict, args.ensemble_method, weights)
+    pred_ensemble = ensemble_predictions(pred_dict, args.ensemble_method, weights)
     print(f"    Ensemble shape: {len(pred_ensemble)}, Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
     # AI affinity filter
@@ -1232,7 +677,7 @@ def main():
 
     # Backtest
     if args.backtest:
-        run_ensemble_backtest(pred_ensemble, args, time_splits)
+        run_ensemble_backtest(pred_ensemble, args, time_splits, model_name="Ensemble_V4")
 
         print("\n" + "=" * 80)
         print("ENSEMBLE V4 BACKTEST COMPLETE")

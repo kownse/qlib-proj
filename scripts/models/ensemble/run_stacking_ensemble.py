@@ -62,6 +62,7 @@ from models.common import (
     MODEL_SAVE_PATH,
     FINAL_TEST,
 )
+from models.common.ensemble import zscore_by_day
 
 from models.ensemble.run_ae_cb_ensemble import (
     load_ae_mlp_model,
@@ -108,13 +109,6 @@ MODEL_CONFIGS = {
 # ============================================================================
 # Stacking Utils
 # ============================================================================
-
-def zscore_by_day(series):
-    """Cross-sectional z-score normalization within each day."""
-    mean = series.groupby(level='datetime').transform('mean')
-    std = series.groupby(level='datetime').transform('std')
-    return (series - mean) / (std + 1e-8)
-
 
 def prepare_stacking_matrix(preds, model_names, add_meta_features=False):
     """
