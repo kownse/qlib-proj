@@ -67,68 +67,10 @@ from models.common import (
     prepare_data_from_dataset,
     compute_ic,
 )
+from models.common.dynamic_handlers import normalize_data
 
 
-# Handler d_feat 配置
-# Alpha360-Macro has (6 + M) features × 60 timesteps where M = macro features
-# Alpha300 has 5 features × 60 timesteps (no VWAP, recommended for US data)
-HANDLER_D_FEAT = {
-    'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
-    'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
-    'alpha300-ts': 5,        # 5 features × 60 timesteps (time-series norm for TCN/LSTM)
-    'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
-    'alpha158': 158,
-    'alpha158-talib': 158,
-    'alpha158-talib-lite': 158,
-}
-
-
-def normalize_data(X, fit_stats=None):
-    """
-    对数据进行归一化处理：3σ clip + zscore
-
-    借鉴自 run_tcn.py 的数据处理方式。
-
-    Args:
-        X: numpy array 或 DataFrame
-        fit_stats: 训练集统计量 (mean, std)，如果为 None 则从 X 计算
-
-    Returns:
-        normalized_X: 归一化后的数据 (numpy array)
-        stats: 统计量 (mean, std)，可用于测试数据
-    """
-    if isinstance(X, pd.DataFrame):
-        X_df = X.copy()
-    else:
-        X_df = pd.DataFrame(X)
-
-    # 处理 NaN 和 inf
-    X_df = X_df.fillna(0)
-    X_df = X_df.replace([np.inf, -np.inf], 0)
-
-    if fit_stats is None:
-        # 计算统计量
-        means = X_df.mean().values
-        stds = X_df.std().values
-        stds = np.where(stds == 0, 1, stds)  # 避免除以0
-    else:
-        means, stds = fit_stats
-
-    # 按列进行 3σ clip + zscore 归一化
-    X_values = X_df.values.copy()
-    for i in range(X_values.shape[1]):
-        col_mean = means[i]
-        col_std = stds[i]
-        if col_std > 0:
-            lower = col_mean - 3 * col_std
-            upper = col_mean + 3 * col_std
-            X_values[:, i] = np.clip(X_values[:, i], lower, upper)
-            X_values[:, i] = (X_values[:, i] - col_mean) / col_std
-
-    # 最终处理
-    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return X_values, (means, stds)
+from models.common.ts_model_utils import HANDLER_D_FEAT
 
 
 def print_data_quality(X, name="Data"):

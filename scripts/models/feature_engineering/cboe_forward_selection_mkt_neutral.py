@@ -47,6 +47,7 @@ from models.feature_engineering.feature_selection_utils import (
     countdown,
     load_checkpoint,
 )
+from models.deep.ae_mlp_shared import build_ae_mlp_model
 
 # ---------------------------------------------------------------------------
 # V9 baseline features (hardcoded from datahandler_enhanced_v9.py)
@@ -274,49 +275,6 @@ class DynamicMktNeutralCBOEHandler(DataHandlerLP):
             df[label_col] = df[label_col].values - spy_aligned.values
 
 
-# ---------------------------------------------------------------------------
-# AE-MLP model builder
-# ---------------------------------------------------------------------------
-def build_ae_mlp_model(input_dim, hyperparams):
-    """Build AE-MLP model with given hyperparams."""
-    hidden_units = hyperparams["hidden_units"]
-    dropout_rates = hyperparams["dropout_rates"]
-    lr = hyperparams["lr"]
-    loss_weights = hyperparams["loss_weights"]
-
-    inputs = tf.keras.layers.Input(shape=(input_dim,))
-
-    # Encoder
-    x = inputs
-    for i, (units, dr) in enumerate(zip(hidden_units[:2], dropout_rates[:2])):
-        x = tf.keras.layers.Dense(units, activation="relu", name=f"enc_{i}")(x)
-        x = tf.keras.layers.Dropout(dr, name=f"enc_drop_{i}")(x)
-    encoded = x
-
-    # Decoder
-    decoder_out = tf.keras.layers.Dense(input_dim, activation="linear", name="decoder")(encoded)
-
-    # Auxiliary branch
-    ae_x = encoded
-    ae_x = tf.keras.layers.Dense(hidden_units[2], activation="relu", name="ae_dense")(ae_x)
-    ae_x = tf.keras.layers.Dropout(dropout_rates[2], name="ae_drop")(ae_x)
-    ae_action = tf.keras.layers.Dense(1, activation="linear", name="ae_action")(ae_x)
-
-    # Main branch (concat input + encoded)
-    main_x = tf.keras.layers.Concatenate()([inputs, encoded])
-    for i, (units, dr) in enumerate(zip(hidden_units[2:], dropout_rates[3:])):
-        main_x = tf.keras.layers.Dense(units, activation="relu", name=f"main_{i}")(main_x)
-        main_x = tf.keras.layers.Dropout(dr, name=f"main_drop_{i}")(main_x)
-    action = tf.keras.layers.Dense(1, activation="linear", name="action")(main_x)
-
-    model = tf.keras.Model(inputs=inputs, outputs=[decoder_out, ae_action, action])
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss={"decoder": "mse", "ae_action": "mse", "action": "mse"},
-        loss_weights=loss_weights,
-    )
-    return model
-
 
 # ---------------------------------------------------------------------------
 # CBOEForwardSelection
@@ -401,7 +359,7 @@ class CBOEForwardSelection(ForwardSelectionBase):
             )
 
             input_dim = X_train.shape[1]
-            model = build_ae_mlp_model(input_dim, self.hyperparams)
+            model = build_ae_mlp_model({**self.hyperparams, 'num_columns': input_dim})
 
             early_stop = tf.keras.callbacks.EarlyStopping(
                 monitor="val_action_loss",

@@ -63,19 +63,7 @@ def add_tcn_args(parser):
     return parser
 
 
-# Alpha360 has 6 base features with 60 timesteps = 360 total
-# Alpha300 has 5 base features with 60 timesteps = 300 total (no VWAP, for US data)
-# Alpha158 has 158 features (no temporal structure, use all as d_feat)
-# Alpha360-Macro has (6 + M) features × 60 timesteps where M = macro features
-HANDLER_D_FEAT = {
-    'alpha360': 6,           # 6 features × 60 timesteps (includes VWAP - may have NaN in US data!)
-    'alpha300': 5,           # 5 features × 60 timesteps (no VWAP - recommended for US data)
-    'alpha300-ts': 5,        # 5 features × 60 timesteps (time-series norm for TCN/LSTM)
-    'alpha360-macro': 29,    # (6 + 23 core macro) × 60 = 1740 total
-    'alpha158': 158,         # No temporal structure
-    'alpha158_vol': 158,
-    'alpha158_vol_talib': 158,
-}
+from models.common.ts_model_utils import resolve_d_feat_and_seq_len
 
 
 def main():
@@ -146,21 +134,7 @@ def main():
     for col, val in col_max.head(10).items():
         print(f"    {str(col):20s}: max abs = {val:.4e}")
 
-    # 对于 TCN，d_feat 是每个时间步的基础特征数
-    # Alpha360: 6 features × 60 timesteps = 360
-    if args.d_feat:
-        d_feat = args.d_feat
-    else:
-        d_feat = HANDLER_D_FEAT.get(args.handler, total_features)
-
-    # 计算序列长度
-    if total_features % d_feat == 0:
-        seq_len = total_features // d_feat
-    else:
-        print(f"    WARNING: total_features ({total_features}) not divisible by d_feat ({d_feat})")
-        print(f"    Falling back to d_feat = total_features (no temporal structure)")
-        d_feat = total_features
-        seq_len = 1
+    d_feat, seq_len = resolve_d_feat_and_seq_len(args.handler, total_features, args.d_feat)
 
     print(f"\n[6] Model Configuration:")
     print(f"    Total features: {total_features}")

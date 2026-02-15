@@ -95,6 +95,7 @@ from models.common import (
     prepare_data_from_dataset,
     compute_ic,
 )
+from models.deep.ae_mlp_shared import build_ae_mlp_model, set_random_seed, create_tf_dataset
 
 
 # ============================================================================
@@ -173,119 +174,6 @@ ALL_CONFIGS = [BASELINE_CONFIG, OPTIMIZED_CONFIG_A, OPTIMIZED_CONFIG_B, OPTIMIZE
 # ============================================================================
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "ablation_validation"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================================
-# 模型构建
-# ============================================================================
-
-def set_random_seed(seed: int):
-    """设置随机种子"""
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-
-def build_ae_mlp_model(config: dict, num_columns: int) -> Model:
-    """根据配置构建 AE-MLP 模型"""
-    hidden_units = config['hidden_units']
-    dropout_rates = config['dropout_rates']
-    lr = config['lr']
-    encoder_dim = config['encoder_dim']
-    use_decoder_loss = config['use_decoder_loss']
-    use_auxiliary_output = config['use_auxiliary_output']
-    use_concat = config['use_concat']
-    decoder_weight = config['decoder_weight']
-    aux_weight = config['aux_weight']
-
-    inp = layers.Input(shape=(num_columns,), name='input')
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(encoder_dim, name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    outputs = []
-    output_names = []
-    loss_weights = {}
-
-    # Decoder (可选)
-    decoder = None
-    if use_decoder_loss:
-        decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-        decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
-        outputs.append(decoder)
-        output_names.append('decoder')
-        loss_weights['decoder'] = decoder_weight
-
-    # Auxiliary output (可选)
-    if use_auxiliary_output:
-        if use_decoder_loss and decoder is not None:
-            x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-        else:
-            x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(encoder)
-        x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-        x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-        x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-        out_ae = layers.Dense(1, dtype='float32', name='ae_action')(x_ae)
-        outputs.append(out_ae)
-        output_names.append('ae_action')
-        loss_weights['ae_action'] = aux_weight
-
-    # Main branch
-    if use_concat:
-        x = layers.Concatenate(name='concat')([x0, encoder])
-    else:
-        x = encoder
-
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    out = layers.Dense(1, dtype='float32', name='action')(x)
-    outputs.append(out)
-    output_names.append('action')
-    loss_weights['action'] = 1.0
-
-    model = Model(inputs=inp, outputs=outputs, name='AE_MLP_Validation')
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={name: 'mse' for name in output_names},
-        loss_weights=loss_weights,
-    )
-
-    return model, output_names
-
-
-def create_tf_dataset(X, y, output_names, batch_size, shuffle=True):
-    """创建 tf.data.Dataset"""
-    with tf.device('/CPU:0'):
-        outputs = {}
-        for name in output_names:
-            if name == 'decoder':
-                outputs[name] = X.astype(np.float32)
-            else:
-                outputs[name] = y.astype(np.float32)
-
-        dataset = tf.data.Dataset.from_tensor_slices((X.astype(np.float32), outputs))
-
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=min(len(X), 50000))
-
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    return dataset
 
 
 # ============================================================================

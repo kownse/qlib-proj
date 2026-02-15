@@ -117,16 +117,7 @@ from models.common import (
     prepare_data_from_dataset,
     compute_ic,
 )
-
-
-def set_random_seed(seed: int):
-    """设置随机种子以提高可复现性"""
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-    # 设置 Python hash seed
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"    Random seed set to: {seed}")
+from models.deep.ae_mlp_shared import set_random_seed, create_tf_dataset, build_ae_mlp_model, setup_gpu
 
 
 def load_params_from_json(params_file: str) -> dict:
@@ -153,108 +144,6 @@ def load_params_from_json(params_file: str) -> dict:
                 print(f"      {fold['name']}: IC={fold['ic']:.4f}, ICIR={fold['icir']:.4f}")
 
     return params, cv_results
-
-
-def create_tf_dataset(X, y, batch_size, shuffle=True, prefetch=True):
-    """创建优化的 tf.data.Dataset，数据保持在 CPU 上"""
-    # 强制在 CPU 上创建数据集，避免 GPU 内存不足
-    with tf.device('/CPU:0'):
-        outputs = {
-            'decoder': X.astype(np.float32),
-            'ae_action': y.astype(np.float32),
-            'action': y.astype(np.float32),
-        }
-
-        dataset = tf.data.Dataset.from_tensor_slices((X.astype(np.float32), outputs))
-
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=min(len(X), 50000))
-
-        dataset = dataset.batch(batch_size)
-
-        if prefetch:
-            dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    return dataset
-
-
-def build_ae_mlp_model(params: dict) -> Model:
-    """构建 AE-MLP 模型"""
-    num_columns = params['num_columns']
-    hidden_units = params['hidden_units']
-    dropout_rates = params['dropout_rates']
-    lr = params['lr']
-    loss_weights = params['loss_weights']
-
-    inp = layers.Input(shape=(num_columns,), name='input')
-
-    # 输入标准化
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    # Decoder (重建原始输入)
-    decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
-
-    # 辅助预测分支 (基于 decoder 输出)
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-    x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-    x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-    x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, dtype='float32', name='ae_action')(x_ae)
-
-    # 主分支: 原始特征 + encoder 特征
-    x = layers.Concatenate(name='concat')([x0, encoder])
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    # MLP 主体
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    # 主输出 (使用 float32 确保数值稳定性)
-    out = layers.Dense(1, dtype='float32', name='action')(x)
-
-    model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={
-            'decoder': 'mse',
-            'ae_action': 'mse',
-            'action': 'mse',
-        },
-        loss_weights=loss_weights,
-    )
-
-    return model
-
-
-def setup_gpu(gpu: int, use_mixed_precision: bool = False):
-    """配置 GPU (内存增长已在模块级别设置)"""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpu >= 0 and gpus:
-        try:
-            tf.config.set_visible_devices(gpus[gpu], 'GPU')
-            print(f"    Using GPU: {gpus[gpu]}")
-
-            if use_mixed_precision:
-                mixed_precision.set_global_policy('mixed_float16')
-                print("    Mixed precision (FP16) enabled")
-        except RuntimeError as e:
-            print(f"    GPU setup error: {e}")
-    else:
-        tf.config.set_visible_devices([], 'GPU')
-        print("    Using CPU")
 
 
 def run_cv_evaluation(args, handler_config, symbols, model_path, use_mixed_precision=False):

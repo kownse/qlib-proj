@@ -72,7 +72,7 @@ import shap
 
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers, Model, callbacks
+from tensorflow.keras import Model, callbacks
 
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
@@ -82,6 +82,7 @@ from models.common import (
     HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
     get_time_splits,
 )
+from models.deep.ae_mlp_shared import build_ae_mlp_model, setup_gpu
 
 
 # ============================================================================
@@ -102,25 +103,6 @@ DEFAULT_AE_MLP_PARAMS = {
 }
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "feature_selection"
-
-
-# ============================================================================
-# GPU 设置
-# ============================================================================
-
-def setup_gpu(gpu: int = 0):
-    """配置 GPU"""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpu >= 0 and gpus:
-        try:
-            tf.config.set_visible_devices(gpus[gpu], 'GPU')
-            tf.config.experimental.set_memory_growth(gpus[gpu], True)
-            print(f"    Using GPU: {gpus[gpu]}")
-        except RuntimeError as e:
-            print(f"    GPU setup error: {e}")
-    else:
-        tf.config.set_visible_devices([], 'GPU')
-        print("    Using CPU")
 
 
 # ============================================================================
@@ -208,83 +190,6 @@ def prepare_data(
     return X.values, y.values, index
 
 
-# ============================================================================
-# AE-MLP 模型构建
-# ============================================================================
-
-def build_ae_mlp_model(num_columns: int, params: dict = None) -> Model:
-    """
-    构建 AE-MLP 模型
-
-    Args:
-        num_columns: 输入特征数
-        params: 模型参数
-
-    Returns:
-        编译好的 Keras 模型
-    """
-    if params is None:
-        params = DEFAULT_AE_MLP_PARAMS.copy()
-
-    hidden_units = params['hidden_units']
-    dropout_rates = params['dropout_rates']
-    lr = params['lr']
-    loss_weights = params['loss_weights']
-
-    inp = layers.Input(shape=(num_columns,), name='input')
-
-    # 输入标准化
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    # Decoder (重建原始输入)
-    decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, name='decoder')(decoder)
-
-    # 辅助预测分支 (基于 decoder 输出)
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-    x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-    x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-    x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, name='ae_action')(x_ae)
-
-    # 主分支: 原始特征 + encoder 特征
-    x = layers.Concatenate(name='concat')([x0, encoder])
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    # MLP 主体
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    # 主输出 (回归)
-    out = layers.Dense(1, name='action')(x)
-
-    # 构建模型
-    model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
-
-    # 编译
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={
-            'decoder': 'mse',
-            'ae_action': 'mse',
-            'action': 'mse',
-        },
-        loss_weights=loss_weights,
-    )
-
-    return model
-
 
 def create_prediction_model(full_model: Model) -> Model:
     """
@@ -342,7 +247,7 @@ def train_ae_mlp(
     print(f"      batch_size: {params['batch_size']}")
     print(f"      epochs: {n_epochs}")
 
-    model = build_ae_mlp_model(num_columns, params)
+    model = build_ae_mlp_model({**params, 'num_columns': num_columns})
 
     # 回调
     cb_list = [
@@ -592,7 +497,7 @@ def evaluate_with_features(
 
     # 训练模型
     tf.keras.backend.clear_session()
-    model = build_ae_mlp_model(num_columns, eval_params)
+    model = build_ae_mlp_model({**eval_params, 'num_columns': num_columns})
 
     cb_list = [
         callbacks.EarlyStopping(

@@ -45,11 +45,11 @@ from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
 
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model, callbacks
+from tensorflow.keras import callbacks
 
 from utils.talib_ops import TALIB_OPS
 from data.stock_pools import STOCK_POOLS
+from models.deep.ae_mlp_shared import build_ae_mlp_model
 
 # 导入共享工具
 from models.feature_engineering.feature_selection_utils import (
@@ -72,7 +72,7 @@ from models.feature_engineering.feature_selection_utils import (
 
 
 # ============================================================================
-# AE-MLP 模型
+# AE-MLP 超参数
 # ============================================================================
 
 BEST_HYPERPARAMS = {
@@ -82,59 +82,6 @@ BEST_HYPERPARAMS = {
     "batch_size": 2048,
     "loss_weights": {"decoder": 0.267, "ae_action": 0.072, "action": 1.0}
 }
-
-
-def build_ae_mlp_model(num_columns: int, params: dict = None) -> Model:
-    """构建 AE-MLP 模型"""
-    if params is None:
-        params = BEST_HYPERPARAMS
-
-    hidden_units = params['hidden_units']
-    dropout_rates = params['dropout_rates']
-    lr = params['lr']
-    loss_weights = params['loss_weights']
-
-    inp = layers.Input(shape=(num_columns,), name='input')
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    # Decoder
-    decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
-
-    # Auxiliary branch
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-    x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-    x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-    x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, dtype='float32', name='ae_action')(x_ae)
-
-    # Main branch
-    x = layers.Concatenate(name='concat')([x0, encoder])
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    out = layers.Dense(1, dtype='float32', name='action')(x)
-
-    model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={'decoder': 'mse', 'ae_action': 'mse', 'action': 'mse'},
-        loss_weights=loss_weights,
-    )
-    return model
 
 
 # ============================================================================
@@ -338,7 +285,7 @@ class AEMLPForwardSelection(ForwardSelectionBase):
                 X_train, y_train, X_valid, y_valid, valid_index = self.prepare_fold_data(fold)
 
                 num_features = X_train.shape[1]
-                model = build_ae_mlp_model(num_features)
+                model = build_ae_mlp_model({**BEST_HYPERPARAMS, 'num_columns': num_features})
 
                 train_outputs = {'decoder': X_train, 'ae_action': y_train, 'action': y_train}
                 valid_outputs = {'decoder': X_valid, 'ae_action': y_valid, 'action': y_valid}

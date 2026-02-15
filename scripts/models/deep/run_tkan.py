@@ -62,18 +62,7 @@ from models.common import (
 from models.deep.tkan_model import TKANStock
 
 
-# ============================================================================
-# d_feat mapping for known sequential handlers
-# ============================================================================
-
-HANDLER_D_FEAT = {
-    'alpha360': 6,
-    'alpha300': 5,
-    'alpha360-macro': 29,
-    'alpha300-macro': 11,
-    'alpha180': 6,
-    'alpha180-macro': 6,
-}
+from models.common.ts_model_utils import resolve_d_feat_and_seq_len
 
 
 # ============================================================================
@@ -176,18 +165,9 @@ def main():
     # Determine d_feat and seq_len
     total_features = train_data.shape[1]
 
-    if args.d_feat > 0:
-        d_feat = args.d_feat
-    else:
-        d_feat = HANDLER_D_FEAT.get(args.handler, total_features)
-
-    if total_features % d_feat == 0:
-        seq_len = total_features // d_feat
-    else:
-        print(f"    WARNING: total_features ({total_features}) not divisible by "
-              f"d_feat ({d_feat}), using d_feat=total_features, seq_len=1")
-        d_feat = total_features
-        seq_len = 1
+    d_feat, seq_len = resolve_d_feat_and_seq_len(
+        args.handler, total_features, args.d_feat if args.d_feat > 0 else None
+    )
 
     # Build sub-layer configs
     sub_kan_configs = build_sub_kan_configs(args)

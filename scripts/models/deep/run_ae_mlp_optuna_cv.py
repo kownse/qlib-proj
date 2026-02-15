@@ -112,7 +112,7 @@ for i, arg in enumerate(sys.argv):
 setup_gpu_early(_gpu_id, _gpu_memory)
 
 from tensorflow import keras
-from tensorflow.keras import layers, Model, callbacks
+from tensorflow.keras import callbacks
 
 from qlib.data.dataset import DatasetH
 from qlib.data.dataset.handler import DataHandlerLP
@@ -124,7 +124,9 @@ from models.common import (
     HANDLER_CONFIG, PROJECT_ROOT, MODEL_SAVE_PATH,
     init_qlib,
     run_backtest,
+    compute_ic,
 )
+from models.deep.ae_mlp_shared import build_ae_mlp_model
 
 
 # ============================================================================
@@ -206,82 +208,6 @@ def prepare_data_from_dataset(dataset: DatasetH, segment: str):
         return features.values, labels, features.index
     except Exception:
         return features.values, None, features.index
-
-
-def compute_ic(pred, label, index):
-    """计算 IC (按日期分组的相关系数平均值)"""
-    df = pd.DataFrame({'pred': pred, 'label': label}, index=index)
-    ic_by_date = df.groupby(level='datetime').apply(
-        lambda x: x['pred'].corr(x['label']) if len(x) > 1 else np.nan
-    )
-    ic_by_date = ic_by_date.dropna()
-    if len(ic_by_date) == 0:
-        return 0.0, 0.0, 0.0
-    mean_ic = ic_by_date.mean()
-    ic_std = ic_by_date.std()
-    icir = mean_ic / ic_std if ic_std > 0 else 0
-    return mean_ic, ic_std, icir
-
-
-def build_ae_mlp_model(params: dict) -> Model:
-    """构建 AE-MLP 模型"""
-    num_columns = params['num_columns']
-    hidden_units = params['hidden_units']
-    dropout_rates = params['dropout_rates']
-    lr = params['lr']
-    loss_weights = params['loss_weights']
-
-    inp = layers.Input(shape=(num_columns,), name='input')
-
-    # 输入标准化
-    x0 = layers.BatchNormalization(name='input_bn')(inp)
-
-    # Encoder
-    encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
-    encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
-    encoder = layers.Activation('swish', name='encoder_act')(encoder)
-
-    # Decoder (重建原始输入, float32 for mixed precision)
-    decoder = layers.Dropout(dropout_rates[1], name='decoder_dropout')(encoder)
-    decoder = layers.Dense(num_columns, name='decoder', dtype='float32')(decoder)
-
-    # 辅助预测分支 (基于 decoder 输出)
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
-    x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
-    x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
-    x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
-    out_ae = layers.Dense(1, name='ae_action', dtype='float32')(x_ae)
-
-    # 主分支: 原始特征 + encoder 特征
-    x = layers.Concatenate(name='concat')([x0, encoder])
-    x = layers.BatchNormalization(name='main_bn0')(x)
-    x = layers.Dropout(dropout_rates[3], name='main_dropout0')(x)
-
-    # MLP 主体
-    for i in range(2, len(hidden_units)):
-        dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
-        x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
-        x = layers.Activation('swish', name=f'main_act{i-1}')(x)
-        x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
-
-    # 主输出 (使用 float32 确保数值稳定性，混合精度要求)
-    out = layers.Dense(1, name='action', dtype='float32')(x)
-
-    model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss={
-            'decoder': 'mse',
-            'ae_action': 'mse',
-            'action': 'mse',
-        },
-        loss_weights=loss_weights,
-    )
-
-    return model
 
 
 def clear_gpu_memory():

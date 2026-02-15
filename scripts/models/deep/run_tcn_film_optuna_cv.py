@@ -67,36 +67,10 @@ from models.common import (
     compute_ic,
 )
 from models.common.handlers import get_handler_class
+from models.common.macro_features import (
+    load_macro_df, get_macro_cols, prepare_macro,
+)
 from models.deep.tcn_film import TCNFiLM
-
-
-# ============================================================================
-# Macro Features (from run_tcn_macro_cv.py)
-# ============================================================================
-
-DEFAULT_MACRO_PATH = PROJECT_ROOT / "my_data" / "macro_processed" / "macro_features.parquet"
-
-MINIMAL_MACRO_FEATURES = [
-    "macro_vix_zscore20", "macro_hy_spread_zscore", "macro_credit_stress",
-    "macro_tlt_pct_20d", "macro_uso_pct_5d", "macro_risk_on_off",
-]
-
-CORE_MACRO_FEATURES = [
-    "macro_vix_level", "macro_vix_zscore20", "macro_vix_pct_5d",
-    "macro_vix_regime", "macro_vix_term_structure",
-    "macro_gld_pct_5d", "macro_tlt_pct_5d", "macro_yield_curve",
-    "macro_uup_pct_5d", "macro_uso_pct_5d",
-    "macro_spy_pct_5d", "macro_spy_vol20",
-    "macro_hyg_vs_lqd", "macro_credit_stress", "macro_hy_spread_zscore",
-    "macro_eem_vs_spy", "macro_global_risk",
-    "macro_yield_10y", "macro_yield_2s10s", "macro_yield_inversion",
-    "macro_risk_on_off", "macro_market_stress", "macro_hy_spread",
-]
-
-FEATURES_NEED_ZSCORE = [
-    "macro_tlt_pct_20d", "macro_tlt_pct_5d", "macro_uso_pct_5d",
-    "macro_gld_pct_5d", "macro_uup_pct_5d", "macro_spy_pct_5d",
-]
 
 
 # ============================================================================
@@ -124,34 +98,6 @@ class TCNMacroDataset(Dataset):
 # ============================================================================
 # Data Preparation
 # ============================================================================
-
-def load_macro_df(path=None):
-    path = path or DEFAULT_MACRO_PATH
-    df = pd.read_parquet(path)
-    print(f"Loaded macro: {df.shape}, {df.index.min()} ~ {df.index.max()}")
-    return df
-
-
-def get_macro_cols(macro_set):
-    return CORE_MACRO_FEATURES if macro_set == "core" else MINIMAL_MACRO_FEATURES
-
-
-def prepare_macro(index, macro_df, macro_cols, lag=1):
-    dates = index.get_level_values('datetime')
-    available = [c for c in macro_cols if c in macro_df.columns]
-    macro = macro_df[available].copy()
-
-    for col in available:
-        if col in FEATURES_NEED_ZSCORE:
-            roll_mean = macro[col].rolling(60, min_periods=20).mean()
-            roll_std = macro[col].rolling(60, min_periods=20).std()
-            macro[col] = ((macro[col] - roll_mean) / (roll_std + 1e-8)).clip(-5, 5)
-
-    if lag > 0:
-        macro = macro.shift(lag)
-
-    return macro.reindex(dates).fillna(0).values
-
 
 def prepare_fold_data(dataset, segment, macro_df, macro_cols, d_feat=5, step_len=60, lag=1):
     """Prepare stock (reshaped) + macro + labels for a dataset segment."""
