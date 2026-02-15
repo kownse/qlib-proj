@@ -445,6 +445,7 @@ class MHCVHyperoptObjective:
                 )
 
                 best_epoch = ic_cb.best_epoch if ic_cb.best_epoch > 0 else len(history.history['loss'])
+                total_epochs = len(history.history['loss'])
 
                 fold_ics.append(mean_ic)
                 fold_results.append({
@@ -452,6 +453,7 @@ class MHCVHyperoptObjective:
                     'ic': mean_ic,
                     'icir': icir,
                     'best_epoch': best_epoch,
+                    'total_epochs': total_epochs,
                 })
 
             mean_ic_all = np.mean(fold_ics)
@@ -464,7 +466,7 @@ class MHCVHyperoptObjective:
                 is_best = ""
 
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
-            fold_ep_str = ", ".join([str(r['best_epoch']) for r in fold_results])
+            fold_ep_str = ", ".join([f"{r['best_epoch']}/{r['total_epochs']}" for r in fold_results])
             ic_w = model_params.get('ic_loss_weight', 0.0)
             print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
                   f"IC[{fold_ic_str}] ep[{fold_ep_str}] "
