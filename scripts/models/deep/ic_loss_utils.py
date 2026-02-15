@@ -169,26 +169,25 @@ class ICEarlyStoppingCallback(keras.callbacks.Callback):
 
         in_warmup = (epoch + 1) < self.min_epochs
 
-        if mean_ic > self.best_ic + self.min_delta:
+        if in_warmup:
+            # Warmup: log IC but don't track best or count patience
+            if self.verbose > 0:
+                print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
+                      f'icir={icir:.4f} [warmup {epoch+1}/{self.min_epochs}]')
+        elif mean_ic > self.best_ic + self.min_delta:
             self.best_ic = mean_ic
             self.best_weights = self.model.get_weights()
             self.wait = 0
             self.best_epoch = epoch + 1
             if self.verbose > 0:
-                warmup_tag = ' [warmup]' if in_warmup else ''
                 print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
-                      f'icir={icir:.4f} (new best){warmup_tag}')
+                      f'icir={icir:.4f} (new best)')
         else:
-            if not in_warmup:
-                self.wait += 1
+            self.wait += 1
             if self.verbose > 0:
-                if in_warmup:
-                    print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
-                          f'icir={icir:.4f} [warmup {epoch+1}/{self.min_epochs}]')
-                else:
-                    print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
-                          f'icir={icir:.4f} (patience {self.wait}/{self.patience})')
-            if not in_warmup and self.wait >= self.patience:
+                print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
+                      f'icir={icir:.4f} (patience {self.wait}/{self.patience})')
+            if self.wait >= self.patience:
                 self.stopped_epoch = epoch
                 self.model.stop_training = True
                 if self.best_weights is not None:
