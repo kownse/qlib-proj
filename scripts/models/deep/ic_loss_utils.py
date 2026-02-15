@@ -92,12 +92,15 @@ class ICEarlyStoppingCallback(keras.callbacks.Callback):
         patience: Number of epochs with no improvement before stopping
         batch_size: Batch size for prediction
         min_delta: Minimum improvement to qualify as better
+        min_epochs: Warm-up period — IC is tracked but early stopping won't
+            trigger before this many epochs (default 10)
         verbose: Verbosity level (0=silent, 1=progress)
     """
 
     def __init__(self, X_valid, y_valid, valid_index,
                  primary_output_idx=2, patience=10,
-                 batch_size=4096, min_delta=0.0, verbose=1):
+                 batch_size=4096, min_delta=0.0, min_epochs=5,
+                 verbose=1):
         super().__init__()
         self.X_valid = X_valid
         self.y_valid = y_valid
@@ -106,6 +109,7 @@ class ICEarlyStoppingCallback(keras.callbacks.Callback):
         self.patience = patience
         self.batch_size = batch_size
         self.min_delta = min_delta
+        self.min_epochs = min_epochs
         self.verbose = verbose
 
         self.best_ic = -np.inf
@@ -163,20 +167,28 @@ class ICEarlyStoppingCallback(keras.callbacks.Callback):
             logs['val_ic'] = mean_ic
             logs['val_icir'] = icir
 
+        in_warmup = (epoch + 1) < self.min_epochs
+
         if mean_ic > self.best_ic + self.min_delta:
             self.best_ic = mean_ic
             self.best_weights = self.model.get_weights()
             self.wait = 0
             self.best_epoch = epoch + 1
             if self.verbose > 0:
+                warmup_tag = ' [warmup]' if in_warmup else ''
                 print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
-                      f'icir={icir:.4f} (new best)')
+                      f'icir={icir:.4f} (new best){warmup_tag}')
         else:
-            self.wait += 1
+            if not in_warmup:
+                self.wait += 1
             if self.verbose > 0:
-                print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
-                      f'icir={icir:.4f} (patience {self.wait}/{self.patience})')
-            if self.wait >= self.patience:
+                if in_warmup:
+                    print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
+                          f'icir={icir:.4f} [warmup {epoch+1}/{self.min_epochs}]')
+                else:
+                    print(f'  IC EarlyStopping: epoch {epoch+1}, val_ic={mean_ic:.4f}, '
+                          f'icir={icir:.4f} (patience {self.wait}/{self.patience})')
+            if not in_warmup and self.wait >= self.patience:
                 self.stopped_epoch = epoch
                 self.model.stop_training = True
                 if self.best_weights is not None:
