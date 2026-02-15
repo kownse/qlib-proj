@@ -170,9 +170,12 @@ SEARCH_SPACE = {
     # Head 结构
     'head_dim': scope.int(hp.quniform('head_dim', 16, 64, 8)),
 
-    # Dropout
-    'noise_std': hp.uniform('noise_std', 0.01, 0.1),
-    'dropout': hp.uniform('dropout', 0.01, 0.15),
+    # Dropout (扩大上界，允许更强正则化)
+    'noise_std': hp.uniform('noise_std', 0.01, 0.3),
+    'dropout': hp.uniform('dropout', 0.02, 0.4),
+
+    # L2 weight decay
+    'l2_reg': hp.loguniform('l2_reg', np.log(1e-6), np.log(1e-2)),
 
     # 学习率
     'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-2)),
@@ -238,6 +241,7 @@ def create_mh_model_params(hyperparams, num_columns, horizons, primary_horizon):
         'primary_horizon': primary_horizon,
         'aux_weight': hyperparams['aux_weight'],
         'ic_loss_weight': hyperparams.get('ic_loss_weight', 0.0),
+        'l2_reg': hyperparams.get('l2_reg', 0.0),
     }
 
 
@@ -251,6 +255,8 @@ def build_mh_model(params):
     head_dim = params['head_dim']
     horizons = params['horizons']
     ic_loss_weight = params.get('ic_loss_weight', 0.0)
+    l2_reg = params.get('l2_reg', 0.0)
+    reg = keras.regularizers.l2(l2_reg) if l2_reg > 0 else None
 
     inp = layers.Input(shape=(num_columns,), name='input')
 
@@ -259,7 +265,7 @@ def build_mh_model(params):
 
     # Encoder
     encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
+    encoder = layers.Dense(hidden_units[0], kernel_regularizer=reg, name='encoder_dense')(encoder)
     encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
     encoder = layers.Activation('swish', name='encoder_act')(encoder)
 
@@ -268,7 +274,7 @@ def build_mh_model(params):
     decoder = layers.Dense(num_columns, name='decoder')(decoder)
 
     # 辅助预测分支
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
+    x_ae = layers.Dense(hidden_units[1], kernel_regularizer=reg, name='ae_dense1')(decoder)
     x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
     x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
     x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
@@ -281,7 +287,7 @@ def build_mh_model(params):
 
     for i in range(2, len(hidden_units)):
         dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
+        x = layers.Dense(hidden_units[i], kernel_regularizer=reg, name=f'main_dense{i-1}')(x)
         x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
         x = layers.Activation('swish', name=f'main_act{i-1}')(x)
         x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
@@ -290,7 +296,7 @@ def build_mh_model(params):
     outputs = [decoder, out_ae]
     for h in horizons:
         head_name = f'action_{h}d'
-        head = layers.Dense(head_dim, name=f'head_{h}d_dense')(x)
+        head = layers.Dense(head_dim, kernel_regularizer=reg, name=f'head_{h}d_dense')(x)
         head = layers.Activation('swish', name=f'head_{h}d_act')(head)
         head = layers.Dense(1, name=head_name)(head)
         outputs.append(head)
@@ -468,10 +474,11 @@ class MHCVHyperoptObjective:
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
             fold_ep_str = ", ".join([f"{r['best_epoch']}/{r['total_epochs']}" for r in fold_results])
             ic_w = model_params.get('ic_loss_weight', 0.0)
+            l2 = model_params.get('l2_reg', 0.0)
             print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
                   f"IC[{fold_ic_str}] ep[{fold_ep_str}] "
-                  f"lr={hyperparams['learning_rate']:.5f} "
-                  f"aux={hyperparams['aux_weight']:.3f} ic_w={ic_w:.1f}{is_best}")
+                  f"lr={hyperparams['learning_rate']:.5f} drop={hyperparams['dropout']:.3f} "
+                  f"l2={l2:.1e} ic_w={ic_w:.1f}{is_best}")
 
             return {
                 'loss': -mean_ic_all,
@@ -554,6 +561,7 @@ def run_hyperopt_cv_search(args, handler_config, symbols, horizons, primary_hori
     print(f"  noise_std: {best_params['dropout_rates'][0]:.4f}")
     print(f"  aux_weight: {best_params['aux_weight']:.4f}")
     print(f"  ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
+    print(f"  l2_reg: {best_params.get('l2_reg', 0.0):.6f}")
     print(f"  loss_weights: {best_params['loss_weights']}")
     print("=" * 70)
 
@@ -570,6 +578,7 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
     print(f"    batch_size: {best_params['batch_size']}")
     print(f"    aux_weight: {best_params['aux_weight']:.4f}")
     print(f"    ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
+    print(f"    l2_reg: {best_params.get('l2_reg', 0.0):.6f}")
 
     # 创建最终数据集
     handler = create_mh_data_handler_for_fold(
@@ -810,6 +819,7 @@ def main():
             'batch_size': best_params['batch_size'],
             'aux_weight': best_params['aux_weight'],
             'ic_loss_weight': best_params.get('ic_loss_weight', 0.0),
+            'l2_reg': best_params.get('l2_reg', 0.0),
             'loss_weights': {k: float(v) for k, v in best_params['loss_weights'].items()},
         },
         'cv_results': {
@@ -835,6 +845,7 @@ def main():
                 'batch_size': t['result']['params']['batch_size'],
                 'aux_weight': t['result']['params']['aux_weight'],
                 'ic_loss_weight': t['result']['params'].get('ic_loss_weight', 0.0),
+                'l2_reg': t['result']['params'].get('l2_reg', 0.0),
             })
 
     history_df = pd.DataFrame(history)
