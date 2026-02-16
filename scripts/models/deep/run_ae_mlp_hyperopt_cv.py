@@ -87,6 +87,7 @@ from models.common.cv_utils import (
 
 from models.deep.ae_mlp_model import AEMLP
 from models.deep.ae_mlp_shared import build_ae_mlp_model
+from models.deep.ic_loss_utils import ICEarlyStoppingCallback
 
 
 # ============================================================================
@@ -114,7 +115,14 @@ SEARCH_SPACE = {
     # 损失权重
     'loss_decoder': hp.uniform('loss_decoder', 0.01, 0.3),
     'loss_ae': hp.uniform('loss_ae', 0.01, 0.3),
+
+    # IC loss and regularization
+    'ic_loss_weight': hp.choice('ic_loss_weight', [0.0, 0.1, 0.2, 0.5, 1.0]),
+    'l2_reg': hp.loguniform('l2_reg', np.log(1e-6), np.log(1e-2)),
 }
+
+BATCH_SIZE_CHOICES = [1024, 2048, 4096, 8192]
+IC_LOSS_WEIGHT_CHOICES = [0.0, 0.1, 0.2, 0.5, 1.0]
 
 
 def create_ae_mlp_params(hyperparams: dict, num_columns: int) -> dict:
@@ -150,6 +158,8 @@ def create_ae_mlp_params(hyperparams: dict, num_columns: int) -> dict:
         'lr': hyperparams['learning_rate'],
         'batch_size': hyperparams['batch_size'],
         'loss_weights': loss_weights,
+        'ic_loss_weight': hyperparams.get('ic_loss_weight', 0.0),
+        'l2_reg': hyperparams.get('l2_reg', 0.0),
     }
 
 
@@ -244,20 +254,21 @@ class CVHyperoptObjective:
                     'action': fold['y_valid'],
                 }
 
-                # 回调
-                cb_list = [
-                    callbacks.EarlyStopping(
-                        monitor='val_action_loss',
-                        patience=self.early_stop,
-                        min_delta=1e-5,
-                        restore_best_weights=True,
-                        verbose=0,
-                        mode='min'
-                    ),
-                ]
+                # 回调: IC-based early stopping with warm-up
+                ic_cb = ICEarlyStoppingCallback(
+                    X_valid=fold['X_valid'],
+                    y_valid=fold['y_valid'],
+                    valid_index=fold['valid_index'],
+                    primary_output_idx=2,  # 'action' output
+                    patience=self.early_stop,
+                    batch_size=batch_size,
+                    min_epochs=self.args.min_epochs,
+                    verbose=0,
+                )
+                cb_list = [ic_cb]
 
                 # 训练
-                history = model.fit(
+                model.fit(
                     fold['X_train'],
                     train_outputs,
                     validation_data=(fold['X_valid'], valid_outputs),
@@ -267,7 +278,7 @@ class CVHyperoptObjective:
                     verbose=0,
                 )
 
-                # 验证集预测
+                # 验证集 IC (model has best weights restored by IC callback)
                 _, _, valid_pred = model.predict(fold['X_valid'], batch_size=batch_size, verbose=0)
                 valid_pred = valid_pred.flatten()
 
@@ -276,9 +287,7 @@ class CVHyperoptObjective:
                     valid_pred, fold['y_valid'], fold['valid_index']
                 )
 
-                best_epoch = len(history.history['loss']) - self.early_stop
-                if best_epoch < 1:
-                    best_epoch = len(history.history['loss'])
+                best_epoch = ic_cb.best_epoch
 
                 fold_ics.append(mean_ic)
                 fold_results.append({
@@ -301,8 +310,12 @@ class CVHyperoptObjective:
 
             # 打印进度
             fold_ic_str = ", ".join([f"{r['ic']:.4f}" for r in fold_results])
+            ep_str = ", ".join([f"{r['best_epoch']}" for r in fold_results])
+            ic_w = model_params.get('ic_loss_weight', 0.0)
+            l2 = model_params.get('l2_reg', 0.0)
             print(f"  Trial {self.trial_count:3d}: Mean IC={mean_ic_all:.4f} (±{std_ic_all:.4f}) "
-                  f"[{fold_ic_str}] lr={hyperparams['learning_rate']:.5f}{is_best}")
+                  f"IC[{fold_ic_str}] ep[{ep_str}] "
+                  f"lr={hyperparams['learning_rate']:.5f} l2={l2:.1e} ic_w={ic_w}{is_best}")
 
             return {
                 'loss': -mean_ic_all,
@@ -360,8 +373,9 @@ def run_hyperopt_cv_search(args, handler_config, symbols):
 
     # 获取最佳结果
     best_params = create_ae_mlp_params(best, objective.num_columns)
-    # 需要处理 hp.choice 的 batch_size
-    best_params['batch_size'] = [1024, 2048, 4096, 8192][best['batch_size']]
+    # 需要处理 hp.choice 的 batch_size 和 ic_loss_weight
+    best_params['batch_size'] = BATCH_SIZE_CHOICES[best['batch_size']]
+    best_params['ic_loss_weight'] = IC_LOSS_WEIGHT_CHOICES[best['ic_loss_weight']]
 
     best_trial_idx = np.argmin([t['result']['loss'] for t in trials.trials])
     best_trial = trials.trials[best_trial_idx]['result']
@@ -379,6 +393,8 @@ def run_hyperopt_cv_search(args, handler_config, symbols):
     print(f"  batch_size: {best_params['batch_size']}")
     print(f"  dropout: {best_params['dropout_rates'][1]:.4f}")
     print(f"  noise_std: {best_params['dropout_rates'][0]:.4f}")
+    print(f"  ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
+    print(f"  l2_reg: {best_params.get('l2_reg', 0.0):.6f}")
     print(f"  loss_weights: {best_params['loss_weights']}")
     print("=" * 70)
 
@@ -398,13 +414,15 @@ def train_final_model(args, handler_config, symbols, best_params):
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
     X_train, y_train, _ = prepare_data_from_dataset(dataset, "train")
-    X_valid, y_valid, _ = prepare_data_from_dataset(dataset, "valid")
+    X_valid, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
     X_test, _, test_index = prepare_data_from_dataset(dataset, "test")
 
     print(f"\n    Final training data:")
     print(f"      Train: {X_train.shape} ({FINAL_TEST['train_start']} ~ {FINAL_TEST['train_end']})")
     print(f"      Valid: {X_valid.shape} ({FINAL_TEST['valid_start']} ~ {FINAL_TEST['valid_end']})")
     print(f"      Test:  {X_test.shape} ({FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']})")
+    print(f"      ic_loss_weight: {best_params.get('ic_loss_weight', 0.0)}")
+    print(f"      l2_reg: {best_params.get('l2_reg', 0.0):.6f}")
 
     # 更新特征数
     best_params['num_columns'] = X_train.shape[1]
@@ -413,23 +431,26 @@ def train_final_model(args, handler_config, symbols, best_params):
     tf.keras.backend.clear_session()
     model = build_ae_mlp_model(best_params)
 
-    # 回调
+    # 回调: IC-based early stopping with warm-up + LR reduction
+    ic_cb = ICEarlyStoppingCallback(
+        X_valid=X_valid,
+        y_valid=y_valid,
+        valid_index=valid_index,
+        primary_output_idx=2,  # 'action' output
+        patience=args.early_stop,
+        batch_size=best_params['batch_size'],
+        min_epochs=args.min_epochs,
+        verbose=1,
+    )
     cb_list = [
-        callbacks.EarlyStopping(
-            monitor='val_action_loss',
-            patience=args.early_stop,
-            min_delta=1e-5,  # 最小改善阈值，避免微小改善导致训练过长
-            restore_best_weights=True,
-            verbose=1,
-            mode='min'
-        ),
+        ic_cb,
         callbacks.ReduceLROnPlateau(
-            monitor='val_action_loss',
+            monitor='val_loss',
             factor=0.5,
             patience=5,
             min_lr=1e-6,
             verbose=1,
-            mode='min'
+            mode='min',
         ),
     ]
 
@@ -458,14 +479,12 @@ def train_final_model(args, handler_config, symbols, best_params):
     )
 
     # 验证集 IC
+    print(f"\n    [Validation Set - for reference]")
+    print(f"    Valid IC:   {ic_cb.best_ic:.4f} (from IC early stopping, epoch {ic_cb.best_epoch})")
     _, _, valid_pred = model.predict(X_valid, batch_size=best_params['batch_size'], verbose=0)
     valid_pred = valid_pred.flatten()
-    valid_ic, valid_ic_std, valid_icir = compute_ic(
-        valid_pred, y_valid,
-        dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L).index
-    )
-    print(f"\n    [Validation Set - for reference]")
-    print(f"    Valid IC:   {valid_ic:.4f}")
+    valid_ic, _, valid_icir = compute_ic(valid_pred, y_valid, valid_index)
+    print(f"    Valid IC:   {valid_ic:.4f} (final model)")
     print(f"    Valid ICIR: {valid_icir:.4f}")
 
     # 测试集预测
@@ -497,6 +516,10 @@ def main():
                         help='Epochs per CV trial (smaller for faster search)')
     parser.add_argument('--cv-early-stop', type=int, default=10,
                         help='Early stopping patience for CV trials')
+
+    # IC loss 参数
+    parser.add_argument('--min-epochs', type=int, default=5,
+                        help='Warm-up epochs before IC early stopping can trigger')
 
     # 最终训练参数
     parser.add_argument('--n-epochs', type=int, default=100,
@@ -556,6 +579,8 @@ def main():
             'lr': best_params['lr'],
             'batch_size': best_params['batch_size'],
             'loss_weights': {k: float(v) for k, v in best_params['loss_weights'].items()},
+            'ic_loss_weight': best_params.get('ic_loss_weight', 0.0),
+            'l2_reg': best_params.get('l2_reg', 0.0),
         },
         'cv_results': {
             'mean_ic': float(best_trial['mean_ic']),
@@ -577,6 +602,8 @@ def main():
                 'hidden_units': str(t['result']['params']['hidden_units']),
                 'lr': t['result']['params']['lr'],
                 'batch_size': t['result']['params']['batch_size'],
+                'ic_loss_weight': t['result']['params'].get('ic_loss_weight', 0.0),
+                'l2_reg': t['result']['params'].get('l2_reg', 0.0),
             })
 
     history_df = pd.DataFrame(history)
