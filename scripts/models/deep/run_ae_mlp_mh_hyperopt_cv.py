@@ -692,6 +692,12 @@ def train_cv_ensemble(args, handler_config, symbols, best_params, horizons, prim
     fold_valid_ics = {}
     last_dataset = None
 
+    # 保存目录
+    horizons_str = '_'.join(str(h) for h in horizons)
+    ensemble_dir = MODEL_SAVE_PATH / f"cv_ensemble_{args.handler}_{args.stock_pool}_{horizons_str}"
+    ensemble_dir.mkdir(parents=True, exist_ok=True)
+    print(f"    Save dir: {ensemble_dir}")
+
     for fold_idx, fold in enumerate(CV_FOLDS):
         fold_name = fold['name']
         print(f"\n    --- Fold {fold_idx+1}/{len(CV_FOLDS)}: {fold_name} ---")
@@ -769,8 +775,33 @@ def train_cv_ensemble(args, handler_config, symbols, best_params, horizons, prim
         all_fold_test_preds[fold_name] = fold_preds
         print(f"    Valid IC ({primary_horizon}d): {ic_cb.best_ic:.4f}, Best epoch: {ic_cb.best_epoch}")
 
+        # 保存 fold 模型
+        fold_model_path = ensemble_dir / f"fold_{fold_idx+1}.keras"
+        model.save(str(fold_model_path))
+
+        # 保存 fold 预测
+        fold_pred_df = pd.DataFrame({f'score_{h}d': fold_preds[h] for h in horizons})
+        fold_pred_path = ensemble_dir / f"fold_{fold_idx+1}_test_preds.pkl"
+        fold_pred_df.to_pickle(str(fold_pred_path))
+
+        print(f"    Saved: {fold_model_path.name}, {fold_pred_path.name}")
+
         del model
         tf.keras.backend.clear_session()
+
+    # 保存 ensemble 元数据
+    ensemble_meta = {
+        'horizons': horizons,
+        'primary_horizon': primary_horizon,
+        'handler': args.handler,
+        'stock_pool': args.stock_pool,
+        'fold_valid_ics': {k: float(v) for k, v in fold_valid_ics.items()},
+        'n_folds': len(CV_FOLDS),
+        'folds': [{'name': f['name'], 'train_end': f['train_end'], 'valid_end': f['valid_end']} for f in CV_FOLDS],
+    }
+    with open(ensemble_dir / "ensemble_meta.json", 'w') as f:
+        json.dump(ensemble_meta, f, indent=2)
+    print(f"\n    Ensemble models and predictions saved to: {ensemble_dir}")
 
     # 平均 4 个 fold 的预测
     ensemble_preds = {}
