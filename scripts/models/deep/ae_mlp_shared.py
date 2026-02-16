@@ -61,12 +61,17 @@ def build_ae_mlp_model(params: dict) -> Model:
             - dropout_rates: list of dropout rates
             - lr: learning rate
             - loss_weights: dict of loss weights for decoder/ae_action/action
+            - ic_loss_weight: (optional) weight for IC loss on action output (default 0.0)
+            - l2_reg: (optional) L2 regularization strength (default 0.0)
     """
     num_columns = params['num_columns']
     hidden_units = params['hidden_units']
     dropout_rates = params['dropout_rates']
     lr = params['lr']
     loss_weights = params['loss_weights']
+    ic_loss_weight = params.get('ic_loss_weight', 0.0)
+    l2_reg = params.get('l2_reg', 0.0)
+    reg = keras.regularizers.l2(l2_reg) if l2_reg > 0 else None
 
     inp = layers.Input(shape=(num_columns,), name='input')
 
@@ -75,7 +80,7 @@ def build_ae_mlp_model(params: dict) -> Model:
 
     # Encoder
     encoder = layers.GaussianNoise(dropout_rates[0], name='noise')(x0)
-    encoder = layers.Dense(hidden_units[0], name='encoder_dense')(encoder)
+    encoder = layers.Dense(hidden_units[0], kernel_regularizer=reg, name='encoder_dense')(encoder)
     encoder = layers.BatchNormalization(name='encoder_bn')(encoder)
     encoder = layers.Activation('swish', name='encoder_act')(encoder)
 
@@ -84,7 +89,7 @@ def build_ae_mlp_model(params: dict) -> Model:
     decoder = layers.Dense(num_columns, dtype='float32', name='decoder')(decoder)
 
     # Auxiliary prediction branch (based on decoder output)
-    x_ae = layers.Dense(hidden_units[1], name='ae_dense1')(decoder)
+    x_ae = layers.Dense(hidden_units[1], kernel_regularizer=reg, name='ae_dense1')(decoder)
     x_ae = layers.BatchNormalization(name='ae_bn1')(x_ae)
     x_ae = layers.Activation('swish', name='ae_act1')(x_ae)
     x_ae = layers.Dropout(dropout_rates[2], name='ae_dropout1')(x_ae)
@@ -98,7 +103,7 @@ def build_ae_mlp_model(params: dict) -> Model:
     # MLP body
     for i in range(2, len(hidden_units)):
         dropout_idx = min(i + 2, len(dropout_rates) - 1)
-        x = layers.Dense(hidden_units[i], name=f'main_dense{i-1}')(x)
+        x = layers.Dense(hidden_units[i], kernel_regularizer=reg, name=f'main_dense{i-1}')(x)
         x = layers.BatchNormalization(name=f'main_bn{i-1}')(x)
         x = layers.Activation('swish', name=f'main_act{i-1}')(x)
         x = layers.Dropout(dropout_rates[dropout_idx], name=f'main_dropout{i-1}')(x)
@@ -108,12 +113,16 @@ def build_ae_mlp_model(params: dict) -> Model:
 
     model = Model(inputs=inp, outputs=[decoder, out_ae, out], name='AE_MLP')
 
+    # Use mixed IC+MSE loss for action output when ic_loss_weight > 0
+    from models.deep.ic_loss_utils import make_mixed_ic_mse_loss
+    action_loss = make_mixed_ic_mse_loss(ic_loss_weight)
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr),
         loss={
             'decoder': 'mse',
             'ae_action': 'mse',
-            'action': 'mse',
+            'action': action_loss,
         },
         loss_weights=loss_weights,
     )

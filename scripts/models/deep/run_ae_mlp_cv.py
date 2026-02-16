@@ -118,6 +118,7 @@ from models.common import (
     compute_ic,
 )
 from models.deep.ae_mlp_shared import set_random_seed, create_tf_dataset, build_ae_mlp_model, setup_gpu
+from models.deep.ic_loss_utils import ICEarlyStoppingCallback
 
 
 def load_params_from_json(params_file: str) -> dict:
@@ -309,20 +310,21 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
         train_dataset = create_tf_dataset(X_train, y_train, batch_size, shuffle=True, prefetch=True)
         valid_dataset = create_tf_dataset(X_valid, y_valid, batch_size, shuffle=False, prefetch=True)
 
-        # 回调
-        cb_list = [
-            callbacks.EarlyStopping(
-                monitor='val_action_loss',
-                patience=args.cv_early_stop,
-                min_delta=1e-5,
-                restore_best_weights=True,
-                verbose=0,
-                mode='min'
-            ),
-        ]
+        # 回调: IC-based early stopping with warm-up
+        ic_cb = ICEarlyStoppingCallback(
+            X_valid=X_valid,
+            y_valid=y_valid,
+            valid_index=valid_index,
+            primary_output_idx=2,  # 'action' output
+            patience=args.cv_early_stop,
+            batch_size=batch_size,
+            min_epochs=args.min_epochs,
+            verbose=0,
+        )
+        cb_list = [ic_cb]
 
         # 训练
-        history = model.fit(
+        model.fit(
             train_dataset,
             validation_data=valid_dataset,
             epochs=args.cv_epochs,
@@ -330,11 +332,9 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
             verbose=1 if args.verbose else 0,
         )
 
-        # 验证集预测
+        # 验证集 IC (model has best weights restored by IC callback)
         _, _, valid_pred = model.predict(X_valid, batch_size=batch_size, verbose=0)
         valid_pred = valid_pred.flatten()
-
-        # 计算验证集 IC
         mean_ic, ic_std, icir = compute_ic(valid_pred, y_valid, valid_index)
 
         # ========== 2025 测试集评估 ==========
@@ -342,9 +342,7 @@ def run_cv_training(args, handler_config, symbols, params, use_mixed_precision=F
         test_pred = test_pred.flatten()
         test_ic, test_ic_std, test_icir = compute_ic(test_pred, y_test, test_index)
 
-        best_epoch = len(history.history['loss']) - args.cv_early_stop
-        if best_epoch < 1:
-            best_epoch = len(history.history['loss'])
+        best_epoch = ic_cb.best_epoch
 
         fold_ics.append(mean_ic)
         fold_test_ics.append(test_ic)
@@ -393,7 +391,7 @@ def train_final_model(args, handler_config, symbols, params, use_mixed_precision
     dataset = create_dataset_for_fold(handler, FINAL_TEST)
 
     X_train, y_train, _ = prepare_data_from_dataset(dataset, "train")
-    X_valid, y_valid, _ = prepare_data_from_dataset(dataset, "valid")
+    X_valid, y_valid, valid_index = prepare_data_from_dataset(dataset, "valid")
     X_test, _, test_index = prepare_data_from_dataset(dataset, "test")
 
     print(f"\n    Final training data:")
@@ -417,30 +415,33 @@ def train_final_model(args, handler_config, symbols, params, use_mixed_precision
 
     model = build_ae_mlp_model(final_params)
 
-    # 回调
-    cb_list = [
-        callbacks.EarlyStopping(
-            monitor='val_action_loss',
-            patience=args.early_stop,
-            min_delta=1e-5,
-            restore_best_weights=True,
-            verbose=1,
-            mode='min'
-        ),
-        callbacks.ReduceLROnPlateau(
-            monitor='val_action_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1,
-            mode='min'
-        ),
-    ]
-
     # 创建数据集
     batch_size = params['batch_size']
     train_dataset = create_tf_dataset(X_train, y_train, batch_size, shuffle=True, prefetch=True)
     valid_dataset = create_tf_dataset(X_valid, y_valid, batch_size, shuffle=False, prefetch=True)
+
+    # 回调: IC-based early stopping with warm-up + LR reduction
+    ic_cb = ICEarlyStoppingCallback(
+        X_valid=X_valid,
+        y_valid=y_valid,
+        valid_index=valid_index,
+        primary_output_idx=2,  # 'action' output
+        patience=args.early_stop,
+        batch_size=batch_size,
+        min_epochs=args.min_epochs,
+        verbose=1,
+    )
+    cb_list = [
+        ic_cb,
+        callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1,
+            mode='min',
+        ),
+    ]
 
     # 训练
     print("\n    Training progress:")
@@ -453,13 +454,11 @@ def train_final_model(args, handler_config, symbols, params, use_mixed_precision
     )
 
     # 验证集 IC
+    print(f"\n    [Validation Set - for reference]")
+    print(f"    Valid IC ({ic_cb.best_epoch}):   {ic_cb.best_ic:.4f} (from IC early stopping)")
     _, _, valid_pred = model.predict(X_valid, batch_size=batch_size, verbose=0)
     valid_pred = valid_pred.flatten()
-    valid_ic, valid_ic_std, valid_icir = compute_ic(
-        valid_pred, y_valid,
-        dataset.prepare("valid", col_set="feature", data_key=DataHandlerLP.DK_L).index
-    )
-    print(f"\n    [Validation Set - for reference]")
+    valid_ic, valid_ic_std, valid_icir = compute_ic(valid_pred, y_valid, valid_index)
     print(f"    Valid IC:   {valid_ic:.4f}")
     print(f"    Valid ICIR: {valid_icir:.4f}")
 
@@ -506,6 +505,14 @@ def main():
                         help='Random seed for reproducibility (try different seeds like 42, 123, 2024)')
     parser.add_argument('--num-seeds', type=int, default=1,
                         help='Run CV with multiple seeds and report best result (e.g., --num-seeds 5)')
+
+    # IC loss 参数
+    parser.add_argument('--ic-loss-weight', type=float, default=0.0,
+                        help='Weight for IC loss component on action output (0=pure MSE)')
+    parser.add_argument('--l2-reg', type=float, default=0.0,
+                        help='L2 regularization strength')
+    parser.add_argument('--min-epochs', type=int, default=5,
+                        help='Warm-up epochs before IC early stopping can trigger')
 
     # 最终训练参数
     parser.add_argument('--n-epochs', type=int, default=100,
@@ -599,6 +606,12 @@ def main():
     # 加载超参数
     params, original_cv_results = load_params_from_json(args.params_file)
 
+    # CLI overrides for IC loss and L2 reg
+    if args.ic_loss_weight > 0:
+        params['ic_loss_weight'] = args.ic_loss_weight
+    if args.l2_reg > 0:
+        params['l2_reg'] = args.l2_reg
+
     # 打印头部
     print("\n" + "=" * 70)
     print("AE-MLP Cross-Validation Training")
@@ -610,6 +623,11 @@ def main():
     print(f"CV Folds: {len(CV_FOLDS)}")
     print(f"GPU: {args.gpu}")
     print(f"Mixed precision: {'ON' if use_mixed_precision else 'OFF'}")
+    if params.get('ic_loss_weight', 0) > 0:
+        print(f"IC loss weight: {params['ic_loss_weight']}")
+    if params.get('l2_reg', 0) > 0:
+        print(f"L2 reg: {params['l2_reg']:.6f}")
+    print(f"Min epochs (warm-up): {args.min_epochs}")
     if args.num_seeds > 1:
         print(f"Num seeds: {args.num_seeds}")
     print("=" * 70)
