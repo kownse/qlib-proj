@@ -681,6 +681,171 @@ def train_final_model(args, handler_config, symbols, best_params, horizons, prim
     return model, test_pred, all_horizon_preds, dataset
 
 
+def train_cv_ensemble(args, handler_config, symbols, best_params, horizons, primary_horizon):
+    """用 4 个 CV fold 模型做 ensemble，在 test set 上取平均预测"""
+    print("\n[*] CV Ensemble: training fold models and averaging test predictions...")
+    print(f"    Horizons: {horizons}, Primary: {primary_horizon}d")
+    print(f"    Test period: {FINAL_TEST['test_start']} ~ {FINAL_TEST['test_end']}")
+    print(f"    Folds: {len(CV_FOLDS)}")
+
+    all_fold_test_preds = {}  # {fold_name: {horizon: pd.Series}}
+    fold_valid_ics = {}
+    last_dataset = None
+
+    for fold_idx, fold in enumerate(CV_FOLDS):
+        fold_name = fold['name']
+        print(f"\n    --- Fold {fold_idx+1}/{len(CV_FOLDS)}: {fold_name} ---")
+        print(f"    Train: {fold['train_start']} ~ {fold['train_end']}")
+        print(f"    Valid: {fold['valid_start']} ~ {fold['valid_end']}")
+
+        # 扩展 fold config 加入 test segment
+        fold_with_test = {
+            **fold,
+            'test_start': FINAL_TEST['test_start'],
+            'test_end': FINAL_TEST['test_end'],
+        }
+
+        handler = create_mh_data_handler_for_fold(
+            args, handler_config, symbols, fold_with_test, horizons, primary_horizon
+        )
+        dataset = create_dataset_for_fold(handler, fold_with_test)
+        last_dataset = dataset
+
+        X_train, y_train_dict, _ = prepare_mh_data_from_dataset(dataset, "train", horizons)
+        X_valid, y_valid_dict, valid_index = prepare_mh_data_from_dataset(dataset, "valid", horizons)
+        X_test, _, test_index = prepare_mh_data_from_dataset(dataset, "test", horizons)
+
+        print(f"    Train: {X_train.shape}, Valid: {X_valid.shape}, Test: {X_test.shape}")
+
+        best_params['num_columns'] = X_train.shape[1]
+
+        tf.keras.backend.clear_session()
+        model = build_mh_model(best_params)
+
+        # IC-based early stopping
+        primary_idx = 2 + horizons.index(primary_horizon)
+        ic_cb = ICEarlyStoppingCallback(
+            X_valid=X_valid,
+            y_valid=y_valid_dict[primary_horizon],
+            valid_index=valid_index,
+            primary_output_idx=primary_idx,
+            patience=args.early_stop,
+            batch_size=best_params['batch_size'],
+            verbose=0,
+        )
+        cb_list = [
+            ic_cb,
+            callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6, verbose=0, mode='min',
+            ),
+        ]
+
+        # 构建多输出训练数据
+        train_outputs = {'decoder': X_train, 'ae_action': y_train_dict[primary_horizon]}
+        valid_outputs = {'decoder': X_valid, 'ae_action': y_valid_dict[primary_horizon]}
+        for h in horizons:
+            train_outputs[f'action_{h}d'] = y_train_dict[h]
+            valid_outputs[f'action_{h}d'] = y_valid_dict[h]
+
+        model.fit(
+            X_train, train_outputs,
+            validation_data=(X_valid, valid_outputs),
+            epochs=args.n_epochs,
+            batch_size=best_params['batch_size'],
+            callbacks=cb_list,
+            verbose=0,
+        )
+
+        fold_valid_ics[fold_name] = ic_cb.best_ic
+
+        # Test 预测 (所有 horizons)
+        test_preds = model.predict(X_test, batch_size=best_params['batch_size'], verbose=0)
+
+        fold_preds = {}
+        for i, h in enumerate(horizons):
+            pred = test_preds[2 + i].flatten()
+            fold_preds[h] = pd.Series(pred, index=test_index, name=f'score_{h}d')
+
+        all_fold_test_preds[fold_name] = fold_preds
+        print(f"    Valid IC ({primary_horizon}d): {ic_cb.best_ic:.4f}, Best epoch: {ic_cb.best_epoch}")
+
+        del model
+        tf.keras.backend.clear_session()
+
+    # 平均 4 个 fold 的预测
+    ensemble_preds = {}
+    for h in horizons:
+        fold_series = [all_fold_test_preds[f['name']][h] for f in CV_FOLDS]
+        ensemble_preds[h] = pd.concat(fold_series, axis=1).mean(axis=1)
+        ensemble_preds[h].name = f'score_{h}d'
+
+    test_pred = ensemble_preds[primary_horizon].rename('score')
+
+    # Fold 间一致性分析
+    print(f"\n{'='*60}")
+    print("CV Ensemble Summary")
+    print(f"{'='*60}")
+
+    # 每个 fold 在 test set 上的 IC + 与 ensemble 的相关性
+    label_data = last_dataset.prepare("test", col_set="label")
+    if isinstance(label_data, pd.DataFrame) and isinstance(label_data.columns, pd.MultiIndex):
+        label_data.columns = [col[1] if isinstance(col, tuple) else col for col in label_data.columns]
+
+    ph_col = f'LABEL_{primary_horizon}d'
+    if isinstance(label_data, pd.DataFrame) and ph_col in label_data.columns:
+        label_series = label_data[ph_col]
+
+        for fold_name, fold_preds in all_fold_test_preds.items():
+            pred = fold_preds[primary_horizon]
+            pred_aligned = pred.reindex(label_data.index)
+            valid_idx = ~(pred_aligned.isna() | label_series.isna())
+            pred_clean = pred_aligned[valid_idx]
+            label_clean = label_series[valid_idx]
+
+            daily_ic = pred_clean.groupby(level="datetime").apply(
+                lambda x: x.corr(label_clean.loc[x.index]) if len(x) > 1 else np.nan
+            ).dropna()
+
+            fold_ic = daily_ic.mean() if len(daily_ic) > 0 else float('nan')
+            corr_with_ens = pred.corr(ensemble_preds[primary_horizon])
+            print(f"  {fold_name}: Valid IC={fold_valid_ics[fold_name]:.4f}, "
+                  f"Test IC({primary_horizon}d)={fold_ic:.4f}, "
+                  f"corr_with_ensemble={corr_with_ens:.3f}")
+
+        # Ensemble IC
+        ens_pred = ensemble_preds[primary_horizon].reindex(label_data.index)
+        valid_idx = ~(ens_pred.isna() | label_series.isna())
+        ens_clean = ens_pred[valid_idx]
+        label_clean = label_series[valid_idx]
+        daily_ic = ens_clean.groupby(level="datetime").apply(
+            lambda x: x.corr(label_clean.loc[x.index]) if len(x) > 1 else np.nan
+        ).dropna()
+        ens_ic = daily_ic.mean() if len(daily_ic) > 0 else float('nan')
+        ens_icir = daily_ic.mean() / daily_ic.std() if len(daily_ic) > 1 else float('nan')
+        print(f"\n  Ensemble: Test IC({primary_horizon}d)={ens_ic:.4f}, ICIR={ens_icir:.4f}")
+
+    # Inter-fold prediction correlation matrix
+    print(f"\n  Inter-fold prediction correlation ({primary_horizon}d):")
+    fold_names = [f['name'] for f in CV_FOLDS]
+    corr_data = pd.DataFrame({
+        name: all_fold_test_preds[name][primary_horizon]
+        for name in fold_names
+    })
+    corr_matrix = corr_data.corr()
+    # Print compact correlation matrix
+    header = "          " + "  ".join(f"{n[:8]:>8}" for n in fold_names)
+    print(f"  {header}")
+    for i, name in enumerate(fold_names):
+        row = f"  {name[:8]:>8}  " + "  ".join(
+            f"{corr_matrix.iloc[i, j]:8.3f}" for j in range(len(fold_names))
+        )
+        print(row)
+
+    print(f"{'='*60}")
+
+    return None, test_pred, ensemble_preds, last_dataset
+
+
 def evaluate_all_horizons(all_horizon_preds, dataset, horizons, primary_horizon):
     """评估所有 horizons 的 IC/ICIR"""
     print("\n[*] Evaluation (all horizons on test set)...")
@@ -763,6 +928,10 @@ def main():
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU device ID (-1 for CPU)')
 
+    # CV Ensemble
+    parser.add_argument('--cv-ensemble', action='store_true',
+                        help='Use CV fold models ensemble instead of single final model')
+
     # 回测参数
     parser.add_argument('--backtest', action='store_true')
     parser.add_argument('--topk', type=int, default=10)
@@ -792,6 +961,8 @@ def main():
     print(f"CV epochs: {args.cv_epochs}")
     print(f"CV Folds: {len(CV_FOLDS)}")
     print(f"GPU: {args.gpu}")
+    if args.cv_ensemble:
+        print(f"Mode: CV Ensemble (average {len(CV_FOLDS)} fold models)")
     print("=" * 70)
 
     init_qlib(handler_config['use_talib'])
@@ -853,20 +1024,27 @@ def main():
     history_df.to_csv(history_file, index=False)
     print(f"Search history saved to: {history_file}")
 
-    # 训练最终模型
-    model, test_pred, all_horizon_preds, dataset = train_final_model(
-        args, handler_config, symbols, best_params, horizons, primary_horizon
-    )
+    # 训练最终模型 / CV Ensemble
+    if args.cv_ensemble:
+        _, test_pred, all_horizon_preds, dataset = train_cv_ensemble(
+            args, handler_config, symbols, best_params, horizons, primary_horizon
+        )
+    else:
+        model, test_pred, all_horizon_preds, dataset = train_final_model(
+            args, handler_config, symbols, best_params, horizons, primary_horizon
+        )
 
     # 评估
     evaluate_all_horizons(all_horizon_preds, dataset, horizons, primary_horizon)
 
-    # 保存模型
-    print("\n[*] Saving model...")
-    MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
-    model_path = MODEL_SAVE_PATH / f"ae_mlp_mh_cv_{args.handler}_{args.stock_pool}_{horizons_str}.keras"
-    model.save(str(model_path))
-    print(f"    Model saved to: {model_path}")
+    # 保存模型 (only for single model, not ensemble)
+    model_path = None
+    if not args.cv_ensemble:
+        print("\n[*] Saving model...")
+        MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
+        model_path = MODEL_SAVE_PATH / f"ae_mlp_mh_cv_{args.handler}_{args.stock_pool}_{horizons_str}.keras"
+        model.save(str(model_path))
+        print(f"    Model saved to: {model_path}")
 
     # 回测
     if args.backtest:
@@ -881,25 +1059,35 @@ def main():
             'test_end': FINAL_TEST['test_end'],
         }
 
-        def load_model(path):
-            return keras.models.load_model(str(path))
+        if args.cv_ensemble:
+            ensemble_model_path = MODEL_SAVE_PATH / f"ae_mlp_mh_cv_ensemble_{args.handler}_{args.stock_pool}_{horizons_str}"
+            run_backtest(
+                ensemble_model_path, dataset, pred_df, args, time_splits,
+                model_name="MH-AE-MLP (CV Ensemble)",
+                load_model_func=lambda p: None,
+                get_feature_count_func=lambda m: "N/A (ensemble)",
+            )
+        else:
+            def load_model(path):
+                return keras.models.load_model(str(path))
 
-        def get_feature_count(m):
-            return m.input_shape[1]
+            def get_feature_count(m):
+                return m.input_shape[1]
 
-        run_backtest(
-            model_path, dataset, pred_df, args, time_splits,
-            model_name="MH-AE-MLP (CV Hyperopt)",
-            load_model_func=load_model,
-            get_feature_count_func=get_feature_count,
-        )
+            run_backtest(
+                model_path, dataset, pred_df, args, time_splits,
+                model_name="MH-AE-MLP (CV Hyperopt)",
+                load_model_func=load_model,
+                get_feature_count_func=get_feature_count,
+            )
 
     print("\n" + "=" * 70)
-    print("CV HYPEROPT COMPLETE (Multi-Horizon AE-MLP)")
+    print(f"CV HYPEROPT COMPLETE (Multi-Horizon AE-MLP{' - CV Ensemble' if args.cv_ensemble else ''})")
     print("=" * 70)
     print(f"Horizons: {horizons}, Primary: {primary_horizon}d")
     print(f"CV Mean IC: {best_trial['mean_ic']:.4f} (±{best_trial['std_ic']:.4f})")
-    print(f"Model saved to: {model_path}")
+    if model_path:
+        print(f"Model saved to: {model_path}")
     print(f"Best parameters: {params_file}")
     print("=" * 70)
 
