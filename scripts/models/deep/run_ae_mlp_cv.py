@@ -489,6 +489,8 @@ def main():
 
     # 基础参数
     parser.add_argument('--nday', type=int, default=5)
+    parser.add_argument('--train-start', type=str, default=None,
+                        help='Override training start date for all folds (e.g., 2015-01-01)')
     parser.add_argument('--handler', type=str, default='alpha158-talib-macro',
                         choices=list(HANDLER_CONFIG.keys()))
     parser.add_argument('--stock-pool', type=str, default='sp500',
@@ -538,6 +540,13 @@ def main():
                         choices=['topk', 'dynamic_risk', 'vol_stoploss'])
 
     args = parser.parse_args()
+
+    # 覆盖训练起始日期
+    if args.train_start:
+        print(f"[*] Overriding train_start to {args.train_start} for all folds")
+        for fold in CV_FOLDS:
+            fold['train_start'] = args.train_start
+        FINAL_TEST['train_start'] = args.train_start
 
     # 验证参数
     if args.eval_only and not args.model_path:
@@ -623,6 +632,8 @@ def main():
     print(f"CV Folds: {len(CV_FOLDS)}")
     print(f"GPU: {args.gpu}")
     print(f"Mixed precision: {'ON' if use_mixed_precision else 'OFF'}")
+    if args.train_start:
+        print(f"Train start override: {args.train_start}")
     if params.get('ic_loss_weight', 0) > 0:
         print(f"IC loss weight: {params['ic_loss_weight']}")
     if params.get('l2_reg', 0) > 0:
