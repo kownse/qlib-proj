@@ -33,6 +33,8 @@ from datetime import datetime
 from daily_trading_common import (
     PROJECT_ROOT,
     add_common_trading_args,
+    add_strategy_args,
+    build_optimizer_params,
     download_data,
     init_qlib_for_talib,
     create_dataset_for_trading,
@@ -116,20 +118,8 @@ def main():
     parser.add_argument('--cb-weight', type=float, default=0.350,
                         help='CatBoost weight (default: 0.350)')
 
-    # Strategy parameters
-    parser.add_argument('--strategy', type=str, default='topk',
-                        choices=['topk', 'mvo', 'rp', 'gmv', 'inv'],
-                        help='Trading strategy (default: topk)')
-    parser.add_argument('--opt-lamb', type=float, default=15.0,
-                        help='[mvo] Risk aversion (default: 15.0)')
-    parser.add_argument('--opt-delta', type=float, default=0.2,
-                        help='[mvo/rp/gmv] Max turnover per rebalance (default: 0.2)')
-    parser.add_argument('--opt-alpha', type=float, default=0.05,
-                        help='[mvo/rp/gmv] L2 regularization (default: 0.05)')
-    parser.add_argument('--cov-lookback', type=int, default=60,
-                        help='[mvo/rp/gmv/inv] Covariance lookback days (default: 60)')
-    parser.add_argument('--max-weight', type=float, default=0.30,
-                        help='[mvo/rp/gmv/inv] Max weight per stock (default: 0.30)')
+    # Strategy + dynamic risk parameters
+    add_strategy_args(parser)
 
     # AI affinity filter
     parser.add_argument('--ai-filter', type=str, default='none',
@@ -193,6 +183,9 @@ def main():
     print(f"Account: ${args.account:,.2f}")
     print(f"Top-K: {args.topk}")
     print(f"Backtest Start: {args.backtest_start}")
+    if args.dynamic_risk:
+        print(f"Dynamic Risk: ENABLED (VIX thresholds: {args.vix_threshold_medium}/{args.vix_threshold_high}, "
+              f"risk: {args.risk_degree_medium_vix:.0%}/{args.risk_degree_high_vix:.0%})")
     print("=" * 70)
 
     # Step 1: 下载数据
@@ -321,16 +314,7 @@ def main():
             file_prefix="ensemble_v4",
         )
     else:
-        # Build optimizer params if using portfolio optimization strategy
-        optimizer_params = None
-        if args.strategy in ('mvo', 'rp', 'gmv', 'inv'):
-            optimizer_params = {
-                "lamb": args.opt_lamb,
-                "delta": args.opt_delta,
-                "alpha": args.opt_alpha,
-                "cov_lookback": args.cov_lookback,
-                "max_weight": args.max_weight,
-            }
+        optimizer_params = build_optimizer_params(args)
 
         trading_details = run_ensemble_backtest(
             pred_ensemble=pred_ensemble,

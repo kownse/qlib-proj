@@ -1106,6 +1106,52 @@ def run_ensemble_backtest(
 # Common Argparse
 # ============================================================================
 
+def add_strategy_args(parser: argparse.ArgumentParser) -> None:
+    """Add strategy, optimizer, and dynamic risk CLI args shared by all ensemble scripts."""
+    parser.add_argument('--strategy', type=str, default='topk',
+                        choices=['topk', 'mvo', 'rp', 'gmv', 'inv'],
+                        help='Trading strategy (default: topk)')
+    parser.add_argument('--opt-lamb', type=float, default=15.0,
+                        help='[mvo] Risk aversion (default: 15.0)')
+    parser.add_argument('--opt-delta', type=float, default=0.2,
+                        help='[mvo/rp/gmv] Max turnover per rebalance (default: 0.2)')
+    parser.add_argument('--opt-alpha', type=float, default=0.05,
+                        help='[mvo/rp/gmv] L2 regularization (default: 0.05)')
+    parser.add_argument('--cov-lookback', type=int, default=60,
+                        help='[mvo/rp/gmv/inv] Covariance lookback days (default: 60)')
+    parser.add_argument('--max-weight', type=float, default=0.30,
+                        help='[mvo/rp/gmv/inv] Max weight per stock (default: 0.30)')
+    # Dynamic risk (market regime filter)
+    parser.add_argument('--dynamic-risk', action='store_true',
+                        help='Enable dynamic cash allocation based on VIX regime')
+    parser.add_argument('--vix-threshold-high', type=float, default=30.0,
+                        help='VIX level for HIGH_FEAR regime (default: 30.0)')
+    parser.add_argument('--vix-threshold-medium', type=float, default=20.0,
+                        help='VIX level for ELEVATED regime (default: 20.0)')
+    parser.add_argument('--risk-degree-high-vix', type=float, default=0.60,
+                        help='Capital deployment in HIGH_FEAR (default: 0.60)')
+    parser.add_argument('--risk-degree-medium-vix', type=float, default=0.80,
+                        help='Capital deployment in ELEVATED (default: 0.80)')
+
+
+def build_optimizer_params(args) -> dict:
+    """Build optimizer_params dict from parsed args. Returns None if strategy is topk."""
+    if args.strategy not in ('mvo', 'rp', 'gmv', 'inv'):
+        return None
+    return {
+        "lamb": args.opt_lamb,
+        "delta": args.opt_delta,
+        "alpha": args.opt_alpha,
+        "cov_lookback": args.cov_lookback,
+        "max_weight": args.max_weight,
+        "dynamic_risk": args.dynamic_risk,
+        "vix_threshold_high": args.vix_threshold_high,
+        "vix_threshold_medium": args.vix_threshold_medium,
+        "risk_degree_high_vix": args.risk_degree_high_vix,
+        "risk_degree_medium_vix": args.risk_degree_medium_vix,
+    }
+
+
 def add_common_trading_args(parser: argparse.ArgumentParser) -> None:
     """添加所有 trading 脚本共享的参数"""
     parser.add_argument('--skip-download', action='store_true',
