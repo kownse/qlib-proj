@@ -139,6 +139,18 @@ def main():
     parser.add_argument('--max-weight', type=float, default=0.30,
                         help='[mvo/rp/gmv/inv] Max weight per stock (default: 0.30)')
 
+    # Dynamic risk (market regime filter)
+    parser.add_argument('--dynamic-risk', action='store_true',
+                        help='Enable dynamic cash allocation based on VIX regime')
+    parser.add_argument('--vix-threshold-high', type=float, default=30.0,
+                        help='VIX level for HIGH_FEAR regime (default: 30.0)')
+    parser.add_argument('--vix-threshold-medium', type=float, default=20.0,
+                        help='VIX level for ELEVATED regime (default: 20.0)')
+    parser.add_argument('--risk-degree-high-vix', type=float, default=0.60,
+                        help='Capital deployment in HIGH_FEAR (default: 0.60)')
+    parser.add_argument('--risk-degree-medium-vix', type=float, default=0.80,
+                        help='Capital deployment in ELEVATED (default: 0.80)')
+
     # AI affinity filter
     parser.add_argument('--ai-filter', type=str, default='none',
                         choices=['none', 'penalty', 'exclude'],
@@ -209,6 +221,9 @@ def main():
     print(f"Account: ${args.account:,.2f}")
     print(f"Top-K: {args.topk}")
     print(f"Backtest Start: {args.backtest_start}")
+    if args.dynamic_risk:
+        print(f"Dynamic Risk: ENABLED (VIX thresholds: {args.vix_threshold_medium}/{args.vix_threshold_high}, "
+              f"risk: {args.risk_degree_medium_vix:.0%}/{args.risk_degree_high_vix:.0%})")
     print("=" * 70)
 
     # Step 1: 下载数据
@@ -346,6 +361,11 @@ def main():
                 "alpha": args.opt_alpha,
                 "cov_lookback": args.cov_lookback,
                 "max_weight": args.max_weight,
+                "dynamic_risk": args.dynamic_risk,
+                "vix_threshold_high": args.vix_threshold_high,
+                "vix_threshold_medium": args.vix_threshold_medium,
+                "risk_degree_high_vix": args.risk_degree_high_vix,
+                "risk_degree_medium_vix": args.risk_degree_medium_vix,
             }
 
         trading_details = run_ensemble_backtest(

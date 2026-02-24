@@ -1083,11 +1083,11 @@ def run_ensemble_backtest(
 
         # 输出每日详细交易信息
         print(f"\n{'='*70}")
-        print("DAILY TRADING DETAILS (Last 10 days)")
+        print("DAILY TRADING DETAILS (Last 20 days)")
         print(f"{'='*70}")
 
         all_trading_details = collect_trading_details_from_positions(positions, report_df)
-        print_trading_details(all_trading_details, show_last_n=10)
+        print_trading_details(all_trading_details, show_last_n=20)
 
         # 保存报告
         output_dir = PROJECT_ROOT / "outputs"

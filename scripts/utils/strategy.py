@@ -685,6 +685,13 @@ class OptimizedWeightStrategy:
         risk_degree=0.95,
         max_weight=0.0,
         n_drop=None,
+        dynamic_risk=False,
+        vix_csv_path=None,
+        vix_threshold_high=30.0,
+        vix_threshold_medium=20.0,
+        risk_degree_high_vix=0.60,
+        risk_degree_medium_vix=0.80,
+        market_proxy="SPY",
     ):
         """
         Create a WeightStrategyBase subclass with portfolio optimization.
@@ -714,6 +721,20 @@ class OptimizedWeightStrategy:
             Max number of positions to replace per rebalance.
             When set and holdings exist, keeps top (topk - n_drop) current
             holdings and fills n_drop slots with new best-scoring stocks.
+        dynamic_risk : bool
+            Enable dynamic cash allocation based on market regime (default: False)
+        vix_csv_path : str, optional
+            Path to VIX CSV. Auto-detected from my_data/macro_csv/VIX.csv if None.
+        vix_threshold_high : float
+            VIX level for HIGH_FEAR regime (default: 30.0)
+        vix_threshold_medium : float
+            VIX level for ELEVATED regime (default: 20.0)
+        risk_degree_high_vix : float
+            Capital deployment in HIGH_FEAR (default: 0.60)
+        risk_degree_medium_vix : float
+            Capital deployment in ELEVATED (default: 0.80)
+        market_proxy : str
+            Ticker for SPY-based fallback volatility (default: "SPY")
 
         Returns
         -------
@@ -734,6 +755,13 @@ class OptimizedWeightStrategy:
         _risk_degree = risk_degree
         _max_weight = max_weight
         _n_drop = n_drop
+        _dynamic_risk = dynamic_risk
+        _vix_csv_path = vix_csv_path
+        _vix_threshold_high = vix_threshold_high
+        _vix_threshold_medium = vix_threshold_medium
+        _risk_degree_high_vix = risk_degree_high_vix
+        _risk_degree_medium_vix = risk_degree_medium_vix
+        _market_proxy = market_proxy
 
         class OptimizedWeightStrategyImpl(WeightStrategyBase):
             def __init__(self, *, topk=30, rebalance_freq=1, **kwargs):
@@ -744,6 +772,13 @@ class OptimizedWeightStrategy:
                 print(f"[MVO-INIT] OptimizedWeightStrategyImpl created: topk={topk}, rebalance_freq={_rebalance_freq}, method={_opt_method}, n_drop={_n_drop}")
                 self._risk_degree = _risk_degree
                 self._max_weight = _max_weight
+                self._dynamic_risk = _dynamic_risk
+                self._vix_df = None
+                self._regime_cache = {}
+                self._prev_regime = None
+                if self._dynamic_risk:
+                    print(f"[MVO-Regime] Dynamic risk ENABLED: VIX thresholds={_vix_threshold_medium}/{_vix_threshold_high}, "
+                          f"risk_degrees={_risk_degree_medium_vix:.0%}/{_risk_degree_high_vix:.0%}")
                 self._optimizer = PortfolioOptimizer(
                     method=_opt_method,
                     lamb=_lamb,
@@ -754,8 +789,151 @@ class OptimizedWeightStrategy:
                 self._cov_lookback = _cov_lookback
                 self._prev_weights = {}
 
+            def _load_vix_data(self):
+                """Load VIX CSV data once, cache as DataFrame."""
+                if self._vix_df is not None:
+                    return self._vix_df
+
+                from pathlib import Path
+                vix_path = _vix_csv_path
+                if vix_path is None:
+                    # Auto-detect from project root
+                    candidates = [
+                        Path(__file__).resolve().parent.parent / "my_data" / "macro_csv" / "VIX.csv",
+                        Path(__file__).resolve().parent.parent.parent / "my_data" / "macro_csv" / "VIX.csv",
+                        Path("my_data/macro_csv/VIX.csv"),
+                    ]
+                    for p in candidates:
+                        if p.exists():
+                            vix_path = str(p)
+                            break
+
+                if vix_path is None or not Path(vix_path).exists():
+                    print("[MVO-Regime] VIX CSV not found, will use SPY volatility fallback")
+                    self._vix_df = pd.DataFrame()
+                    return self._vix_df
+
+                try:
+                    df = pd.read_csv(vix_path)
+                    df.columns = [c.lower().strip() for c in df.columns]
+                    if "date" in df.columns:
+                        df["date"] = pd.to_datetime(df["date"])
+                        df = df.set_index("date")
+                    else:
+                        df.index = pd.to_datetime(df.index)
+                    if "close" in df.columns:
+                        self._vix_df = df[["close"]].rename(columns={"close": "vix"}).sort_index()
+                    elif "adj_close" in df.columns:
+                        self._vix_df = df[["adj_close"]].rename(columns={"adj_close": "vix"}).sort_index()
+                    else:
+                        self._vix_df = df.iloc[:, -1:].rename(columns={df.columns[-1]: "vix"}).sort_index()
+                    self._vix_df = self._vix_df.dropna()
+                    print(f"[MVO-Regime] VIX data loaded: {self._vix_df.index[0].strftime('%Y-%m-%d')} to "
+                          f"{self._vix_df.index[-1].strftime('%Y-%m-%d')} ({len(self._vix_df)} days)")
+                except Exception as e:
+                    print(f"[MVO-Regime] Failed to load VIX CSV: {e}")
+                    self._vix_df = pd.DataFrame()
+
+                return self._vix_df
+
+            def _get_vix_level(self, trade_date):
+                """Get VIX close for trade_date (most recent available on or before)."""
+                date_key = str(trade_date)[:10]
+                if date_key in self._regime_cache:
+                    return self._regime_cache[date_key]
+
+                vix_df = self._load_vix_data()
+                if vix_df.empty:
+                    return None
+
+                ts = pd.Timestamp(trade_date)
+                # Get most recent VIX on or before trade_date
+                mask = vix_df.index <= ts
+                if mask.any():
+                    vix_val = float(vix_df.loc[mask, "vix"].iloc[-1])
+                    self._regime_cache[date_key] = vix_val
+                    return vix_val
+                return None
+
+            def _get_spy_volatility(self, trade_date):
+                """Fallback: get SPY 20-day annualized realized vol via D.features()."""
+                date_key = f"spy_vol_{str(trade_date)[:10]}"
+                if date_key in self._regime_cache:
+                    return self._regime_cache[date_key]
+
+                try:
+                    lookback = 20
+                    start_date = pd.Timestamp(trade_date) - pd.Timedelta(days=lookback * 2)
+                    proxies = [_market_proxy, "AAPL", "MSFT", "GOOGL"]
+                    data = pd.DataFrame()
+                    for proxy in proxies:
+                        data = D.features(
+                            [proxy], ["$close"],
+                            start_time=start_date,
+                            end_time=trade_date
+                        )
+                        if not data.empty and len(data) >= lookback:
+                            break
+
+                    if data.empty or len(data) < lookback:
+                        return 0.20
+
+                    close = data.iloc[:, 0].dropna().tail(lookback)
+                    if len(close) < 5:
+                        return 0.20
+
+                    returns = close.pct_change().dropna()
+                    daily_vol = returns.std()
+                    annual_vol = daily_vol * np.sqrt(252)
+
+                    self._regime_cache[date_key] = annual_vol
+                    return annual_vol
+                except Exception:
+                    return 0.20
+
             def get_risk_degree(self, trade_step=None):
-                return self._risk_degree
+                if not self._dynamic_risk:
+                    return self._risk_degree
+
+                try:
+                    trade_date, _ = self.trade_calendar.get_step_time(trade_step)
+                except Exception:
+                    return self._risk_degree
+
+                # Try VIX first
+                vix = self._get_vix_level(trade_date)
+                if vix is not None:
+                    if vix >= _vix_threshold_high:
+                        regime = "HIGH_FEAR"
+                        rd = _risk_degree_high_vix
+                    elif vix >= _vix_threshold_medium:
+                        regime = "ELEVATED"
+                        rd = _risk_degree_medium_vix
+                    else:
+                        regime = "NORMAL"
+                        rd = self._risk_degree
+                    if regime != self._prev_regime:
+                        print(f"[MVO-Regime] {str(trade_date)[:10]} | VIX={vix:.1f} | "
+                              f"regime={regime} | risk_degree={rd:.0%}")
+                        self._prev_regime = regime
+                    return rd
+
+                # Fallback to SPY realized volatility
+                annual_vol = self._get_spy_volatility(trade_date)
+                if annual_vol >= 0.35:
+                    regime = "HIGH_FEAR"
+                    rd = _risk_degree_high_vix
+                elif annual_vol >= 0.25:
+                    regime = "ELEVATED"
+                    rd = _risk_degree_medium_vix
+                else:
+                    regime = "NORMAL"
+                    rd = self._risk_degree
+                if regime != self._prev_regime:
+                    print(f"[MVO-Regime] {str(trade_date)[:10]} | SPY_vol={annual_vol:.1%} | "
+                          f"regime={regime} | risk_degree={rd:.0%}")
+                    self._prev_regime = regime
+                return rd
 
             def generate_trade_decision(self, execute_result=None):
                 trade_step = self.trade_calendar.get_trade_step()
@@ -1100,6 +1278,13 @@ def get_strategy_config(
             risk_degree=params.get("risk_degree", 0.95),
             max_weight=params.get("max_weight", 0.0),
             n_drop=n_drop,
+            dynamic_risk=params.get("dynamic_risk", False),
+            vix_csv_path=params.get("vix_csv_path", None),
+            vix_threshold_high=params.get("vix_threshold_high", 30.0),
+            vix_threshold_medium=params.get("vix_threshold_medium", 20.0),
+            risk_degree_high_vix=params.get("risk_degree_high_vix", 0.60),
+            risk_degree_medium_vix=params.get("risk_degree_medium_vix", 0.80),
+            market_proxy=params.get("market_proxy", "SPY"),
         )
         return {
             "class": OptStrategy,

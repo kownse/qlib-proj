@@ -210,6 +210,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 Enhanced V7 (~40 features: expanded stock + macro)',
         'use_talib': True,
     },
+    'alpha158-enhanced-v7-sr': {
+        'module': 'data.datahandler_enhanced_v7_sector_relative',
+        'class_name': 'Alpha158_Enhanced_V7_SectorRelative',
+        'description': 'Alpha158 Enhanced V7 + sector-relative (~49 features)',
+        'use_talib': True,
+    },
     'alpha158-enhanced-v7-mh': {
         'module': 'data.datahandler_enhanced_v7',
         'class_name': 'Alpha158_Enhanced_V7_MultiHorizon',
