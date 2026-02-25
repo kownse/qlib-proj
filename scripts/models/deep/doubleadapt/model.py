@@ -16,12 +16,10 @@ import pandas as pd
 import torch
 from torch import optim, nn
 import torch.nn.functional as F
-import higher
 
-from .higher_optim import DifferentiableOptimizer  # noqa: F401 - monkey-patches higher
 from .net import (
     ForecastModelFiLM, DoubleAdaptFiLM,
-    override_state, has_rnn,
+    has_rnn,
 )
 
 from tqdm import tqdm
@@ -129,6 +127,7 @@ class IncrementalManager:
 
         self.phase = phase
         for i in (tqdm(indices, desc=phase) if tqdm_show else indices):
+            torch.cuda.empty_cache()
             meta_input = task_list[i]
             if not isinstance(meta_input['X_train'], torch.Tensor):
                 meta_input = {
@@ -278,8 +277,11 @@ class DoubleAdaptFiLMManager(IncrementalManager):
     def _run_task(self, meta_input, phase):
         """Single DoubleAdapt + FiLM meta-learning task.
 
-        Inner loop: adapt backbone (GRU + FiLM) on support set
-        Outer loop: update meta-learners (FeatureAdapter + LabelAdapter) on query set
+        Uses manual first-order MAML (no higher library) for memory efficiency:
+        1. Save original backbone weights
+        2. Inner loop: one gradient step on support set
+        3. Outer loop: compute loss on query set with adapted weights
+        4. Update meta-params, restore + update original weights
         """
         self.framework.opt.zero_grad()
         self.opt.zero_grad()
@@ -289,27 +291,34 @@ class DoubleAdaptFiLMManager(IncrementalManager):
         if macro_train is not None:
             macro_train = macro_train.to(self.framework.device)
 
-        # Inner loop: adapt backbone with higher
-        with higher.innerloop_ctx(
-            self.framework.model,
-            self.framework.opt,
-            copy_initial_weights=False,
-            track_higher_grads=not self.first_order,
-            override={'lr': [self.lr_model]},
-        ) as (fmodel, diffopt):
-            with torch.backends.cudnn.flags(enabled=self.first_order or not self.has_rnn):
-                y_hat, _ = self.framework(
-                    X, macro=macro_train, model=fmodel, transform=self.adapt_x,
-                )
+        # Save original backbone weights
+        orig_state = {k: v.clone() for k, v in self.framework.model.state_dict().items()}
 
-            y = meta_input["y_train"].to(self.framework.device)
-            if self.adapt_y:
-                raw_y = y
-                y = self.framework.teacher_y(X, raw_y, inverse=False)
-            loss2 = self.framework.criterion(y_hat, y)
-            diffopt.step(loss2)
+        # === Inner loop: one gradient step on support set ===
+        y_hat, X_adapted = self.framework(
+            X, macro=macro_train, model=None, transform=self.adapt_x,
+        )
+        y = meta_input["y_train"].to(self.framework.device)
+        if self.adapt_y:
+            raw_y = y
+            y = self.framework.teacher_y(X, raw_y, inverse=False)
 
-        # Outer loop: evaluate on query set
+        inner_loss = self.framework.criterion(y_hat, y)
+
+        # Manual gradient step on backbone only
+        backbone_params = list(self.framework.model.parameters())
+        grads = torch.autograd.grad(
+            inner_loss, backbone_params, create_graph=False, allow_unused=True,
+        )
+        with torch.no_grad():
+            for param, grad in zip(backbone_params, grads):
+                if grad is not None:
+                    param.data -= self.lr_model * grad
+
+        del y_hat, inner_loss, grads
+        macro_train = None
+
+        # === Outer loop: evaluate on query set with adapted backbone ===
         X_test = meta_input["X_test"].to(self.framework.device)
         y_test = meta_input["y_test"].to(self.framework.device)
         macro_test = meta_input.get("macro_test")
@@ -317,7 +326,7 @@ class DoubleAdaptFiLMManager(IncrementalManager):
             macro_test = macro_test.to(self.framework.device)
 
         pred, X_test_adapted = self.framework(
-            X_test, macro=macro_test, model=fmodel, transform=self.adapt_x,
+            X_test, macro=macro_test, model=None, transform=self.adapt_x,
         )
         if self.adapt_y:
             pred = self.framework.teacher_y(X_test, pred, inverse=True)
@@ -336,34 +345,39 @@ class DoubleAdaptFiLMManager(IncrementalManager):
 
         # Meta-learner optimization
         if len(y_test) == 0:
-            self.framework.model.load_state_dict(fmodel.state_dict())
-            self.framework.opt.state = override_state(
-                self.framework.opt.param_groups, diffopt
-            )
+            # No query data, keep adapted weights
             return output
 
         loss = self.framework.criterion(pred, y_test)
 
         if self.adapt_y:
-            if not self.first_order:
-                y = self.framework.teacher_y(X, raw_y, inverse=False)
             loss_y = F.mse_loss(y, raw_y)
-            if self.first_order:
-                # First-order MAML approximation (Appendix C of DoubleAdapt paper)
-                with torch.no_grad():
-                    pred2, _ = self.framework(
-                        X_test_adapted, macro=macro_test, model=None, transform=False,
-                    )
-                    pred2 = self.framework.teacher_y(X_test, pred2, inverse=True).detach()
-                    loss_old = self.framework.criterion(pred2.view_as(y_test), y_test)
-                loss_y = (loss_old.item() - loss.item()) / self.sigma * loss_y + loss_y * self.reg
-            else:
-                loss_y = loss_y * self.reg
+            # First-order approximation: compare adapted vs original model
+            with torch.no_grad():
+                pred2, _ = self.framework(
+                    X_test_adapted, macro=macro_test, model=None, transform=False,
+                )
+                pred2 = self.framework.teacher_y(X_test, pred2, inverse=True).detach()
+                loss_old = self.framework.criterion(pred2.view_as(y_test), y_test)
+            loss_y = (loss_old.item() - loss.item()) / self.sigma * loss_y + loss_y * self.reg
             loss_y.backward()
 
         loss.backward()
         if self.adapt_x or self.adapt_y:
             self.opt.step()
+
+        # Restore original weights and apply outer loop gradient
+        # The gradients on backbone params come from outer loss
+        # We need to: restore original weights, then apply the accumulated gradients
+        backbone_grads = {
+            k: p.grad.clone() if p.grad is not None else None
+            for k, p in zip(orig_state.keys(), backbone_params)
+        }
+        self.framework.model.load_state_dict(orig_state)
+        # Re-attach saved gradients to restored params
+        for param, (k, grad) in zip(backbone_params, backbone_grads.items()):
+            param.grad = grad
         self.framework.opt.step()
 
+        del orig_state, backbone_grads
         return output
