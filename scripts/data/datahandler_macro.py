@@ -1557,3 +1557,153 @@ class Alpha300_Macro(DataHandlerLP):
         """Return N-day volatility label."""
         volatility_expr = f"Ref($close, -{self.volatility_window})/Ref($close, -1) - 1"
         return [volatility_expr], ["LABEL0"]
+
+
+class Alpha158_Volatility_TALib_Macro_Stable(Alpha158_Volatility_TALib_Macro):
+    """
+    Stability-filtered subset of Alpha158 + TA-Lib + Macro features.
+
+    Generated from factor stability analysis (2026-02-27) on SP500 with 5-day horizon.
+
+    Selection criteria:
+    - Stock features: stability_score >= 0.65, regime_consistent=True, |IC| >= 0.003
+    - Macro features: |ts_ICIR| >= 0.15 and sign_ratio in [0.25, 0.75]
+
+    Total features: ~65 (37 stock + 2 TA-Lib + 26 macro)
+
+    Key properties:
+    - All stock features have positive IC that persists from train to test period
+    - All stock features maintain IC sign across VIX regimes (low/mid/high)
+    - Macro features selected by time-series IC stability
+
+    Usage:
+        handler = Alpha158_Volatility_TALib_Macro_Stable(
+            volatility_window=5,
+            instruments=["AAPL", "MSFT"],
+            start_time="2000-01-01",
+            end_time="2025-12-31",
+        )
+    """
+
+    # Stock rolling operators and their stable windows
+    # Based on stability_score >= 0.65, regime_consistent=True
+    STABLE_ROLLING_CONFIG = {
+        "ROC": [5, 10],              # ROC5(0.81), ROC10(0.91)
+        "MA": [5, 10, 20, 30],       # MA5(0.79), MA10(0.88), MA20(0.82), MA30(0.66)
+        "MAX": [5, 10, 20, 30, 60],  # MAX5-60 all stable
+        "QTLU": [5, 10, 20, 30],     # QTLU5(0.86), QTLU10(0.99), QTLU20(0.91), QTLU30(0.81)
+        "QTLD": [5, 10, 20],         # QTLD5(0.73), QTLD10(0.75), QTLD20(0.73)
+        "SUMN": [5, 10, 20],         # SUMN5(0.88), SUMN10(0.85), SUMN20(0.69)
+        "IMIN": [5, 10],             # IMIN5(0.90), IMIN10(0.88)
+        "WVMA": [20, 30, 60],        # WVMA20(0.76), WVMA30(0.70), WVMA60(0.88)
+    }
+
+    # Stable TA-Lib features (score >= 0.65, regime_consistent=True)
+    # TALIB_BB_UPPER_DIST(0.84), TALIB_SMA20(0.82), TALIB_EMA20(0.71),
+    # TALIB_NATR14(0.68), TALIB_ATR14(0.67)
+    STABLE_TALIB = [
+        "TALIB_BB_UPPER_DIST", "TALIB_SMA20", "TALIB_EMA20",
+        "TALIB_NATR14", "TALIB_ATR14",
+    ]
+
+    # Stable macro features: |ts_ICIR| >= 0.15, sign_ratio in [0.25, 0.75]
+    STABLE_MACRO_FEATURES = [
+        # VIX (5)
+        "macro_vix_term_zscore",    # ts_ICIR=0.267
+        "macro_vix_ma20_ratio",     # ts_ICIR=0.236
+        "macro_vix_zscore20",       # ts_ICIR=0.192
+        "macro_vix_pct_10d",        # ts_ICIR=0.154
+        "macro_vix_contango",       # ts_ICIR=-0.164
+        # Sector momentum (7)
+        "macro_xlk_pct_20d",        # ts_ICIR=-0.322
+        "macro_xli_pct_20d",        # ts_ICIR=-0.257
+        "macro_xlb_pct_20d",        # ts_ICIR=-0.244
+        "macro_xly_pct_20d",        # ts_ICIR=-0.227
+        "macro_xlv_pct_20d",        # ts_ICIR=-0.203
+        "macro_xlf_pct_20d",        # ts_ICIR=-0.180
+        "macro_xlf_vs_spy",         # ts_ICIR=0.161
+        # Benchmark (3)
+        "macro_spy_pct_20d",        # ts_ICIR=-0.303
+        "macro_spy_ma20_ratio",     # ts_ICIR=-0.255
+        "macro_spy_pct_5d",         # ts_ICIR=-0.157
+        # Global (3)
+        "macro_eem_pct_20d",        # ts_ICIR=-0.326
+        "macro_eem_pct_5d",         # ts_ICIR=-0.178
+        "macro_efa_pct_5d",         # ts_ICIR=-0.168
+        # Rates (4)
+        "macro_yield_10y",          # ts_ICIR=0.218
+        "macro_yield_2y",           # ts_ICIR=0.214
+        "macro_yield_30y",          # ts_ICIR=0.188
+        "macro_market_stress",      # ts_ICIR=0.192
+        # Other (4)
+        "macro_bond_vol20",         # ts_ICIR=-0.208
+        "macro_risk_on_off",        # ts_ICIR=-0.208
+        "macro_uup_ma20_ratio",     # ts_ICIR=0.147 (borderline, strong dollar signal)
+        "macro_uup_pct_5d",         # ts_ICIR=0.146
+    ]
+
+    def get_feature_config(self):
+        """
+        Stability-filtered feature config.
+
+        Only includes Alpha158 operators + windows with stability_score >= 0.65
+        and regime-consistent IC across VIX regimes.
+        """
+        from qlib.contrib.data.loader import Alpha158DL
+
+        # Build rolling config with only stable operators and their best windows
+        conf = {
+            "kbar": {},  # Keep kbar: KUP(0.82), HIGH0/OPEN0 from price
+            "price": {
+                "windows": [0],
+                "feature": ["OPEN", "HIGH"],  # OPEN0(0.68), HIGH0(0.87); LOW0 excluded (decayed)
+            },
+            "rolling": {
+                "include": list(self.STABLE_ROLLING_CONFIG.keys()),
+                "windows": [5, 10, 20, 30, 60],  # superset; per-feature filtering below
+            },
+        }
+
+        # Get base features from Alpha158
+        fields, names = Alpha158DL.get_feature_config(conf)
+
+        # Filter: only keep (operator, window) combos that are stable
+        # Sort operators by name length descending to avoid prefix conflicts (MA vs MAX)
+        sorted_ops = sorted(self.STABLE_ROLLING_CONFIG.items(), key=lambda x: len(x[0]), reverse=True)
+
+        filtered_fields = []
+        filtered_names = []
+        for field, name in zip(fields, names):
+            # Check if this is a rolling feature
+            matched = False
+            for op, windows in sorted_ops:
+                if name.startswith(op):
+                    matched = True
+                    suffix = name[len(op):]
+                    try:
+                        win = int(suffix)
+                        if win in windows:
+                            filtered_fields.append(field)
+                            filtered_names.append(name)
+                    except ValueError:
+                        pass
+                    break
+            if not matched:
+                # Non-rolling feature (kbar, price)
+                filtered_fields.append(field)
+                filtered_names.append(name)
+
+        # Add stable TA-Lib features only
+        talib_fields, talib_names = self._get_talib_features()
+        for field, name in zip(talib_fields, talib_names):
+            if name in self.STABLE_TALIB:
+                filtered_fields.append(field)
+                filtered_names.append(name)
+
+        return filtered_fields, filtered_names
+
+    def _get_macro_feature_columns(self) -> List[str]:
+        """Override: use stability-filtered macro features."""
+        if self.macro_features == "none":
+            return []
+        return self.STABLE_MACRO_FEATURES

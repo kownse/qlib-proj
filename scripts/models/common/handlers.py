@@ -97,6 +97,12 @@ HANDLER_REGISTRY = {
         'description': 'Alpha158 + TA-Lib Lite + Macro features (~205 features)',
         'use_talib': True,
     },
+    'alpha158-talib-macro-stable': {
+        'module': 'data.datahandler_macro',
+        'class_name': 'Alpha158_Volatility_TALib_Macro_Stable',
+        'description': 'Stability-filtered Alpha158 + TA-Lib + Macro (~65 features)',
+        'use_talib': True,
+    },
     'alpha158-macro': {
         'module': 'data.datahandler_macro',
         'class_name': 'Alpha158_Macro',
