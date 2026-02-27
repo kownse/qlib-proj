@@ -771,6 +771,77 @@ def send_trading_email(args, trading_details: list, model_info: str = None) -> N
 
 
 # ============================================================================
+# LLM Fundamental Review (shared by backtest & live prediction)
+# ============================================================================
+
+def llm_review_pred_ensemble(
+    pred_ensemble: pd.Series,
+    llm_filter: str,
+    topk: int,
+    llm_model: str = None,
+    llm_refresh: list = None,
+) -> pd.Series:
+    """
+    对 pred_ensemble 进行 LLM 基本面审查，移除 verdict 不是 pass 的股票。
+
+    Parameters
+    ----------
+    pred_ensemble : pd.Series
+        MultiIndex (datetime, instrument) 的预测分数
+    llm_filter : str
+        过滤模式，'none' 则跳过
+    topk : int
+        取最新日期 top-K 股票进行审查
+    llm_model : str, optional
+        LLM 模型名称
+    llm_refresh : list, optional
+        需要强制刷新缓存的股票列表
+
+    Returns
+    -------
+    pd.Series
+        过滤后的 pred_ensemble
+    """
+    if not llm_filter or llm_filter == 'none':
+        return pred_ensemble
+
+    print(f"\n{'='*60}")
+    print(f"[STEP] LLM Fundamental Review ({llm_filter})")
+    print(f"{'='*60}")
+
+    from utils.llm_filter import review_selected_stocks, refresh_stock
+
+    if llm_refresh:
+        for sym in llm_refresh:
+            refresh_stock(sym)
+
+    # 取最新日期的 top-K 股票进行审查
+    _pred_df = pred_ensemble.to_frame("score").reset_index()
+    _pred_df['instrument'] = _pred_df['instrument'].str.lower()
+    _pred_df = _pred_df.set_index(['datetime', 'instrument'])
+    _latest = _pred_df.index.get_level_values(0).unique().sort_values()[-1]
+    _top = _pred_df.loc[_latest].sort_values("score", ascending=False).head(topk)
+    top_symbols = [s.upper() for s in _top.index.tolist()]
+
+    reviews = review_selected_stocks(top_symbols, model=llm_model or "claude-haiku-4-5-20251001")
+    failed = [r['symbol'].lower() for r in reviews if r.get('verdict') != 'pass']
+
+    if failed:
+        instruments = pred_ensemble.index.get_level_values(1).str.lower()
+        mask = ~instruments.isin(failed)
+        before = len(pred_ensemble)
+        pred_ensemble = pred_ensemble[mask.values]
+        after = len(pred_ensemble)
+        print(f"\n    LLM excluded: {', '.join(s.upper() for s in failed)}")
+        print(f"    Removed {before - after} predictions ({(before - after) / before * 100:.1f}%)")
+        print(f"    Remaining: {after}")
+    else:
+        print(f"\n    All {len(top_symbols)} stocks passed LLM review")
+
+    return pred_ensemble
+
+
+# ============================================================================
 # Ensemble Live Prediction
 # ============================================================================
 
