@@ -859,7 +859,7 @@ def run_ensemble_live_prediction(
         reviews = review_selected_stocks(symbols, model=llm_model or "claude-haiku-4-5-20251001")
 
         if llm_filter == 'exclude':
-            failed = [r['symbol'].lower() for r in reviews if r.get('verdict') == 'fail']
+            failed = [r['symbol'].lower() for r in reviews if r.get('verdict') != 'pass']
             if failed:
                 top_stocks = top_stocks.drop(failed, errors='ignore')
                 allocation_per_stock = account * 0.95 / max(len(top_stocks), 1)
