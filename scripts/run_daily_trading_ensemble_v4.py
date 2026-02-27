@@ -134,6 +134,15 @@ def main():
     parser.add_argument('--no-ai-time-scale', action='store_true',
                         help='Disable AI affinity time scaling (ramp 2020-2024)')
 
+    # LLM fundamental review
+    parser.add_argument('--llm-filter', type=str, default='none',
+                        choices=['none', 'exclude'],
+                        help='LLM fundamental review mode (default: none)')
+    parser.add_argument('--llm-model', type=str, default='claude-sonnet-4-6',
+                        help='Claude model for LLM review (default: claude-sonnet-4-6)')
+    parser.add_argument('--llm-refresh', type=str, nargs='*', default=None,
+                        help='Symbols to force refresh LLM cache (e.g., --llm-refresh SMCI INTC)')
+
     args = parser.parse_args()
 
     # Model config
@@ -300,6 +309,41 @@ def main():
         )
         print(f"  Filtered shape: {len(pred_ensemble)}")
         print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
+
+    # LLM 基本面审查 — 从 pred_ensemble 中移除 fail 股票（backtest + live 均生效）
+    if args.llm_filter != 'none':
+        print(f"\n{'='*60}")
+        print(f"[STEP] LLM Fundamental Review ({args.llm_filter})")
+        print(f"{'='*60}")
+
+        from utils.llm_filter import review_selected_stocks, refresh_stock
+
+        if args.llm_refresh:
+            for sym in args.llm_refresh:
+                refresh_stock(sym)
+
+        # 取最新日期的 top-K 股票进行审查
+        _pred_df = pred_ensemble.to_frame("score").reset_index()
+        _pred_df['instrument'] = _pred_df['instrument'].str.lower()
+        _pred_df = _pred_df.set_index(['datetime', 'instrument'])
+        _latest = _pred_df.index.get_level_values(0).unique().sort_values()[-1]
+        _top = _pred_df.loc[_latest].sort_values("score", ascending=False).head(args.topk)
+        top_symbols = [s.upper() for s in _top.index.tolist()]
+
+        reviews = review_selected_stocks(top_symbols, model=args.llm_model)
+        failed = [r['symbol'].lower() for r in reviews if r.get('verdict') == 'fail']
+
+        if failed:
+            instruments = pred_ensemble.index.get_level_values(1).str.lower()
+            mask = ~instruments.isin(failed)
+            before = len(pred_ensemble)
+            pred_ensemble = pred_ensemble[mask.values]
+            after = len(pred_ensemble)
+            print(f"\n    LLM excluded: {', '.join(s.upper() for s in failed)}")
+            print(f"    Removed {before - after} predictions ({(before - after) / before * 100:.1f}%)")
+            print(f"    Remaining: {after}")
+        else:
+            print(f"\n    All {len(top_symbols)} stocks passed LLM review")
 
     # Step 9: 运行预测或回测
     trading_details = []

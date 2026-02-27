@@ -781,6 +781,9 @@ def run_ensemble_live_prediction(
     account: float = 8000,
     version_label: str = "Ensemble",
     file_prefix: str = "ensemble",
+    llm_filter: str = None,
+    llm_model: str = None,
+    llm_refresh: list = None,
 ) -> pd.DataFrame:
     """
     生成 ensemble 实盘交易预测（不运行回测）。
@@ -799,6 +802,12 @@ def run_ensemble_live_prediction(
         标题中显示的版本标签
     file_prefix : str
         输出文件名前缀
+    llm_filter : str or None
+        LLM filter mode: 'exclude' to remove fail stocks, None to skip.
+    llm_model : str or None
+        Claude model for LLM analysis.
+    llm_refresh : list or None
+        List of symbols to force refresh before analysis.
     """
     print(f"\n{'='*70}")
     print(f"LIVE TRADING PREDICTIONS ({version_label})")
@@ -832,6 +841,32 @@ def run_ensemble_live_prediction(
 
     for i, (stock, row) in enumerate(top_stocks.iterrows(), 1):
         print(f"{i:<6} {stock.upper():<10} {row['score']:>12.4f} ${allocation_per_stock:>15,.2f}")
+
+    # LLM 基本面审查
+    if llm_filter and llm_filter != 'none':
+        print(f"\n{'='*70}")
+        print("[STEP] LLM Fundamental Review")
+        print(f"{'='*70}")
+
+        from utils.llm_filter import review_selected_stocks, refresh_stock
+
+        # Force refresh specified symbols
+        if llm_refresh:
+            for sym in llm_refresh:
+                refresh_stock(sym)
+
+        symbols = [s.upper() for s in top_stocks.index.tolist()]
+        reviews = review_selected_stocks(symbols, model=llm_model or "claude-haiku-4-5-20251001")
+
+        if llm_filter == 'exclude':
+            failed = [r['symbol'].lower() for r in reviews if r.get('verdict') == 'fail']
+            if failed:
+                top_stocks = top_stocks.drop(failed, errors='ignore')
+                allocation_per_stock = account * 0.95 / max(len(top_stocks), 1)
+                print(f"\n    LLM excluded: {', '.join(s.upper() for s in failed)}")
+                print(f"    Remaining: {len(top_stocks)} stocks, new allocation: ${allocation_per_stock:,.2f}/stock")
+            else:
+                print(f"\n    LLM review: all {len(symbols)} stocks passed")
 
     print(f"\nTOP {topk} STOCKS TO AVOID (lowest predicted return):")
     print("-" * 60)
