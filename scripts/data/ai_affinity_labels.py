@@ -131,9 +131,8 @@ AI_AFFINITY_SCORES = {
 
     # --- Tech companies where AI is a feature, not a growth driver ---
     "AAPL": 0,   # Apple Intelligence shipped but hasn't driven iPhone growth
-    "ZS": 0,     # Zero trust security; not selling AI, faces platform consolidation
-    "FTNT": 0,   # Network security; AI is a feature not a differentiator
-    "ANSS": 0,   # Simulation software; AI supplements but doesn't drive revenue
+    "FTNT": 0,   # Network security; hardware moat (FortiGate), 500+ AI patents, but faces platform consolidation
+    "ANSS": 0,   # Simulation software; acquired by SNPS; AI supplements but doesn't drive revenue
     "FICO": 0,   # Credit scoring; data moat matters more than AI
     "MSCI": 0,   # Financial indexes/analytics; AI impact marginal
     "FFIV": 0,   # Application delivery; not a clear AI play
@@ -173,7 +172,7 @@ AI_AFFINITY_SCORES = {
 
     # --- SaaS / Enterprise Software (seat-based model directly at risk) ---
     # "If AI agents do the work of 100 people, you need 10 software seats, not 100"
-    "CRM": -1,   # Salesforce - AI agents reduce CRM seat count; -27% in 2025
+    "CRM": -1,   # Salesforce - AI agents reduce CRM seat count; -38% in 2026 SaaSpocalypse
     "NOW": -1,   # ServiceNow - AI handles IT tickets; -44% from peak
     "ADBE": -1,  # Creative tools threatened by Midjourney/DALL-E/Sora; -43% from peak
     "INTU": -1,  # TurboTax/QuickBooks threatened by AI assistants; -45% from peak
@@ -184,6 +183,12 @@ AI_AFFINITY_SCORES = {
     "DAY": -1,   # Dayforce HCM - AI automates HR tasks
     "PTC": -1,   # PLM/CAD software; AI-generated designs threaten
     # NOTE: CDNS/SNPS are BENEFICIARIES (score 1) - AI chip design drives their demand.
+
+    # --- Cybersecurity SaaS (per-seat model + platform consolidation) ---
+    "ZS": -1,    # Zscaler - zero trust SaaS per-seat pricing; AI reduces headcount → fewer seats; -28% in Feb 2026 cybersecurity bloodbath
+
+    # --- Web/SMB Services (AI replaces core product) ---
+    "GDDY": -1,  # GoDaddy - AI website builders replace web hosting/design; -60% from peak
 
     # --- IT Services / Consulting (AI reduces billable hours) ---
     "ACN": -1,   # Accenture - consulting being automated by AI coding/agents
