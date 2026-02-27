@@ -815,13 +815,16 @@ def llm_review_pred_ensemble(
         for sym in llm_refresh:
             refresh_stock(sym)
 
-    # 取最新日期的 top-K 股票进行审查
+    # 收集所有日期 top-K 股票的并集进行审查（缓存后每只股票只调用一次 API）
     _pred_df = pred_ensemble.to_frame("score").reset_index()
     _pred_df['instrument'] = _pred_df['instrument'].str.lower()
     _pred_df = _pred_df.set_index(['datetime', 'instrument'])
-    _latest = _pred_df.index.get_level_values(0).unique().sort_values()[-1]
-    _top = _pred_df.loc[_latest].sort_values("score", ascending=False).head(topk)
-    top_symbols = [s.upper() for s in _top.index.tolist()]
+    all_top_symbols = set()
+    for dt in _pred_df.index.get_level_values(0).unique():
+        day_top = _pred_df.loc[dt].sort_values("score", ascending=False).head(topk)
+        all_top_symbols.update(s.upper() for s in day_top.index.tolist())
+    top_symbols = sorted(all_top_symbols)
+    print(f"    Reviewing {len(top_symbols)} unique stocks across all dates (topk={topk})")
 
     reviews = review_selected_stocks(top_symbols, model=llm_model or "claude-haiku-4-5-20251001")
     failed = [r['symbol'].lower() for r in reviews if r.get('verdict') != 'pass']
@@ -830,7 +833,7 @@ def llm_review_pred_ensemble(
         instruments = pred_ensemble.index.get_level_values(1).str.lower()
         mask = ~instruments.isin(failed)
         before = len(pred_ensemble)
-        pred_ensemble = pred_ensemble[mask.values]
+        pred_ensemble = pred_ensemble[mask]
         after = len(pred_ensemble)
         print(f"\n    LLM excluded: {', '.join(s.upper() for s in failed)}")
         print(f"    Removed {before - after} predictions ({(before - after) / before * 100:.1f}%)")
