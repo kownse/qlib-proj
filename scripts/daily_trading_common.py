@@ -1140,7 +1140,7 @@ def run_ensemble_backtest(
             "open_cost": 0.0005,
             "close_cost": 0.0005,
             "min_cost": 1,
-            "trade_unit": None,
+            "trade_unit": 1,
             "codes": pool_symbols_lower,
         },
     }
