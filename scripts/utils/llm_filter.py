@@ -16,7 +16,7 @@ import anthropic
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_DIR = PROJECT_ROOT / "outputs" / "llm_stock_analysis"
-CACHE_TTL_DAYS = 30
+CACHE_TTL_DAYS = 90
 
 SYSTEM_PROMPT = """你是一位专业的美股基本面分析师。用户会给你一只股票代码，请你根据你的知识进行全面评估。
 

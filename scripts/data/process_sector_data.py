@@ -1,12 +1,13 @@
 """
 Process sector data into features for the data handler.
 
-Loads sector_info.json and generates:
+Loads sector_info.json + AI affinity labels and generates:
   - 11 sector one-hot features (sector_technology, sector_healthcare, etc.)
+  - 1 AI affinity score (ai_affinity, normalized to [-1, 1])
 
 Output: my_data/sector_data/sector_features.parquet
   Index: stock symbol
-  Columns: 11 sector one-hot features
+  Columns: 12 features (11 sector + 1 AI affinity)
 
 Usage:
     python scripts/data/process_sector_data.py
@@ -67,11 +68,13 @@ CANONICAL_SECTORS = [
 def process_sector_features(sector_info_path: Path = SECTOR_INFO_PATH,
                             output_path: Path = OUTPUT_PATH):
     """
-    Process sector info JSON into a features parquet.
+    Process sector info JSON + AI affinity into a features parquet.
 
     Returns:
-        DataFrame with sector one-hot features, indexed by symbol
+        DataFrame with sector one-hot + AI affinity features, indexed by symbol
     """
+    from data.ai_affinity_labels import AI_AFFINITY_SCORES
+
     # Load sector info
     if not sector_info_path.exists():
         raise FileNotFoundError(
@@ -95,6 +98,10 @@ def process_sector_features(sector_info_path: Path = SECTOR_INFO_PATH,
         for s in CANONICAL_SECTORS:
             row[f"sector_{s}"] = 1.0 if canonical == s else 0.0
 
+        # AI affinity score (normalize from [-2, 2] to [-1, 1])
+        raw_score = AI_AFFINITY_SCORES.get(symbol, 0)
+        row["ai_affinity"] = raw_score / 2.0
+
         rows.append(row)
 
     df = pd.DataFrame(rows).set_index("symbol")
@@ -110,6 +117,13 @@ def process_sector_features(sector_info_path: Path = SECTOR_INFO_PATH,
         count = int(df[col].sum())
         if count > 0:
             print(f"  {col}: {count}")
+
+    print(f"\nAI affinity distribution:")
+    affinity_counts = df["ai_affinity"].value_counts().sort_index()
+    for val, count in affinity_counts.items():
+        label = {-1.0: "Strong disruption", -0.5: "Moderate disruption",
+                 0.0: "Neutral", 0.5: "Moderate beneficiary", 1.0: "Strong beneficiary"}
+        print(f"  {val:+.1f} ({label.get(val, '?')}): {count}")
 
     return df
 
