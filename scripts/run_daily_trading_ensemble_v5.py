@@ -51,8 +51,6 @@ from daily_trading_common import (
     run_ensemble_backtest,
     llm_review_pred_ensemble,
 )
-from utils.ai_filter import apply_ai_affinity_filter
-
 
 def calculate_correlation_multi(pred_dict: dict) -> dict:
     """Calculate pairwise daily correlation between all model predictions."""
@@ -129,19 +127,6 @@ def main():
 
     # Strategy + dynamic risk parameters
     add_strategy_args(parser)
-
-    # AI affinity filter
-    parser.add_argument('--ai-filter', type=str, default='none',
-                        choices=['none', 'penalty', 'exclude'],
-                        help='AI affinity filter mode (default: none)')
-    parser.add_argument('--ai-penalty-weight', type=float, default=0.5,
-                        help='Penalty multiplier for negative-affinity stocks (default: 0.5)')
-    parser.add_argument('--ai-bonus-weight', type=float, default=0.0,
-                        help='Bonus multiplier for positive-affinity stocks (default: 0.0)')
-    parser.add_argument('--ai-exclude-threshold', type=int, default=-1,
-                        help='Affinity threshold for exclude mode, drop if <= this (default: -1)')
-    parser.add_argument('--no-ai-time-scale', action='store_true',
-                        help='Disable AI affinity time scaling (ramp 2020-2024)')
 
     # LLM fundamental review
     parser.add_argument('--llm-filter', type=str, default='none',
@@ -310,22 +295,6 @@ def main():
     pred_ensemble = ensemble_predictions_multi(pred_dict, args.ensemble_method, weights)
     print(f"  Ensemble shape: {len(pred_ensemble)}")
     print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
-
-    # AI affinity filter
-    if args.ai_filter != 'none':
-        print(f"\n{'='*60}")
-        print(f"[STEP] Applying AI affinity filter ({args.ai_filter})")
-        print(f"{'='*60}")
-        pred_ensemble = apply_ai_affinity_filter(
-            pred_ensemble,
-            mode=args.ai_filter,
-            penalty_weight=args.ai_penalty_weight,
-            bonus_weight=args.ai_bonus_weight,
-            exclude_threshold=args.ai_exclude_threshold,
-            time_scale=not args.no_ai_time_scale,
-        )
-        print(f"  Filtered shape: {len(pred_ensemble)}")
-        print(f"  Range: [{pred_ensemble.min():.4f}, {pred_ensemble.max():.4f}]")
 
     # LLM 基本面审查 — 从 pred_ensemble 中移除非 pass 股票（backtest + live 均生效）
     pred_ensemble = llm_review_pred_ensemble(

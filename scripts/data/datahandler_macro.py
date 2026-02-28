@@ -4,7 +4,7 @@ DataHandler with macro features for time series prediction
 Extends Alpha158_Volatility_TALib_Lite with market regime indicators.
 Designed for time series prediction of individual stock returns/volatility.
 
-Optionally includes sector/AI affinity features (per-instrument, constant across dates).
+Optionally includes sector features (per-instrument, constant across dates).
 """
 
 import sys
@@ -74,9 +74,6 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         "sector_communication_services", "sector_industrials",
         "sector_energy", "sector_utilities", "sector_real_estate", "sector_materials",
     ]
-
-    # AI affinity feature
-    AI_AFFINITY_FEATURE = "ai_affinity"
 
     # Macro feature column names (~105 total)
     ALL_MACRO_FEATURES = [
@@ -186,7 +183,7 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         macro_features: str = "all",  # "all", "core", "vix_only", "none"
         # Sector/AI feature parameters
         sector_data_path: Union[str, Path] = None,
-        sector_features: str = "none",  # "none", "sector", "ai_only", "sector+ai"
+        sector_features: str = "none",  # "none", "sector"
         # AI basket feature parameters
         ai_basket_data_path: Union[str, Path] = None,
         ai_basket: bool = False,
@@ -207,8 +204,6 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
             sector_features: Sector feature set to use
                 - "none": No sector features (default)
                 - "sector": 11 sector one-hot features only
-                - "ai_only": AI affinity score only (1 feature)
-                - "sector+ai": All 12 features (11 sector + 1 AI affinity)
             ai_basket_data_path: Path to AI basket features parquet file
             ai_basket: Whether to include AI basket features (~11 features)
             **kwargs: Additional arguments for parent class
@@ -356,10 +351,6 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
         """Get sector feature columns based on configuration."""
         if self.sector_features == "sector":
             return list(self.SECTOR_FEATURES)
-        elif self.sector_features == "ai_only":
-            return [self.AI_AFFINITY_FEATURE]
-        elif self.sector_features == "sector+ai":
-            return list(self.SECTOR_FEATURES) + [self.AI_AFFINITY_FEATURE]
         else:  # "none"
             return []
 
@@ -388,38 +379,19 @@ class Alpha158_Volatility_TALib_Macro(DataHandlerLP):
             import traceback
             traceback.print_exc()
 
-    # AI affinity time-scaling: AI impact didn't exist before ~2020,
-    # ramped up through 2024 as AI transformed markets.
-    AI_AFFINITY_RAMP_START = pd.Timestamp("2020-01-01")
-    AI_AFFINITY_RAMP_END = pd.Timestamp("2024-01-01")
-
     def _merge_sector_to_df(self, df: pd.DataFrame, cols: list) -> pd.DataFrame:
         """
         Merge sector features into a DataFrame by instrument (vectorized).
 
         Unlike macro features (aligned by datetime), sector features are
         aligned by instrument (same value across all dates for a stock).
-
-        AI affinity is time-scaled: 0 before 2020, linear ramp 2020-2024, full after 2024.
         """
-        import numpy as np
-
         instruments = df.index.get_level_values(1)  # instrument level
         has_multi_columns = isinstance(df.columns, pd.MultiIndex)
 
         # Vectorized: reindex sector_df by instruments, fill missing with 0
         aligned = self._sector_df[cols].reindex(instruments, fill_value=0.0)
         aligned.index = df.index  # restore original MultiIndex
-
-        # Time-scale AI affinity if present
-        if self.AI_AFFINITY_FEATURE in cols:
-            datetimes = df.index.get_level_values(0)
-            ramp_start = self.AI_AFFINITY_RAMP_START.value
-            ramp_end = self.AI_AFFINITY_RAMP_END.value
-            ramp_duration = ramp_end - ramp_start
-            dt_values = datetimes.values.astype("int64")
-            ai_scale = ((dt_values - ramp_start) / ramp_duration).clip(0.0, 1.0)
-            aligned[self.AI_AFFINITY_FEATURE] = aligned[self.AI_AFFINITY_FEATURE].values * ai_scale
 
         # Rename columns to match df's column format
         if has_multi_columns:
@@ -639,7 +611,7 @@ class Alpha158_Macro(DataHandlerLP):
             macro_data_path: Path to macro features parquet file
             macro_features: Macro feature set ("all", "core", "vix_only", "none")
             sector_data_path: Path to sector features parquet file
-            sector_features: Sector feature set ("none", "sector", "ai_only", "sector+ai")
+            sector_features: Sector feature set ("none", "sector")
         """
         self.volatility_window = volatility_window
         self.macro_data_path = Path(macro_data_path) if macro_data_path else DEFAULT_MACRO_PATH
